@@ -1,0 +1,15 @@
+# Minimal config: tail files, print events as JSON to stdout.
+agent:
+  data_dir: ./data
+
+inputs:
+  files:
+    - id: demo
+      paths: ["./demo/*.log"]
+      poll_interval_ms: 250
+      read_from_start: true
+
+outputs:
+  - id: console
+    type: stdout
+    format: json

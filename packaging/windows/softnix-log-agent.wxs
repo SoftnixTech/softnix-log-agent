@@ -1,0 +1,92 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Softnix Log Agent - Windows Installer (WiX source)
+
+  Build (Windows, WiX v3):
+    candle softnix-log-agent.wxs && light softnix-log-agent.wixobj -o softnix-log-agent.msi
+  Build (Linux/macOS, msitools):
+    wixl -D SourceDir=.. -o softnix-log-agent.msi softnix-log-agent.wxs
+
+  Installs:
+    [ProgramFiles64]\Softnix\LogAgent\softnix-log-agent.exe
+    [CommonAppData]\Softnix\LogAgent\agent.yaml   (configuration + data dir)
+  Registers and starts the "softnix-log-agent" Windows service (auto start).
+  The config file is preserved on uninstall/upgrade.
+-->
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+  <Product Id="*"
+           Name="Softnix Log Agent"
+           Manufacturer="Softnix Technology"
+           Version="0.1.0"
+           UpgradeCode="6f9a1c2e-3b7d-4e8a-9c5f-2d1e8a7b4c3a"
+           Language="1033">
+
+    <Package InstallerVersion="200"
+             Compressed="yes"
+             InstallScope="perMachine"
+             Description="Softnix Log Agent - lightweight log collector"
+             Comments="https://www.softnix.co.th" />
+
+    <MajorUpgrade AllowDowngrades="no"
+                  DowngradeErrorMessage="A newer version of Softnix Log Agent is already installed." />
+
+    <Media Id="1" Cabinet="product.cab" EmbedCab="yes" />
+
+    <Directory Id="TARGETDIR" Name="SourceDir">
+      <!-- Binary under Program Files -->
+      <Directory Id="ProgramFiles64Folder">
+        <Directory Id="SoftnixDir" Name="Softnix">
+          <Directory Id="INSTALLDIR" Name="LogAgent">
+            <Component Id="MainExecutable"
+                       Guid="8c2f4b6a-1d3e-4f5a-8b7c-9e0d1f2a3b4c" Win64="yes">
+              <File Id="AgentExe"
+                    Name="softnix-log-agent.exe"
+                    Source="$(var.SourceDir)/softnix-log-agent.exe"
+                    KeyPath="yes" />
+
+              <!-- Service registration: same entry point the CLI installer uses -->
+              <ServiceInstall Id="AgentService"
+                              Name="softnix-log-agent"
+                              DisplayName="Softnix Log Agent"
+                              Description="Lightweight, reliable log collector agent"
+                              Type="ownProcess"
+                              Start="auto"
+                              Account="LocalSystem"
+                              ErrorControl="normal"
+                              Arguments="service-run --config &quot;C:\ProgramData\Softnix\LogAgent\agent.yaml&quot;" />
+              <ServiceControl Id="AgentServiceControl"
+                              Name="softnix-log-agent"
+                              Start="install"
+                              Stop="both"
+                              Remove="uninstall"
+                              Wait="yes" />
+            </Component>
+          </Directory>
+        </Directory>
+      </Directory>
+
+      <!-- Config + data under ProgramData -->
+      <Directory Id="CommonAppDataFolder">
+        <Directory Id="SoftnixDataDir" Name="Softnix">
+          <Directory Id="AGENTDATADIR" Name="LogAgent">
+            <!-- Config marked Permanent: kept on uninstall. MSI's unversioned
+                 file rules also keep a user-modified agent.yaml on upgrade. -->
+            <Component Id="DefaultConfig"
+                       Guid="3a5b7c9d-2e4f-4a6b-8c0d-1f3e5a7b9c0d"
+                       Permanent="yes" Win64="yes">
+              <File Id="AgentConfig"
+                    Name="agent.yaml"
+                    Source="$(var.SourceDir)/packaging/windows/agent-default.yaml"
+                    KeyPath="yes" />
+            </Component>
+          </Directory>
+        </Directory>
+      </Directory>
+    </Directory>
+
+    <Feature Id="Complete" Title="Softnix Log Agent" Level="1">
+      <ComponentRef Id="MainExecutable" />
+      <ComponentRef Id="DefaultConfig" />
+    </Feature>
+  </Product>
+</Wix>

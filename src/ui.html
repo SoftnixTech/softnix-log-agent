@@ -1,0 +1,188 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Softnix Log Agent</title>
+<style>
+  :root{--bg:#10151c;--panel:#171f29;--line:#26303d;--fg:#d7dee8;--dim:#8294a8;--ok:#3fb96f;--warn:#e0a93f;--err:#e06060;--acc:#4f9cf0}
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{background:var(--bg);color:var(--fg);font:14px/1.5 ui-monospace,Menlo,Consolas,monospace}
+  header{display:flex;align-items:center;gap:14px;padding:10px 18px;border-bottom:1px solid var(--line);background:var(--panel)}
+  header h1{font-size:15px;font-weight:600}
+  header .v{color:var(--dim);font-size:12px}
+  nav{display:flex;gap:2px;padding:0 12px;border-bottom:1px solid var(--line);background:var(--panel)}
+  nav a{padding:8px 14px;color:var(--dim);text-decoration:none;border-bottom:2px solid transparent;cursor:pointer}
+  nav a.on{color:var(--fg);border-bottom-color:var(--acc)}
+  main{padding:18px;max-width:1100px;margin:0 auto}
+  .cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(170px,1fr));gap:10px;margin-bottom:16px}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:6px;padding:12px}
+  .card .k{color:var(--dim);font-size:11px;text-transform:uppercase;letter-spacing:.06em}
+  .card .val{font-size:20px;margin-top:4px;word-break:break-all}
+  table{width:100%;border-collapse:collapse;background:var(--panel);border:1px solid var(--line);border-radius:6px;overflow:hidden}
+  th,td{padding:8px 12px;text-align:left;border-bottom:1px solid var(--line);vertical-align:top}
+  th{color:var(--dim);font-size:11px;text-transform:uppercase;letter-spacing:.06em}
+  tr:last-child td{border-bottom:none}
+  .ok{color:var(--ok)} .warn{color:var(--warn)} .err{color:var(--err)} .dim{color:var(--dim)}
+  .dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:6px}
+  .dot.ok{background:var(--ok)} .dot.err{background:var(--err)} .dot.warn{background:var(--warn)}
+  textarea{width:100%;height:420px;background:#0c1117;color:var(--fg);border:1px solid var(--line);border-radius:6px;padding:10px;font:13px/1.5 ui-monospace,Menlo,Consolas,monospace;resize:vertical}
+  button{background:var(--acc);color:#fff;border:none;border-radius:5px;padding:7px 16px;font:inherit;cursor:pointer;margin:8px 8px 0 0}
+  button.sec{background:var(--panel);border:1px solid var(--line);color:var(--fg)}
+  button.danger{background:var(--err)}
+  button:disabled{opacity:.5;cursor:default}
+  #msg{margin-top:10px;padding:9px 12px;border-radius:5px;display:none;white-space:pre-wrap}
+  #msg.ok{display:block;background:rgba(63,185,111,.12);border:1px solid var(--ok)}
+  #msg.err{display:block;background:rgba(224,96,96,.12);border:1px solid var(--err)}
+  #msg.warn{display:block;background:rgba(224,169,63,.12);border:1px solid var(--warn)}
+  .logline{font-size:12.5px;white-space:pre-wrap;word-break:break-all}
+  select{background:var(--panel);color:var(--fg);border:1px solid var(--line);border-radius:5px;padding:5px 8px;font:inherit}
+  h2{font-size:13px;color:var(--dim);text-transform:uppercase;letter-spacing:.06em;margin:18px 0 8px}
+  .bar{height:6px;background:#0c1117;border-radius:3px;overflow:hidden;margin-top:4px}
+  .bar i{display:block;height:100%;background:var(--acc)}
+</style>
+</head>
+<body>
+<header>
+  <h1>Softnix Log Agent</h1>
+  <span class="v" id="hver"></span>
+  <span class="v" id="hstate"></span>
+</header>
+<nav id="nav">
+  <a data-p="overview" class="on">Overview</a>
+  <a data-p="inputs">Inputs</a>
+  <a data-p="outputs">Outputs</a>
+  <a data-p="buffer">Buffer</a>
+  <a data-p="config">Configuration</a>
+  <a data-p="logs">Logs</a>
+  <a data-p="about">About</a>
+</nav>
+<main id="main"></main>
+<script>
+"use strict";
+let page="overview", timer=null, cfgDirty=false;
+const $=s=>document.querySelector(s);
+const esc=s=>String(s??"").replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+async function api(p,opt){const r=await fetch(p,opt);const ct=r.headers.get("content-type")||"";const body=ct.includes("json")?await r.json():await r.text();return{ok:r.ok,status:r.status,body}}
+function fmtDur(s){if(s==null)return"-";const d=Math.floor(s/86400),h=Math.floor(s%86400/3600),m=Math.floor(s%3600/60);return(d?d+"d ":"")+(h?h+"h ":"")+m+"m "+Math.floor(s%60)+"s"}
+function fmtBytes(b){if(b==null)return"-";const u=["B","KB","MB","GB"];let i=0;while(b>=1024&&i<3){b/=1024;i++}return b.toFixed(i?1:0)+" "+u[i]}
+function card(k,v,cls){return`<div class="card"><div class="k">${esc(k)}</div><div class="val ${cls||""}">${v}</div></div>`}
+function dot(ok){return`<span class="dot ${ok?"ok":"err"}"></span>`}
+
+const pages={
+async overview(){
+  const {body:s}=await api("/api/status");
+  $("#hver").textContent="v"+(s.version||"");
+  $("#hstate").innerHTML=s.running?'<span class="ok">● running</span>':'<span class="err">● engine stopped</span>';
+  let dest=(s.destinations||[]).map(d=>`<tr><td>${dot(d.healthy)}${esc(d.id)}</td><td>${d.connected?'<span class="ok">connected</span>':'<span class="dim">idle</span>'}</td><td>${d.healthy?'<span class="ok">healthy</span>':'<span class="err">unhealthy</span>'}</td></tr>`).join("");
+  $("#main").innerHTML=`
+  <div class="cards">
+    ${card("Status",s.running?'<span class="ok">running</span>':'<span class="err">stopped</span>')}
+    ${card("Version",esc(s.version))}
+    ${card("Uptime",fmtDur(s.uptime_seconds))}
+    ${card("Events received",s.events_received??0)}
+    ${card("Events sent",s.events_sent??0)}
+    ${card("Events dropped",s.events_dropped??0,s.events_dropped?"warn":"")}
+    ${card("Queue size",(s.queue_events??0)+" ev / "+fmtBytes(s.queue_bytes))}
+    ${card("Errors",s.errors??0,s.errors?"warn":"")}
+  </div>
+  ${s.last_error?`<div id="msg" class="warn" style="display:block">Last error: ${esc(s.last_error)}</div>`:""}
+  <h2>Destinations</h2>
+  <table><tr><th>Destination</th><th>Connection</th><th>Health</th></tr>${dest||'<tr><td colspan="3" class="dim">none configured</td></tr>'}</table>`;
+},
+async inputs(){
+  const {body:list}=await api("/api/inputs");
+  const rows=(list||[]).map(i=>`<tr><td>${dot(i.active&&!i.last_error)}${esc(i.id)}</td><td>${esc(i.kind)}</td><td class="dim">${esc(i.detail)}</td><td>${i.events}</td><td>${i.active?'<span class="ok">active</span>':'<span class="dim">stopped</span>'}</td><td class="err">${esc(i.last_error||"")}</td></tr>`).join("");
+  $("#main").innerHTML=`<table><tr><th>Input</th><th>Type</th><th>Source</th><th>Events</th><th>Status</th><th>Error</th></tr>${rows||'<tr><td colspan="6" class="dim">no inputs configured</td></tr>'}</table>`;
+},
+async outputs(){
+  const {body:list}=await api("/api/outputs");
+  const rows=(list||[]).map(o=>`<tr><td>${dot(o.healthy)}${esc(o.id)}</td><td>${esc(o.kind)}</td><td class="dim">${esc(o.detail)}</td><td>${o.connected?'<span class="ok">connected</span>':'<span class="dim">idle</span>'}</td><td>${o.events_sent}</td><td>${o.retries}</td><td>${o.healthy?'<span class="ok">healthy</span>':'<span class="err">unhealthy</span>'}</td><td class="err">${esc(o.last_error||"")}</td></tr>`).join("");
+  $("#main").innerHTML=`<table><tr><th>Output</th><th>Type</th><th>Address</th><th>Connection</th><th>Sent</th><th>Retries</th><th>Health</th><th>Error</th></tr>${rows||'<tr><td colspan="8" class="dim">no outputs configured</td></tr>'}</table>`;
+},
+async buffer(){
+  const {body:list}=await api("/api/buffer");
+  const rows=(list||[]).map(b=>`<tr><td>${esc(b.destination)}</td><td>${b.events}</td><td>${fmtBytes(b.bytes)} / ${fmtBytes(b.max_bytes)}<div class="bar"><i style="width:${Math.min(100,b.usage_percent)}%"></i></div></td><td>${b.oldest_event_age_seconds!=null?fmtDur(b.oldest_event_age_seconds):"-"}</td><td class="${b.dropped_events?"warn":""}">${b.dropped_events}</td></tr>`).join("");
+  $("#main").innerHTML=`<table><tr><th>Destination</th><th>Queued events</th><th>Disk usage</th><th>Oldest event</th><th>Dropped</th></tr>${rows||'<tr><td colspan="5" class="dim">no queues</td></tr>'}</table>`;
+},
+async config(){
+  if(cfgDirty && $("#cfg")) return; // don't clobber edits on refresh
+  const {ok,body}=await api("/api/config");
+  const content=ok?body.content:"";
+  $("#main").innerHTML=`
+  <div class="dim" style="margin-bottom:8px">${esc(ok?body.path:"cannot read config: "+body)}</div>
+  <textarea id="cfg" spellcheck="false">${esc(content)}</textarea>
+  <div>
+    <button onclick="cfgValidate()">Validate</button>
+    <button onclick="cfgSave()">Save</button>
+    <button onclick="cfgReload()">Save &amp; Reload</button>
+    <button class="sec" onclick="cfgDirty=false;pages.config()">Discard changes</button>
+    <button class="danger" onclick="cfgRollback()">Rollback to backup</button>
+  </div>
+  <div id="msg"></div>`;
+  $("#cfg").addEventListener("input",()=>cfgDirty=true);
+},
+async logs(){
+  const lvl=window._loglvl||"";
+  const {body:list}=await api("/api/logs?limit=200"+(lvl?"&level="+lvl:""));
+  const rows=(list||[]).map(l=>{const c=l.level==="ERROR"?"err":l.level==="WARN"?"warn":"dim";return`<tr><td class="dim">${esc(l.time)}</td><td class="${c}">${esc(l.level)}</td><td class="logline">${esc(l.message)}</td></tr>`}).join("");
+  $("#main").innerHTML=`
+  <div style="margin-bottom:10px">Level:
+    <select onchange="window._loglvl=this.value;pages.logs()">
+      <option value="" ${!lvl?"selected":""}>all</option>
+      <option value="warn" ${lvl==="warn"?"selected":""}>warnings+</option>
+      <option value="error" ${lvl==="error"?"selected":""}>errors</option>
+    </select> <span class="dim">(showing up to 200 recent entries)</span></div>
+  <table><tr><th>Time</th><th>Level</th><th>Message</th></tr>${rows||'<tr><td colspan="3" class="dim">no entries</td></tr>'}</table>`;
+},
+async about(){
+  const {body:a}=await api("/api/about");
+  $("#main").innerHTML=`<table>
+    <tr><th>Name</th><td>${esc(a.name)}</td></tr>
+    <tr><th>Version</th><td>${esc(a.version)}</td></tr>
+    <tr><th>Operating system</th><td>${esc(a.os)} (${esc(a.arch)})</td></tr>
+    <tr><th>Hostname</th><td>${esc(a.hostname)}</td></tr>
+    <tr><th>Config path</th><td>${esc(a.config_path)}</td></tr>
+    <tr><th>State path</th><td>${esc(a.state_path||"-")}</td></tr>
+    <tr><th>PID</th><td>${a.pid}</td></tr>
+  </table>`;
+}};
+
+function showMsg(cls,text){const m=$("#msg");if(!m)return;m.className=cls;m.textContent=text}
+async function cfgValidate(){
+  const {body}=await api("/api/config/validate",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({content:$("#cfg").value})});
+  if(body.valid)showMsg(body.warnings&&body.warnings.length?"warn":"ok","Valid."+(body.warnings||[]).map(w=>"\nWarning: "+w).join(""));
+  else showMsg("err","Invalid:\n"+body.error);
+}
+async function cfgSave(){
+  const {ok,body}=await api("/api/config/save",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({content:$("#cfg").value})});
+  if(ok&&body.saved){cfgDirty=false;showMsg("ok","Saved. Previous config backed up to "+body.backup+(body.warnings||[]).map(w=>"\nWarning: "+w).join(""))}
+  else showMsg("err","Not saved:\n"+(body.error||body));
+}
+async function cfgReload(){
+  if(cfgDirty){const {ok,body}=await api("/api/config/save",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({content:$("#cfg").value})});
+    if(!(ok&&body.saved)){showMsg("err","Not saved:\n"+(body.error||body));return}
+    cfgDirty=false;}
+  showMsg("warn","Reloading...");
+  const {ok,body}=await api("/api/config/reload",{method:"POST"});
+  if(ok&&body.reloaded)showMsg("ok","Configuration reloaded successfully.");
+  else showMsg("err","Reload failed (previous config restored):\n"+(body.error||body));
+}
+async function cfgRollback(){
+  if(!confirm("Restore the previous configuration backup and reload?"))return;
+  const {ok,body}=await api("/api/config/rollback",{method:"POST"});
+  if(ok&&body.rolled_back){cfgDirty=false;showMsg("ok","Rolled back and reloaded.");pages.config()}
+  else showMsg("err","Rollback failed:\n"+(body.error||body));
+}
+
+document.getElementById("nav").addEventListener("click",e=>{
+  const a=e.target.closest("a");if(!a)return;
+  document.querySelectorAll("nav a").forEach(x=>x.classList.toggle("on",x===a));
+  page=a.dataset.p;cfgDirty=false;render();
+});
+async function render(){try{await pages[page]()}catch(e){$("#main").innerHTML='<div class="err">'+esc(e)+"</div>"}}
+function tick(){if(page!=="config")render()}
+render();timer=setInterval(tick,3000);
+</script>
+</body>
+</html>

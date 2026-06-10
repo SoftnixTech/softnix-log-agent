@@ -1,0 +1,39 @@
+# Windows example configuration.
+agent:
+  data_dir: 'C:\ProgramData\Softnix\LogAgent'
+  log_level: info
+
+inputs:
+  files:
+    - id: app-logs
+      paths:
+        - 'C:\Logs\*.log'
+        - 'C:\App\Logs\**\*.log'
+      exclude:
+        - 'C:\Logs\debug-*.log'
+  syslog:
+    - id: udp514
+      protocol: udp
+      bind: 0.0.0.0
+      port: 514
+
+pipeline:
+  enrich:
+    environment: production
+    site: hq
+
+buffer:
+  max_size_mb: 512
+  full_policy: drop_oldest
+
+outputs:
+  - id: central-syslog
+    type: syslog
+    protocol: tcp
+    address: logserver.corp.local:514
+    format: rfc5424
+
+web:
+  enabled: true
+  bind: 127.0.0.1
+  port: 8080

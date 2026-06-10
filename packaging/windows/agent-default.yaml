@@ -1,0 +1,49 @@
+# Softnix Log Agent — default Windows configuration
+# Edit this file, then reload from the web GUI (http://127.0.0.1:8080)
+# or restart the service:  softnix-log-agent.exe service restart
+#
+# Full reference with all options: examples/agent.yaml in the source repo.
+
+agent:
+  data_dir: 'C:\ProgramData\Softnix\LogAgent'
+  log_level: info
+
+inputs:
+  files:
+    - id: app-logs
+      paths:
+        - 'C:\Logs\*.log'          # adjust to your log locations
+      # exclude:
+      #   - 'C:\Logs\debug-*.log'
+
+  # Uncomment to receive syslog from other systems
+  # (allow the port in Windows Firewall first):
+  # syslog:
+  #   - id: udp514
+  #     protocol: udp
+  #     bind: 0.0.0.0
+  #     port: 514
+
+pipeline:
+  enrich:
+    environment: production
+
+buffer:
+  max_size_mb: 512
+  full_policy: block
+
+outputs:
+  # Replace with your real destination, e.g.:
+  # - id: central-syslog
+  #   type: syslog
+  #   protocol: tcp
+  #   address: logserver.corp.local:514
+  #   format: rfc5424
+  - id: console
+    type: stdout
+    format: json
+
+web:
+  enabled: true
+  bind: 127.0.0.1                  # localhost only (recommended)
+  port: 8080

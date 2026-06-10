@@ -1,0 +1,140 @@
+# Softnix Log Agent — full reference configuration
+# Validate with: softnix-log-agent validate --config agent.yaml
+
+agent:
+  # Where state (file offsets) and the persistent queue live.
+  # Linux service default: /var/lib/softnix-log-agent
+  data_dir: /var/lib/softnix-log-agent
+  # Agent self-log level: trace|debug|info|warn|error
+  log_level: info
+
+inputs:
+  files:
+    - id: system-logs
+      paths:
+        - /var/log/*.log
+        - /app/logs/**/*.log       # recursive
+      exclude:
+        - /var/log/lastlog
+        - "**/*.gz"
+      poll_interval_ms: 500
+      read_from_start: false       # skip pre-existing content on first run
+      source_type: linux-syslog
+      parser:
+        mode: raw                  # raw | json | kv | regex | syslog
+
+    - id: app-json
+      paths: ["/app/logs/service-*.json"]
+      parser:
+        mode: json
+
+    - id: nginx-access
+      paths: ["/var/log/nginx/access.log"]
+      parser:
+        mode: regex
+        pattern: '^(?P<remote>\S+) \S+ \S+ \[(?P<timestamp>[^\]]+)\] "(?P<request>[^"]*)" (?P<status>\d+) (?P<bytes>\d+)'
+        timestamp_format: "%d/%b/%Y:%H:%M:%S %z"
+
+  syslog:
+    - id: udp514
+      protocol: udp
+      bind: 0.0.0.0
+      port: 514
+      format: auto                 # auto | rfc3164 | rfc5424 | json | raw
+
+    - id: tcp514
+      protocol: tcp
+      bind: 0.0.0.0
+      port: 514
+
+    - id: tls6514
+      protocol: tls
+      bind: 0.0.0.0
+      port: 6514
+      tls:
+        cert: /etc/softnix-log-agent/tls/server.crt
+        key: /etc/softnix-log-agent/tls/server.key
+        # client_ca: /etc/softnix-log-agent/tls/clients-ca.crt   # enables mTLS
+
+pipeline:
+  transforms:
+    # Add / remove / rename fields
+    - type: add_field
+      field: team
+      value: platform
+    - type: rename_field
+      from: team
+      to: owner_team
+    # Type conversion
+    - type: convert
+      field: status
+      to: int
+    # Data masking (e.g. credit card numbers)
+    - type: mask
+      field: message
+      pattern: '\b\d{13,16}\b'
+      replacement: "[REDACTED]"
+    # Event filtering
+    - type: drop
+      when: { field: message, op: contains, value: "health-check" }
+    # Conditional field
+    - type: add_field
+      field: alert
+      value: true
+      when: { field: severity, op: lt, value: 3 }
+
+  enrich:
+    hostname: true
+    os_info: true
+    agent_version: true
+    local_ip: true
+    environment: ${ENVIRONMENT:-production}
+    site: dc-bkk-1
+    tenant: softnix
+    customer: example-corp
+    tags: [edge, th]
+    fields:
+      rack: r12
+
+buffer:
+  max_size_mb: 1024                # per destination
+  segment_size_mb: 8
+  full_policy: block               # block | drop_oldest | drop_newest
+
+outputs:
+  # Primary SIEM over TLS with mTLS
+  - id: siem-primary
+    type: syslog
+    protocol: tls
+    address: siem.example.com:6514
+    format: rfc5424                # rfc5424 | rfc3164 | json | raw
+    framing: newline               # newline | octet_counting
+    tls:
+      ca: /etc/softnix-log-agent/tls/siem-ca.crt
+      cert: /etc/softnix-log-agent/tls/agent.crt   # mTLS client cert
+      key: /etc/softnix-log-agent/tls/agent.key
+    retry:
+      initial_backoff_ms: 500
+      max_backoff_ms: 30000
+      batch_size: 200
+
+  # Standby destination, used only while siem-primary is unhealthy
+  - id: siem-backup
+    type: syslog
+    protocol: tcp
+    address: siem-backup.example.com:514
+    format: rfc5424
+    failover_for: siem-primary
+
+  # Errors also go to a separate destination (conditional routing)
+  - id: alerts
+    type: syslog
+    protocol: udp
+    address: alerting.example.com:514
+    when: { field: severity, op: lt, value: 4 }
+
+web:
+  enabled: true
+  bind: 127.0.0.1                  # localhost-only by default
+  port: 8080
+  # auth_token: ${WEB_TOKEN:-}     # set when exposing beyond localhost

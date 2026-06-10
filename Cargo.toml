@@ -1,0 +1,52 @@
+[package]
+name = "softnix-log-agent"
+version = "0.1.0"
+edition = "2021"
+description = "Softnix Log Agent - lightweight, reliable, cross-platform log collector"
+license = "Proprietary"
+rust-version = "1.80"
+
+[lib]
+name = "softnix_log_agent"
+path = "src/lib.rs"
+
+[[bin]]
+name = "softnix-log-agent"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "io-std", "time", "sync", "signal", "fs", "process"] }
+tokio-util = { version = "0.7", features = ["codec"] }
+tokio-stream = "0.1"
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+rustls-pemfile = "2"
+webpki-roots = "0.26"
+axum = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+regex = "1"
+glob = "0.3"
+globset = "0.4"
+chrono = { version = "0.4", features = ["serde"] }
+hostname = "0.4"
+clap = { version = "4", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+crc32fast = "1"
+
+[target.'cfg(windows)'.dependencies]
+windows-service = "0.7"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+opt-level = "s"
+lto = "thin"
+codegen-units = 1
+strip = true
+panic = "abort"

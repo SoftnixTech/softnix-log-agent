@@ -1,0 +1,21 @@
+[Unit]
+Description=Softnix Log Agent
+Documentation=https://www.softnix.co.th
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/softnix-log-agent run --config /etc/softnix-log-agent/agent.yaml
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=read-only
+PrivateTmp=true
+ReadWritePaths=/var/lib/softnix-log-agent
+LimitNOFILE=65536
+MemoryMax=512M
+
+[Install]
+WantedBy=multi-user.target
