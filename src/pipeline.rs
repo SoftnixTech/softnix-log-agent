@@ -537,6 +537,17 @@ impl Transformer {
                                 ev.set_field(field, Value::String(masked.into_owned()));
                             }
                         }
+                        // `raw_message` retains the original unparsed line, so
+                        // masking only `message` would leak the secret through
+                        // raw_message on outputs that emit every field (e.g.
+                        // json). Apply the same masking to raw_message whenever
+                        // we mask message, so no sensitive data escapes.
+                        if field == "message" {
+                            if let Some(raw) = ev.raw_message.take() {
+                                let masked = re.replace_all(&raw, replacement.as_str());
+                                ev.raw_message = Some(masked.into_owned());
+                            }
+                        }
                     }
                 }
                 CompiledStep::Drop { when } => {
@@ -787,6 +798,11 @@ transforms:
         assert_eq!(ev.fields["datacenter"], Value::String("bkk-1".into()));
         assert!(ev.message.contains("[CARD]"));
         assert!(!ev.message.contains("4111111111111111"));
+        // PIPE-006 regression: masking `message` must also scrub raw_message so
+        // the secret can't leak through outputs that emit every field (json).
+        let raw = ev.raw_message.as_deref().unwrap();
+        assert!(raw.contains("[CARD]"), "raw_message not masked: {raw}");
+        assert!(!raw.contains("4111111111111111"), "secret leaked in raw_message: {raw}");
 
         let mut debug_ev = raw_parser().parse("noise", "f", "file");
         debug_ev.severity = Some(7);

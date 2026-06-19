@@ -81,6 +81,35 @@ The service entry point is `softnix-log-agent.exe service-run --config <path>`, 
 
 Configuration reload on Windows: use the web GUI (`http://127.0.0.1:8080` → Configuration → Save & Reload) or `service restart`.
 
+## Collecting Windows Event Log
+
+The agent collects Event Log channels natively (no NXLog/winlogbeat sidecar). Add an `inputs.eventlog` block to the config:
+
+```yaml
+inputs:
+  eventlog:
+    - id: winevents
+      channels:
+        - Application
+        - System
+        - Security
+        # - Microsoft-Windows-Sysmon/Operational
+      # XPath filter; "*" = all. Critical/Error/Warning only:
+      # query: "*[System[(Level=1 or Level=2 or Level=3)]]"
+      query: "*"
+      read_existing: false   # true to backfill existing events on first run
+```
+
+Notes:
+
+- **Privilege:** reading the `Security` channel requires elevated rights. The installed service runs as **LocalSystem**, which satisfies this — no extra configuration. If you run the agent interactively for testing, use an elevated PowerShell, or add the account to the **Event Log Readers** group (sufficient for non-Security channels).
+- **Resume after restart:** progress per channel is checkpointed with an Event Log bookmark stored under `agent.data_dir`; on restart collection resumes where it stopped (at-least-once).
+- **Messages:** the human-readable description is rendered from the publisher's metadata; if a provider's message DLL is unavailable the agent falls back to the joined `EventData`. The full event XML is always preserved in `raw_message`.
+- **Channel names:** must match exactly. List available channels with `wevtutil el` (or `Get-WinEvent -ListLog *`).
+- **No firewall rule needed** — Event Log is read locally, not over the network.
+
+Verify events are flowing on the Inputs page of the web GUI, or check the destination.
+
 If receiving syslog on UDP/TCP 514 or running the web GUI beyond localhost, allow it through Windows Firewall, e.g.:
 
 ```powershell

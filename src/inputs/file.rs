@@ -2,7 +2,9 @@
 //!
 //! Strategy: poll-based (cheap, portable, robust against editor/rotation
 //! quirks on both Linux and Windows). Files are identified by OS identity
-//! (inode on Unix, creation time on Windows), so rename rotation and
+//! (inode on Unix; on Windows a content fingerprint of the file head, since
+//! stable Rust exposes no volume/file-index and creation_time collides when
+//! many files are created in the same 100 ns tick), so rename rotation and
 //! recreation are detected; truncation resets the offset.
 
 use crate::config::FileInputConfig;
@@ -25,16 +27,63 @@ const READ_BUDGET: u64 = 4 * 1024 * 1024;
 /// Lines longer than this are emitted even without a trailing newline.
 const MAX_LINE: usize = 1024 * 1024;
 
+/// Upper bound on bytes scanned to fingerprint a file's first line on platforms
+/// without a stable file-id. Caps the cost for a pathologically long first line.
+#[cfg(any(windows, test))]
+const FINGERPRINT_BYTES: usize = 512;
+
 #[cfg(unix)]
-fn file_identity(md: &std::fs::Metadata) -> String {
+fn file_identity(_path: &Path, md: &std::fs::Metadata) -> String {
     use std::os::unix::fs::MetadataExt;
     format!("dev{}:ino{}", md.dev(), md.ino())
 }
 
 #[cfg(windows)]
-fn file_identity(md: &std::fs::Metadata) -> String {
+fn file_identity(path: &Path, md: &std::fs::Metadata) -> String {
     use std::os::windows::fs::MetadataExt;
-    format!("ct{}", md.creation_time())
+    // creation_time alone collides when many files are created in the same
+    // 100 ns tick (e.g. 50 logs written at once) and is unstable across some
+    // rotation schemes. Pair it with a hash of the file head so files with
+    // distinct content are always told apart, while a rotated file (same head
+    // content travels with the rename) keeps the same identity.
+    let head = head_fingerprint(path).unwrap_or(0);
+    format!("ct{}:h{:08x}", md.creation_time(), head)
+}
+
+/// Fingerprint a file by hashing its first line (bytes up to and including the
+/// first newline), capped at `FINGERPRINT_BYTES`. Returns `None` if the file
+/// cannot be read.
+///
+/// Hashing only the first line keeps the fingerprint **stable** for append-only
+/// logs: once the first line is written it never changes, so subsequent growth
+/// leaves the identity untouched (a growing prefix hash would instead flip the
+/// identity mid-life and trigger spurious re-reads). Before the first newline
+/// exists no complete line is emitted, so a hash change in that window cannot
+/// duplicate data.
+#[cfg(any(windows, test))]
+fn head_fingerprint(path: &Path) -> Option<u32> {
+    let mut f = File::open(path).ok()?;
+    let mut buf = vec![0u8; FINGERPRINT_BYTES];
+    let mut filled = 0usize;
+    while filled < buf.len() {
+        match f.read(&mut buf[filled..]) {
+            Ok(0) => break,
+            Ok(n) => {
+                filled += n;
+                if buf[..filled].contains(&b'\n') {
+                    break;
+                }
+            }
+            Err(_) => return None,
+        }
+    }
+    // Truncate to the first newline (inclusive) so appended lines don't affect
+    // the hash; if none was found within the cap, hash what we have.
+    let end = buf[..filled]
+        .iter()
+        .position(|&b| b == b'\n')
+        .map_or(filled, |p| p + 1);
+    Some(crc32fast::hash(&buf[..end]))
 }
 
 struct Tracked {
@@ -159,7 +208,7 @@ impl FileInput {
                 Ok(m) if m.is_file() => m,
                 _ => continue,
             };
-            let identity = file_identity(&md);
+            let identity = file_identity(&path, &md);
             let size = md.len();
             let path_str = path.to_string_lossy().into_owned();
 
@@ -308,6 +357,34 @@ mod tests {
             source_type: None,
         })
         .unwrap()
+    }
+
+    #[test]
+    fn head_fingerprint_distinguishes_concurrent_files() {
+        // FILE-011 regression: files created in the same instant must still be
+        // told apart. creation_time would collide; the content head must not.
+        let dir = tempfile::tempdir().unwrap();
+        let mut hashes = std::collections::HashSet::new();
+        for i in 1..=50 {
+            let p = dir.path().join(format!("multi{i}.log"));
+            std::fs::write(&p, format!("from file {i}\n")).unwrap();
+            hashes.insert(head_fingerprint(&p).unwrap());
+        }
+        assert_eq!(hashes.len(), 50, "every distinct log file must hash uniquely");
+    }
+
+    #[test]
+    fn head_fingerprint_stable_as_file_grows() {
+        // FILE-005 regression: a file's identity must not change as more lines
+        // are appended, so the agent keeps tracking the same file across polls.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("app.log");
+        std::fs::write(&p, "first line\n").unwrap();
+        let h1 = head_fingerprint(&p).unwrap();
+        let mut f = std::fs::OpenOptions::new().append(true).open(&p).unwrap();
+        f.write_all(b"second line\nthird line\n").unwrap();
+        let h2 = head_fingerprint(&p).unwrap();
+        assert_eq!(h1, h2, "fingerprint must be stable as the file grows");
     }
 
     async fn collect(rx: &mut mpsc::Receiver<Event>) -> Vec<String> {

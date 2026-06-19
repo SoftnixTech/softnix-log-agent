@@ -3,7 +3,7 @@
 A lightweight, reliable, cross-platform log collector agent written in Rust — in the spirit of NXLog / Fluent Bit / Vector, but optimized for simplicity, low resource usage and operational clarity.
 
 ```
-Inputs (files, syslog UDP/TCP/TLS)
+Inputs (files, syslog UDP/TCP/TLS, Windows Event Log)
   → Parse (raw / JSON / key-value / regex / syslog)
   → Transform (add/remove/rename/convert/mask/filter)
   → Normalize (common event schema)
@@ -20,6 +20,7 @@ Inputs (files, syslog UDP/TCP/TLS)
 - **File collection** — single paths, wildcards (`/var/log/*.log`), recursive globs (`/app/logs/**/*.log`), Windows paths (`C:\Logs\*.log`), include/exclude patterns, dynamic discovery of new files.
 - **Rotation-safe tailing** — rename rotation, copy-truncate, truncation, recreation; files identified by inode (Linux) / file identity (Windows); offsets persisted so reads resume exactly where they stopped after a restart.
 - **Syslog receiver** — UDP, TCP and TLS (incl. mutual TLS) listeners on any port/binding, multiple listeners, RFC3164 + RFC5424 + JSON + raw parsing with auto-detection.
+- **Windows Event Log** (Windows-only) — native `wevtapi` collection from any channel (`Application`, `System`, `Security`, custom/Sysmon), XPath filtering, publisher-rendered messages, bookmark checkpointing for at-least-once resume after restart.
 - **Processing pipeline** — modular parse → transform → normalize → enrich → route stages; conditions (`eq/ne/contains/matches/gt/lt/exists`) on any field.
 - **Reliability** — per-destination persistent disk queue (CRC-checked segment files), at-least-once delivery, exponential backoff retry, configurable full-queue policy (`block` / `drop_oldest` / `drop_newest`), graceful shutdown, crash recovery.
 - **Outputs** — syslog UDP/TCP/TLS (RFC5424, RFC3164, JSON or raw; newline or octet-counting framing), stdout; multiple destinations, conditional routing, health-based failover destinations.
@@ -213,6 +214,7 @@ Environment variables can be referenced in the config as `${VAR}` or `${VAR:-def
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Architecture overview and design decisions |
 | [docs/INSTALL-LINUX.md](docs/INSTALL-LINUX.md) | Linux build + installation guide (systemd) |
 | [docs/INSTALL-WINDOWS.md](docs/INSTALL-WINDOWS.md) | Windows build + installation guide (Windows Service) |
+| [docs/CONFIGURATION.md](docs/CONFIGURATION.md) | **Configuration manual** — every section, option and default explained (TH: [คู่มือภาษาไทย](docs/CONFIGURATION.th.md)) |
 | [docs/OPERATIONS.md](docs/OPERATIONS.md) | Operational guide: config, reload, monitoring, troubleshooting |
 | [docs/TESTING.md](docs/TESTING.md) | Testing guide |
 | [examples/agent.yaml](examples/agent.yaml) | Full reference configuration |
@@ -221,20 +223,20 @@ Environment variables can be referenced in the config as `${VAR}` or `${VAR:-def
 
 ## Known limitations
 
-- **Windows file identity** uses creation time (stable Rust lacks volume/file-index metadata); a rotated file recreated in the same 100 ns tick would be treated as the same file (practically negligible).
+- **Windows file identity** uses creation time **plus a hash of the file's first line** (stable Rust lacks volume/file-index metadata). The first-line fingerprint disambiguates files created in the same 100 ns tick so concurrent logs are tracked independently; residual collision needs two files created in the same tick *and* with an identical first line.
 - **Copy-truncate race**: if a file is truncated *and* regrows past its previous size within one poll interval (default 500 ms), the truncation is undetectable and some bytes may be skipped or duplicated — inherent to copy-truncate rotation; prefer rename rotation.
 - **Rename-rotation tail loss**: bytes written to a file *after* the final poll before it is rotated out of the glob's scope are not read. Keep poll intervals short or have rotated files still match a pattern.
-- `raw_message` retains the original line — when masking sensitive data, also mask or remove `raw_message`.
+- `raw_message` retains the original line, but a `mask` transform targeting `message` now applies the same masking to `raw_message` automatically, so secrets do not leak through it on field-emitting outputs (e.g. `json`).
 - **At-least-once**, not exactly-once: after a crash the last un-acked batch (≤ `retry.batch_size` events) may be re-sent.
 - TCP syslog input uses newline framing only (no RFC5425 octet-counted *input*; octet-counting is supported on *output*).
 - No multiline aggregation (stack traces arrive as separate events).
 - Config reload restarts the engine (sub-second); listener sockets are closed and reopened, so in-flight UDP datagrams during the reload window can be lost.
+- **Windows Event Log**: reading the `Security` channel requires the agent to run with sufficient privilege (the Windows Service runs as LocalSystem, which satisfies this). If a publisher's message DLL is unavailable, the human-readable message falls back to the joined `EventData`; the full event XML is always preserved in `raw_message`.
 
 ## Recommended future enhancements
 
 - Octet-counted and length-prefixed framing on TCP/TLS inputs; multiline aggregation.
 - Additional outputs (HTTP/HTTPS bulk, Kafka, file archive) behind the existing `OutputWorker` trait-object seam.
-- Windows Event Log input; journald input.
+- journald input; ETW (Event Tracing for Windows) input.
 - Per-input rate limiting and backpressure metrics; queue compression.
-- Checksum-based file fingerprinting to harden Windows rotation detection.
 - Native package artifacts (deb/rpm/MSI) and signed release pipeline.

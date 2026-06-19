@@ -3,3 +3,4 @@
 *.yaml.bak
 /dist
 /target-linux
+.DS_Store

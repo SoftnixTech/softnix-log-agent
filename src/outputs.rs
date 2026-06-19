@@ -17,6 +17,11 @@ use tokio_util::sync::CancellationToken;
 /// (used for failover routing decisions).
 const UNHEALTHY_AFTER: u64 = 3;
 
+/// Maximum UDP payload for IPv4 (65535 total − 20 IP − 8 UDP headers). A single
+/// event larger than this can never be sent as one datagram, so it is dropped
+/// rather than retried forever (which would block the whole queue behind it).
+const MAX_UDP_PAYLOAD: usize = 65507;
+
 enum Sink {
     Stdout,
     Udp(UdpSocket),
@@ -91,7 +96,7 @@ impl OutputWorker {
                 }
             };
 
-            match self.send_batch(&mut sink, &batch).await {
+            match self.send_batch(&mut sink, &batch, &metrics).await {
                 Ok(()) => {
                     let n = batch.len() as u64;
                     if let Err(e) = self.queue.ack(n) {
@@ -136,7 +141,7 @@ impl OutputWorker {
         // Graceful shutdown: one bounded attempt to flush remaining events.
         if let Ok(batch) = self.queue.peek_batch(self.cfg.retry.batch_size) {
             if !batch.is_empty() {
-                let flush = self.send_batch(&mut sink, &batch);
+                let flush = self.send_batch(&mut sink, &batch, &metrics);
                 if let Ok(Ok(())) =
                     tokio::time::timeout(std::time::Duration::from_secs(3), flush).await
                 {
@@ -152,7 +157,7 @@ impl OutputWorker {
         status.update_output(&id, |s| s.connected = false);
     }
 
-    async fn send_batch(&self, sink: &mut Sink, batch: &[Event]) -> Result<()> {
+    async fn send_batch(&self, sink: &mut Sink, batch: &[Event], metrics: &Metrics) -> Result<()> {
         if matches!(sink, Sink::Disconnected) {
             *sink = self.connect().await?;
         }
@@ -180,6 +185,26 @@ impl OutputWorker {
                 // UDP is datagram-based: one event per datagram, no framing.
                 for ev in batch {
                     let line = format_event(ev, self.cfg.format);
+                    // An event larger than a single datagram can never be sent;
+                    // drop it (counted) so it doesn't wedge the head of the queue
+                    // and starve every subsequent event behind it.
+                    if line.len() > MAX_UDP_PAYLOAD {
+                        metrics
+                            .events_dropped
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        metrics.record_error(format!(
+                            "output {}: dropped oversized event ({} bytes > {} UDP limit)",
+                            self.cfg.id,
+                            line.len(),
+                            MAX_UDP_PAYLOAD
+                        ));
+                        tracing::warn!(
+                            "output {}: dropped oversized event ({} bytes) — exceeds UDP datagram limit",
+                            self.cfg.id,
+                            line.len()
+                        );
+                        continue;
+                    }
                     sock.send(line.as_bytes()).await?;
                 }
             }
@@ -268,7 +293,8 @@ pub fn format_event(ev: &Event, format: OutputFormat) -> String {
             let host = ev.hostname.as_deref().unwrap_or("-");
             let app = ev.application.as_deref().unwrap_or("softnix-log-agent");
             let pid = ev.process_id.as_deref().unwrap_or("-");
-            format!("<{pri}>1 {ts} {host} {app} {pid} - - {}", ev.message)
+            let sd = rfc5424_structured_data(ev);
+            format!("<{pri}>1 {ts} {host} {app} {pid} - {sd} {}", ev.message)
         }
         OutputFormat::Rfc3164 => {
             let pri = pri_of(ev);
@@ -281,6 +307,68 @@ pub fn format_event(ev: &Event, format: OutputFormat) -> String {
             }
         }
     }
+}
+
+/// Build the RFC 5424 STRUCTURED-DATA element from the event's custom fields
+/// (enrichment, parsed attributes, etc.). Returns the NILVALUE `-` when there
+/// is nothing to emit. Without this, enriched fields such as
+/// `environment=production` are silently dropped on the rfc5424 wire format.
+fn rfc5424_structured_data(ev: &Event) -> String {
+    let mut params = String::new();
+    for (key, val) in &ev.fields {
+        // `structured_data` holds the original raw SD text from a parsed
+        // rfc5424 input; re-wrapping it as a param would be malformed, skip it.
+        if key == "structured_data" {
+            continue;
+        }
+        let Some(value) = value_to_param(val) else {
+            continue;
+        };
+        // PARAM-NAME must be a valid SD-NAME (no space, '=', ']', '"').
+        if key.is_empty()
+            || key
+                .chars()
+                .any(|c| c == ' ' || c == '=' || c == ']' || c == '"' || (c as u32) < 33)
+        {
+            continue;
+        }
+        params.push(' ');
+        params.push_str(key);
+        params.push_str("=\"");
+        params.push_str(&sd_escape(&value));
+        params.push('"');
+    }
+    if params.is_empty() {
+        "-".to_string()
+    } else {
+        format!("[softnix@32473{params}]")
+    }
+}
+
+/// Render a field value as an SD PARAM-VALUE string. Scalars become their
+/// natural text; arrays/objects are JSON-encoded so nothing is lost.
+fn value_to_param(val: &serde_json::Value) -> Option<String> {
+    use serde_json::Value;
+    match val {
+        Value::Null => None,
+        serde_json::Value::String(s) => Some(s.clone()),
+        Value::Bool(b) => Some(b.to_string()),
+        Value::Number(n) => Some(n.to_string()),
+        other => Some(other.to_string()),
+    }
+}
+
+/// Escape the three characters that are special inside an SD PARAM-VALUE per
+/// RFC 5424 §6.3.3: '"', '\' and ']'.
+fn sd_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if c == '"' || c == '\\' || c == ']' {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
 }
 
 fn pri_of(ev: &Event) -> u8 {
@@ -309,6 +397,40 @@ mod tests {
         assert!(line.starts_with("<132>1 "));
         assert!(line.contains(" web1 nginx "));
         assert!(line.ends_with("hello world"));
+        // No custom fields -> NILVALUE structured data.
+        assert!(line.contains(" - - hello world"));
+    }
+
+    #[test]
+    fn rfc5424_emits_enrichment_as_structured_data() {
+        // PIPE-001 regression: enrichment fields must reach the rfc5424 wire,
+        // not just json. They belong in the STRUCTURED-DATA element.
+        let mut ev = Event::new("s", "syslog", "enrich test line");
+        ev.fields
+            .insert("environment".into(), serde_json::Value::String("production".into()));
+        let line = format_event(&ev, OutputFormat::Rfc5424);
+        assert!(
+            line.contains("[softnix@32473 environment=\"production\"]"),
+            "{line}"
+        );
+        // The SD slot must carry the element, not the NILVALUE, right before msg.
+        assert!(
+            line.ends_with("[softnix@32473 environment=\"production\"] enrich test line"),
+            "{line}"
+        );
+    }
+
+    #[test]
+    fn rfc5424_escapes_and_skips_raw_structured_data() {
+        let mut ev = Event::new("s", "syslog", "msg");
+        ev.fields
+            .insert("note".into(), serde_json::Value::String(r#"a"b]c\d"#.into()));
+        // structured_data holds raw parsed SD text and must not be re-wrapped.
+        ev.fields
+            .insert("structured_data".into(), serde_json::Value::String("[orig x=1]".into()));
+        let line = format_event(&ev, OutputFormat::Rfc5424);
+        assert!(line.contains(r#"note="a\"b\]c\\d""#), "{line}");
+        assert!(!line.contains("structured_data="), "{line}");
     }
 
     #[test]

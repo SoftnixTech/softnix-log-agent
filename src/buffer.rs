@@ -44,8 +44,13 @@ struct Inner {
     bytes: u64,
 }
 
+#[derive(Debug)]
 pub enum PushOutcome {
-    Stored,
+    /// Event was stored. `evicted` is the number of older events discarded to
+    /// make room under the `drop_oldest` full policy (0 otherwise). Callers
+    /// must count these toward the global dropped metric, otherwise oldest-drop
+    /// evictions are invisible on the Overview page.
+    Stored { evicted: u64 },
     Dropped,
     Full,
 }
@@ -147,6 +152,7 @@ impl DiskQueue {
         let rec_len = HEADER + payload.len() as u64;
         let mut inner = self.inner.lock().unwrap();
 
+        let mut evicted = 0u64;
         while inner.bytes + rec_len > self.max_bytes {
             match self.policy {
                 FullPolicy::Block => return Ok(PushOutcome::Full),
@@ -157,6 +163,7 @@ impl DiskQueue {
                 FullPolicy::DropOldest => {
                     let n = drop_oldest_segment(&mut inner, self.seg_bytes)?;
                     self.dropped.fetch_add(n, Ordering::Relaxed);
+                    evicted += n;
                 }
             }
         }
@@ -182,7 +189,7 @@ impl DiskQueue {
         }
         drop(inner);
         self.data_notify.notify_waiters();
-        Ok(PushOutcome::Stored)
+        Ok(PushOutcome::Stored { evicted })
     }
 
     /// Push honoring the full policy; with `block` this waits for space.
@@ -190,7 +197,7 @@ impl DiskQueue {
     pub async fn push_blocking(&self, ev: &Event, cancel: &CancellationToken) -> Result<bool> {
         loop {
             match self.push(ev)? {
-                PushOutcome::Stored | PushOutcome::Dropped => return Ok(true),
+                PushOutcome::Stored { .. } | PushOutcome::Dropped => return Ok(true),
                 PushOutcome::Full => {
                     tokio::select! {
                         _ = self.space_notify.notified() => {}
@@ -472,7 +479,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let q = DiskQueue::open(dir.path(), "d1", &cfg(16, FullPolicy::Block)).unwrap();
         for i in 0..10 {
-            assert!(matches!(q.push(&ev(i)).unwrap(), PushOutcome::Stored));
+            assert!(matches!(q.push(&ev(i)).unwrap(), PushOutcome::Stored { .. }));
         }
         assert_eq!(q.len(), 10);
         let batch = q.peek_batch(4).unwrap();
@@ -525,7 +532,7 @@ mod tests {
         let mut stored = 0;
         for _ in 0..64 {
             match q.push(&Event::new("t", "raw", &big)).unwrap() {
-                PushOutcome::Stored => stored += 1,
+                PushOutcome::Stored { .. } => stored += 1,
                 PushOutcome::Dropped => {}
                 PushOutcome::Full => panic!("unexpected Full with drop_newest"),
             }
@@ -540,13 +547,17 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let q = DiskQueue::open(dir.path(), "d1", &cfg(1, FullPolicy::DropOldest)).unwrap();
         let big = "x".repeat(64 * 1024);
+        let mut reported_evicted = 0u64;
         for _ in 0..64 {
-            assert!(matches!(
-                q.push(&Event::new("t", "raw", &big)).unwrap(),
-                PushOutcome::Stored
-            ));
+            match q.push(&Event::new("t", "raw", &big)).unwrap() {
+                PushOutcome::Stored { evicted } => reported_evicted += evicted,
+                other => panic!("unexpected outcome with drop_oldest: {other:?}"),
+            }
         }
         assert!(q.dropped() > 0);
+        // Evictions must be surfaced to the caller (Overview dropped counter),
+        // not just tracked internally — regression guard for GUI-006.
+        assert_eq!(reported_evicted, q.dropped());
         assert!(q.bytes() <= q.max_bytes() + 2 * 64 * 1024);
         // Remaining events are still readable.
         let batch = q.peek_batch(5).unwrap();

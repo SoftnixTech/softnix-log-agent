@@ -16,6 +16,10 @@ pub struct StateFile {
     /// Input ids that have completed at least one discovery pass.
     #[serde(default)]
     pub known_inputs: HashSet<String>,
+    /// Opaque resume tokens keyed by "<input_id>|<key>" (e.g. Windows Event Log
+    /// bookmarks per channel). Kept separate from file cursors.
+    #[serde(default)]
+    pub checkpoints: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -71,6 +75,23 @@ impl StateManager {
                 touched: chrono::Utc::now().timestamp(),
             },
         );
+        self.dirty.store(true, Ordering::Relaxed);
+    }
+
+    /// Read an opaque resume token (e.g. an Event Log bookmark XML).
+    pub fn get_checkpoint(&self, input_id: &str, key: &str) -> Option<String> {
+        let k = format!("{input_id}|{key}");
+        self.state.lock().unwrap().checkpoints.get(&k).cloned()
+    }
+
+    /// Store an opaque resume token. No-op (and not marked dirty) if unchanged.
+    pub fn set_checkpoint(&self, input_id: &str, key: &str, value: &str) {
+        let k = format!("{input_id}|{key}");
+        let mut st = self.state.lock().unwrap();
+        if st.checkpoints.get(&k).map(String::as_str) == Some(value) {
+            return;
+        }
+        st.checkpoints.insert(k, value.to_string());
         self.dirty.store(true, Ordering::Relaxed);
     }
 
