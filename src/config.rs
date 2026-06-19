@@ -57,6 +57,10 @@ pub struct InputsConfig {
     pub files: Vec<FileInputConfig>,
     #[serde(default)]
     pub syslog: Vec<SyslogInputConfig>,
+    /// Windows Event Log channels. Collected natively on Windows; on other
+    /// platforms a configured eventlog input is ignored with a warning.
+    #[serde(default)]
+    pub eventlog: Vec<EventLogInputConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -125,6 +129,30 @@ pub struct SyslogInputConfig {
 
 fn default_bind_all() -> String {
     "0.0.0.0".to_string()
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct EventLogInputConfig {
+    pub id: String,
+    /// Event Log channels to subscribe to, e.g. "Application", "System",
+    /// "Security", "Microsoft-Windows-Sysmon/Operational".
+    pub channels: Vec<String>,
+    /// XPath query applied to each channel; "*" selects all events. Example:
+    /// "*[System[(Level=1 or Level=2 or Level=3)]]" for critical/error/warning.
+    #[serde(default = "default_eventlog_query")]
+    pub query: String,
+    /// On first run (no saved bookmark), read existing events from the oldest
+    /// record. Default: only events arriving after the agent starts.
+    #[serde(default)]
+    pub read_existing: bool,
+    /// Override the source_type assigned to events (default: "eventlog").
+    #[serde(default)]
+    pub source_type: Option<String>,
+}
+
+fn default_eventlog_query() -> String {
+    "*".to_string()
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -574,6 +602,30 @@ pub fn validate(cfg: &Config) -> Result<Vec<String>> {
                     ));
                 }
             }
+        }
+    }
+
+    for e in &cfg.inputs.eventlog {
+        if e.id.trim().is_empty() {
+            bail!("inputs.eventlog: every eventlog input requires a non-empty `id`");
+        }
+        if !ids.insert(&e.id) {
+            bail!("duplicate input/output id: {}", e.id);
+        }
+        if e.channels.is_empty() {
+            bail!(
+                "inputs.eventlog[{}]: `channels` must list at least one channel",
+                e.id
+            );
+        }
+        if e.query.trim().is_empty() {
+            bail!("inputs.eventlog[{}]: `query` must not be empty (use \"*\")", e.id);
+        }
+        if !cfg!(windows) {
+            warnings.push(format!(
+                "inputs.eventlog[{}]: Windows Event Log input is only collected on Windows; ignored on this platform",
+                e.id
+            ));
         }
     }
 

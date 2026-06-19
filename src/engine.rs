@@ -95,6 +95,24 @@ impl Engine {
                 cancel.child_token(),
             ));
         }
+        #[cfg(windows)]
+        for e in &cfg.inputs.eventlog {
+            let input = crate::inputs::eventlog::EventLogInput::new(e);
+            tasks.push(input.spawn(
+                tx.clone(),
+                state.clone(),
+                status.clone(),
+                metrics.clone(),
+                cancel.child_token(),
+            ));
+        }
+        #[cfg(not(windows))]
+        for e in &cfg.inputs.eventlog {
+            tracing::warn!(
+                "eventlog input {:?} ignored: Windows Event Log is only collected on Windows",
+                e.id
+            );
+        }
         drop(tx); // pipeline exits once all input senders are gone
 
         // Periodic state flush + cursor pruning.
@@ -121,9 +139,10 @@ impl Engine {
         }
 
         tracing::info!(
-            "engine started: {} file input(s), {} syslog input(s), {} output(s)",
+            "engine started: {} file input(s), {} syslog input(s), {} eventlog input(s), {} output(s)",
             cfg.inputs.files.len(),
             cfg.inputs.syslog.len(),
+            cfg.inputs.eventlog.len(),
             cfg.outputs.len()
         );
 
@@ -230,7 +249,7 @@ async fn route_event(
         let result = match block_cancel {
             Some(cancel) => q.push_blocking(&ev, cancel).await.map(|stored| {
                 if stored {
-                    PushOutcome::Stored
+                    PushOutcome::Stored { evicted: 0 }
                 } else {
                     PushOutcome::Dropped
                 }
@@ -238,7 +257,16 @@ async fn route_event(
             None => q.push(&ev),
         };
         match result {
-            Ok(PushOutcome::Stored) => {}
+            // Under drop_oldest, storing a new event may evict older ones to
+            // make room; those evictions must be counted so the Overview's
+            // dropped total stays consistent with the per-queue Buffer page.
+            Ok(PushOutcome::Stored { evicted }) => {
+                if evicted > 0 {
+                    metrics
+                        .events_dropped
+                        .fetch_add(evicted, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
             Ok(PushOutcome::Dropped) | Ok(PushOutcome::Full) => {
                 metrics
                     .events_dropped

@@ -16,6 +16,20 @@ inputs:
       protocol: udp
       bind: 0.0.0.0
       port: 514
+  # Native Windows Event Log collection (Windows-only).
+  eventlog:
+    - id: winevents
+      channels:
+        - Application
+        - System
+        - Security
+        # - Microsoft-Windows-Sysmon/Operational
+      # XPath filter; "*" = all events. Example below keeps
+      # Critical/Error/Warning only:
+      # query: "*[System[(Level=1 or Level=2 or Level=3)]]"
+      query: "*"
+      # On first run, collect only new events (set true to backfill existing).
+      read_existing: false
 
 pipeline:
   enrich:

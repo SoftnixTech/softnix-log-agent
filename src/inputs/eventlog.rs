@@ -1,0 +1,588 @@
+//! Windows Event Log input (Windows-only).
+//!
+//! Uses the modern Windows Event Log API (`wevtapi`) via a *pull* subscription:
+//! `EvtSubscribe` signals a kernel event when new records arrive, then
+//! `EvtNext`/`EvtRender` drain them as XML. Progress is checkpointed with an
+//! `EvtBookmark` persisted through [`StateManager`], giving at-least-once
+//! delivery that resumes after a restart without re-sending old events.
+//!
+//! One blocking OS task is run per (input, channel) pair; the API is inherently
+//! blocking (`WaitForSingleObject`) so it lives on the blocking thread pool.
+
+use crate::config::EventLogInputConfig;
+use crate::event::Event;
+use crate::metrics::{InputStatus, Metrics, StatusRegistry};
+use crate::state::StateManager;
+use chrono::Utc;
+use serde_json::Value;
+use std::ffi::c_void;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
+
+use windows::core::PCWSTR;
+use windows::Win32::Foundation::{
+    CloseHandle, ERROR_INSUFFICIENT_BUFFER, ERROR_NO_MORE_ITEMS, HANDLE,
+};
+use windows::Win32::System::EventLog::{
+    EvtClose, EvtCreateBookmark, EvtFormatMessage, EvtFormatMessageEvent, EvtNext,
+    EvtOpenPublisherMetadata, EvtRender, EvtRenderBookmark, EvtRenderEventXml, EvtSubscribe,
+    EvtSubscribeStartAfterBookmark, EvtSubscribeStartAtOldestRecord, EvtSubscribeToFutureEvents,
+    EvtUpdateBookmark, EVT_HANDLE,
+};
+use windows::Win32::System::Threading::{CreateEventW, ResetEvent, WaitForSingleObject};
+
+/// Events fetched per `EvtNext` call.
+const BATCH: usize = 64;
+/// How often the WaitForSingleObject loop wakes to re-check cancellation.
+const WAIT_MS: u32 = 1000;
+
+pub struct EventLogInput {
+    cfg: EventLogInputConfig,
+    source_type: String,
+}
+
+impl EventLogInput {
+    pub fn new(cfg: &EventLogInputConfig) -> Self {
+        EventLogInput {
+            source_type: cfg.source_type.clone().unwrap_or_else(|| "eventlog".into()),
+            cfg: cfg.clone(),
+        }
+    }
+
+    /// Spawn one blocking collector per channel; the returned task completes
+    /// when every channel has stopped (on cancellation or fatal error).
+    pub fn spawn(
+        self,
+        tx: mpsc::Sender<Event>,
+        state: Arc<StateManager>,
+        status: Arc<StatusRegistry>,
+        metrics: Arc<Metrics>,
+        cancel: CancellationToken,
+    ) -> tokio::task::JoinHandle<()> {
+        status.set_input(InputStatus {
+            id: self.cfg.id.clone(),
+            kind: "eventlog".into(),
+            detail: self.cfg.channels.join(", "),
+            active: true,
+            events: 0,
+            last_error: None,
+        });
+        tokio::spawn(async move {
+            let mut handles = Vec::new();
+            for channel in self.cfg.channels.clone() {
+                let cfg = self.cfg.clone();
+                let source_type = self.source_type.clone();
+                let (tx, state, status, metrics, cancel) = (
+                    tx.clone(),
+                    state.clone(),
+                    status.clone(),
+                    metrics.clone(),
+                    cancel.clone(),
+                );
+                handles.push(tokio::task::spawn_blocking(move || {
+                    if let Err(e) = run_channel(
+                        &cfg,
+                        &channel,
+                        &source_type,
+                        &tx,
+                        &state,
+                        &status,
+                        &metrics,
+                        &cancel,
+                    ) {
+                        metrics.record_error(format!(
+                            "eventlog {} channel {channel}: {e}",
+                            cfg.id
+                        ));
+                        status.update_input(&cfg.id, |s| s.last_error = Some(e.to_string()));
+                    }
+                }));
+            }
+            for h in handles {
+                let _ = h.await;
+            }
+            status.update_input(&self.cfg.id, |s| s.active = false);
+        })
+    }
+}
+
+/// Null `EVT_HANDLE` (local session / empty handle).
+fn null_handle() -> EVT_HANDLE {
+    EVT_HANDLE::default()
+}
+
+fn wide(s: &str) -> Vec<u16> {
+    s.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_channel(
+    cfg: &EventLogInputConfig,
+    channel: &str,
+    source_type: &str,
+    tx: &mpsc::Sender<Event>,
+    state: &StateManager,
+    status: &StatusRegistry,
+    metrics: &Metrics,
+    cancel: &CancellationToken,
+) -> windows::core::Result<()> {
+    let chan_w = wide(channel);
+    let query_w = wide(&cfg.query);
+
+    unsafe {
+        // Manual-reset signal event fired by the subscription on new records.
+        let signal: HANDLE = CreateEventW(None, true, false, PCWSTR::null())?;
+
+        // Bookmark used to checkpoint progress (and to render the resume token).
+        let upd_bookmark = EvtCreateBookmark(PCWSTR::null())?;
+
+        // Resume position: after the saved bookmark if we have one, else from
+        // the oldest record (read_existing) or only future events.
+        let saved = state.get_checkpoint(cfg.id.as_str(), channel);
+        let (start_bookmark, flags) = match &saved {
+            Some(xml) => {
+                let bw = wide(xml);
+                (
+                    Some(EvtCreateBookmark(PCWSTR(bw.as_ptr()))?),
+                    EvtSubscribeStartAfterBookmark.0,
+                )
+            }
+            None if cfg.read_existing => (None, EvtSubscribeStartAtOldestRecord.0),
+            None => (None, EvtSubscribeToFutureEvents.0),
+        };
+
+        let sub = EvtSubscribe(
+            null_handle(),
+            signal,
+            PCWSTR(chan_w.as_ptr()),
+            PCWSTR(query_w.as_ptr()),
+            start_bookmark.unwrap_or_default(),
+            None,
+            None,
+            flags,
+        )?;
+        if let Some(b) = start_bookmark {
+            let _ = EvtClose(b);
+        }
+
+        let mut last_flush = Instant::now();
+        let result = drain_loop(
+            sub,
+            signal,
+            upd_bookmark,
+            cfg,
+            channel,
+            source_type,
+            tx,
+            state,
+            status,
+            metrics,
+            cancel,
+            &mut last_flush,
+        );
+
+        // Persist final position and release handles.
+        if let Ok(xml) = render_bookmark(upd_bookmark) {
+            state.set_checkpoint(cfg.id.as_str(), channel, &xml);
+        }
+        let _ = EvtClose(sub);
+        let _ = EvtClose(upd_bookmark);
+        let _ = CloseHandle(signal);
+        result
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn drain_loop(
+    sub: EVT_HANDLE,
+    signal: HANDLE,
+    upd_bookmark: EVT_HANDLE,
+    cfg: &EventLogInputConfig,
+    channel: &str,
+    source_type: &str,
+    tx: &mpsc::Sender<Event>,
+    state: &StateManager,
+    status: &StatusRegistry,
+    metrics: &Metrics,
+    cancel: &CancellationToken,
+    last_flush: &mut Instant,
+) -> windows::core::Result<()> {
+    loop {
+        if cancel.is_cancelled() {
+            return Ok(());
+        }
+        // Block (briefly) until new records arrive, then drain them all.
+        let _ = WaitForSingleObject(signal, WAIT_MS);
+
+        loop {
+            if cancel.is_cancelled() {
+                return Ok(());
+            }
+            let mut events = [0isize; BATCH];
+            let mut returned = 0u32;
+            let next = EvtNext(sub, &mut events, 0, 0, &mut returned);
+            if let Err(e) = next {
+                if e.code() == ERROR_NO_MORE_ITEMS.to_hresult() {
+                    let _ = ResetEvent(signal);
+                    break; // wait for the next signal
+                }
+                return Err(e);
+            }
+
+            let mut emitted = 0u64;
+            for &raw in events.iter().take(returned as usize) {
+                let ev_handle = EVT_HANDLE(raw);
+                match render_xml(ev_handle) {
+                    Ok(xml) => {
+                        let event = build_event(&xml, ev_handle, channel, source_type);
+                        emitted += 1;
+                        metrics
+                            .events_received
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        // Advance the bookmark before handing the event off so a
+                        // crash re-sends at most the in-flight record.
+                        let _ = EvtUpdateBookmark(upd_bookmark, ev_handle);
+                        let _ = EvtClose(ev_handle);
+                        if tx.blocking_send(event).is_err() {
+                            return Ok(()); // pipeline shut down
+                        }
+                    }
+                    Err(e) => {
+                        let _ = EvtClose(ev_handle);
+                        metrics.record_error(format!("eventlog {}: render: {e}", cfg.id));
+                    }
+                }
+            }
+
+            if emitted > 0 {
+                status.update_input(&cfg.id, |s| s.events += emitted);
+            }
+            // Checkpoint at most once per second to bound state-file writes.
+            if last_flush.elapsed() >= Duration::from_secs(1) {
+                if let Ok(xml) = render_bookmark(upd_bookmark) {
+                    state.set_checkpoint(cfg.id.as_str(), channel, &xml);
+                }
+                *last_flush = Instant::now();
+            }
+
+            if (returned as usize) < BATCH {
+                let _ = ResetEvent(signal);
+                break;
+            }
+        }
+    }
+}
+
+/// Render an event handle to its XML representation.
+unsafe fn render_xml(event: EVT_HANDLE) -> windows::core::Result<String> {
+    render_handle(null_handle(), event, EvtRenderEventXml.0)
+}
+
+/// Render the bookmark handle to its persistable XML token.
+unsafe fn render_bookmark(bookmark: EVT_HANDLE) -> windows::core::Result<String> {
+    render_handle(null_handle(), bookmark, EvtRenderBookmark.0)
+}
+
+/// Shared two-pass `EvtRender`: probe for the buffer size, then render. The
+/// buffer is UTF-16; `bufferused` is a byte count.
+unsafe fn render_handle(
+    context: EVT_HANDLE,
+    fragment: EVT_HANDLE,
+    flags: u32,
+) -> windows::core::Result<String> {
+    let mut used = 0u32;
+    let mut props = 0u32;
+    // First call sizes the buffer (expected to fail with INSUFFICIENT_BUFFER).
+    if let Err(e) = EvtRender(context, fragment, flags, 0, None, &mut used, &mut props) {
+        if e.code() != ERROR_INSUFFICIENT_BUFFER.to_hresult() {
+            return Err(e);
+        }
+    }
+    let mut buf = vec![0u8; used as usize];
+    EvtRender(
+        context,
+        fragment,
+        flags,
+        used,
+        Some(buf.as_mut_ptr() as *mut c_void),
+        &mut used,
+        &mut props,
+    )?;
+    Ok(utf16_bytes_to_string(&buf[..used as usize]))
+}
+
+/// Best-effort human-readable message via the publisher's metadata. Falls back
+/// to `None` when the provider is unknown or has no message for the event.
+unsafe fn format_message(event: EVT_HANDLE, provider: &str) -> Option<String> {
+    if provider.is_empty() {
+        return None;
+    }
+    let pw = wide(provider);
+    let meta = EvtOpenPublisherMetadata(null_handle(), PCWSTR(pw.as_ptr()), PCWSTR::null(), 0, 0)
+        .ok()?;
+    let mut used = 0u32;
+    // Probe length (in characters).
+    let _ = EvtFormatMessage(meta, event, 0, None, EvtFormatMessageEvent.0, None, &mut used);
+    let result = if used > 0 {
+        let mut buf = vec![0u16; used as usize];
+        match EvtFormatMessage(
+            meta,
+            event,
+            0,
+            None,
+            EvtFormatMessageEvent.0,
+            Some(&mut buf),
+            &mut used,
+        ) {
+            Ok(()) => {
+                let end = (used as usize).saturating_sub(1).min(buf.len());
+                let s = String::from_utf16_lossy(&buf[..end]);
+                let s = s.trim_end_matches(['\0', '\r', '\n']).to_string();
+                if s.is_empty() {
+                    None
+                } else {
+                    Some(s)
+                }
+            }
+            Err(_) => None,
+        }
+    } else {
+        None
+    };
+    let _ = EvtClose(meta);
+    result
+}
+
+fn utf16_bytes_to_string(bytes: &[u8]) -> String {
+    let u16s: Vec<u16> = bytes
+        .chunks_exact(2)
+        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .collect();
+    String::from_utf16_lossy(&u16s)
+        .trim_end_matches('\0')
+        .to_string()
+}
+
+/// Windows event Level -> syslog severity (0..7).
+fn level_to_severity(level: u8) -> u8 {
+    match level {
+        1 => 2, // Critical
+        2 => 3, // Error
+        3 => 4, // Warning
+        4 => 6, // Information
+        5 => 7, // Verbose
+        _ => 6, // LogAlways / unknown
+    }
+}
+
+/// Parse the rendered System/EventData XML and assemble an [`Event`].
+unsafe fn build_event(
+    xml: &str,
+    event: EVT_HANDLE,
+    channel: &str,
+    source_type: &str,
+) -> Event {
+    let p = parse_event_xml(xml);
+
+    // Message: prefer the formatted publisher message, then EventData, then a
+    // synthesized line; the full XML is always retained as raw_message.
+    let message = format_message(event, &p.provider)
+        .or_else(|| {
+            if p.data.is_empty() {
+                None
+            } else {
+                Some(
+                    p.data
+                        .iter()
+                        .map(|(k, v)| if k.is_empty() { v.clone() } else { format!("{k}={v}") })
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                )
+            }
+        })
+        .unwrap_or_else(|| {
+            format!(
+                "{} event {} on {}",
+                if p.provider.is_empty() { "Windows" } else { &p.provider },
+                p.event_id.unwrap_or(0),
+                channel
+            )
+        });
+
+    let mut ev = Event::new(channel, source_type, &message);
+    ev.raw_message = Some(xml.to_string());
+
+    if let Some(ts) = p
+        .time_created
+        .as_deref()
+        .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
+    {
+        ev.timestamp = ts.with_timezone(&Utc);
+    }
+    if !p.provider.is_empty() {
+        ev.application = Some(p.provider.clone());
+    }
+    if let Some(c) = &p.computer {
+        ev.hostname = Some(c.clone());
+    }
+    if let Some(pid) = &p.process_id {
+        ev.process_id = Some(pid.clone());
+    }
+    if let Some(level) = p.level {
+        ev.severity = Some(level_to_severity(level));
+        ev.fields.insert("level".into(), Value::from(level));
+    }
+    if let Some(id) = p.event_id {
+        ev.fields.insert("event_id".into(), Value::from(id));
+    }
+    if let Some(rid) = &p.record_id {
+        ev.fields.insert("record_id".into(), Value::from(rid.clone()));
+    }
+    if let Some(k) = &p.keywords {
+        ev.fields.insert("keywords".into(), Value::from(k.clone()));
+    }
+    ev.fields.insert("channel".into(), Value::from(channel));
+    for (k, v) in &p.data {
+        if !k.is_empty() {
+            ev.fields.insert(format!("data_{k}"), Value::from(v.clone()));
+        }
+    }
+    ev
+}
+
+#[derive(Default)]
+struct ParsedEvent {
+    provider: String,
+    event_id: Option<u64>,
+    level: Option<u8>,
+    time_created: Option<String>,
+    computer: Option<String>,
+    record_id: Option<String>,
+    process_id: Option<String>,
+    keywords: Option<String>,
+    data: Vec<(String, String)>,
+}
+
+/// Minimal parser for the fixed Event Log XML schema. Pulls System metadata
+/// and EventData `Data` items without assuming attribute ordering.
+fn parse_event_xml(xml: &str) -> ParsedEvent {
+    use quick_xml::events::Event as Xml;
+    use quick_xml::reader::Reader;
+
+    let mut reader = Reader::from_str(xml);
+    let mut p = ParsedEvent::default();
+    let mut cur: Vec<u8> = Vec::new(); // current text-bearing element name
+    let mut cur_data_name = String::new();
+    let mut in_event_data = false;
+
+    let attr = |e: &quick_xml::events::BytesStart, name: &[u8]| -> Option<String> {
+        e.attributes().flatten().find_map(|a| {
+            if a.key.as_ref() == name {
+                Some(String::from_utf8_lossy(&a.value).into_owned())
+            } else {
+                None
+            }
+        })
+    };
+
+    loop {
+        match reader.read_event() {
+            Ok(Xml::Start(e)) | Ok(Xml::Empty(e)) => {
+                let name = e.name().as_ref().to_vec();
+                match name.as_slice() {
+                    b"Provider" => {
+                        if let Some(v) = attr(&e, b"Name") {
+                            p.provider = v;
+                        }
+                    }
+                    b"TimeCreated" => p.time_created = attr(&e, b"SystemTime"),
+                    b"Execution" => p.process_id = attr(&e, b"ProcessID"),
+                    b"EventData" => in_event_data = true,
+                    b"Data" => cur_data_name = attr(&e, b"Name").unwrap_or_default(),
+                    _ => {}
+                }
+                cur = name;
+            }
+            Ok(Xml::Text(t)) => {
+                let text = t.unescape().map(|c| c.into_owned()).unwrap_or_default();
+                if text.trim().is_empty() {
+                    continue;
+                }
+                if in_event_data && cur.as_slice() == b"Data" {
+                    p.data.push((std::mem::take(&mut cur_data_name), text));
+                } else {
+                    match cur.as_slice() {
+                        b"EventID" => p.event_id = text.trim().parse().ok(),
+                        b"Level" => p.level = text.trim().parse().ok(),
+                        b"Computer" => p.computer = Some(text),
+                        b"EventRecordID" => p.record_id = Some(text),
+                        b"Keywords" => p.keywords = Some(text),
+                        _ => {}
+                    }
+                }
+            }
+            Ok(Xml::End(e)) => {
+                if e.name().as_ref() == b"EventData" {
+                    in_event_data = false;
+                }
+                cur.clear();
+            }
+            Ok(Xml::Eof) => break,
+            Err(_) => break,
+            _ => {}
+        }
+    }
+    p
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SAMPLE: &str = r#"<Event xmlns='http://schemas.microsoft.com/win/2004/08/events/event'>
+      <System>
+        <Provider Name='Microsoft-Windows-Security-Auditing'/>
+        <EventID>4624</EventID>
+        <Level>4</Level>
+        <TimeCreated SystemTime='2026-06-19T09:52:35.713000000Z'/>
+        <EventRecordID>91234</EventRecordID>
+        <Execution ProcessID='720' ThreadID='810'/>
+        <Channel>Security</Channel>
+        <Computer>WIN-HOST</Computer>
+      </System>
+      <EventData>
+        <Data Name='TargetUserName'>alice</Data>
+        <Data Name='LogonType'>3</Data>
+      </EventData>
+    </Event>"#;
+
+    #[test]
+    fn parses_system_and_eventdata() {
+        let p = parse_event_xml(SAMPLE);
+        assert_eq!(p.provider, "Microsoft-Windows-Security-Auditing");
+        assert_eq!(p.event_id, Some(4624));
+        assert_eq!(p.level, Some(4));
+        assert_eq!(p.computer.as_deref(), Some("WIN-HOST"));
+        assert_eq!(p.record_id.as_deref(), Some("91234"));
+        assert_eq!(p.process_id.as_deref(), Some("720"));
+        assert_eq!(p.time_created.as_deref(), Some("2026-06-19T09:52:35.713000000Z"));
+        assert_eq!(
+            p.data,
+            vec![
+                ("TargetUserName".to_string(), "alice".to_string()),
+                ("LogonType".to_string(), "3".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn level_maps_to_syslog_severity() {
+        assert_eq!(level_to_severity(1), 2); // Critical
+        assert_eq!(level_to_severity(2), 3); // Error
+        assert_eq!(level_to_severity(3), 4); // Warning
+        assert_eq!(level_to_severity(4), 6); // Information
+        assert_eq!(level_to_severity(0), 6); // LogAlways
+    }
+}

@@ -40,6 +40,8 @@ Alert suggestions: `agent_output_healthy == 0` for >5 min; `agent_queue_bytes` a
 |---|---|
 | No events from a file input | Inputs page error column; glob quoting (quote patterns containing `*` in YAML); file readable by the service user; on first run pre-existing content is skipped unless `read_from_start: true`. |
 | Events missing after rotation | Prefer rename rotation; ensure rotated files leave the glob scope *after* the last poll; check agent logs for `truncated` messages. |
+| No events from an eventlog input (Windows) | Confirm running on Windows (ignored elsewhere with a validation warning); channel name spelled exactly (`Microsoft-Windows-Sysmon/Operational`); for the `Security` channel the service must run as LocalSystem / Event Log Readers; check the Inputs page error column and the agent log for `eventlog … channel …` errors; verify the XPath `query` is valid. |
+| Eventlog message shows raw data, not a description | The provider's message DLL is missing/unavailable on this host; the agent falls back to joined `EventData` (full XML is always in `raw_message`). |
 | Destination unhealthy | Outputs page last error; TLS: cert chain/hostname (`tls.server_name` to override SNI), mTLS cert/key pair; reachability with `nc`/`Test-NetConnection`. |
 | Queue grows during normal operation | Destination slower than ingest; raise `batch_size`, check destination, or add a second destination with routing. |
 | Duplicates at destination | Expected (at-least-once) after crash/restart of agent or destination; window ≤ one batch per destination. |
