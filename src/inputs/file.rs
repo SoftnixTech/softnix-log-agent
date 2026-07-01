@@ -27,9 +27,10 @@ const READ_BUDGET: u64 = 4 * 1024 * 1024;
 /// Lines longer than this are emitted even without a trailing newline.
 const MAX_LINE: usize = 1024 * 1024;
 
-/// Upper bound on bytes scanned to fingerprint a file's first line on platforms
-/// without a stable file-id. Caps the cost for a pathologically long first line.
-#[cfg(any(windows, test))]
+/// Upper bound on bytes scanned to fingerprint a file's first line. Caps the
+/// cost for a pathologically long first line. Used on Windows for file identity
+/// and on Unix for copy-truncate race detection.
+#[cfg(any(unix, windows, test))]
 const FINGERPRINT_BYTES: usize = 512;
 
 #[cfg(unix)]
@@ -60,7 +61,13 @@ fn file_identity(path: &Path, md: &std::fs::Metadata) -> String {
 /// identity mid-life and trigger spurious re-reads). Before the first newline
 /// exists no complete line is emitted, so a hash change in that window cannot
 /// duplicate data.
-#[cfg(any(windows, test))]
+///
+/// On Windows this is part of `file_identity`. On Unix it backs the copy-truncate
+/// race detector in `poll_once` (see FILE-004): `dev:ino` is stable across
+/// truncate+regrow, so the `size < offset` check alone misses a truncation that
+/// regrows past the old offset within one poll interval — comparing the first
+/// line catches it.
+#[cfg(any(unix, windows, test))]
 fn head_fingerprint(path: &Path) -> Option<u32> {
     let mut f = File::open(path).ok()?;
     let mut buf = vec![0u8; FINGERPRINT_BYTES];
@@ -89,6 +96,12 @@ fn head_fingerprint(path: &Path) -> Option<u32> {
 struct Tracked {
     identity: String,
     offset: u64,
+    /// Hash of the file's first line, recorded once we've advanced `offset`
+    /// past 0. Used on Unix to detect the copy-truncate race (FILE-004):
+    /// `dev:ino` is stable across truncate+regrow, so a content-based signal
+    /// is needed when the file has already regrown past the old offset.
+    #[cfg(unix)]
+    first_line_hash: Option<u32>,
 }
 
 pub struct FileInput {
@@ -221,7 +234,12 @@ impl FileInput {
                             .get_cursor(id, &identity)
                             .map(|c| c.offset)
                             .unwrap_or(0);
-                        *o.get_mut() = Tracked { identity, offset };
+                        *o.get_mut() = Tracked {
+                            identity,
+                            offset,
+                            #[cfg(unix)]
+                            first_line_hash: None,
+                        };
                     }
                     o.into_mut()
                 }
@@ -234,7 +252,12 @@ impl FileInput {
                         None if skip_existing && !self.cfg.read_from_start => size,
                         None => 0,
                     };
-                    v.insert(Tracked { identity, offset })
+                    v.insert(Tracked {
+                        identity,
+                        offset,
+                        #[cfg(unix)]
+                        first_line_hash: None,
+                    })
                 }
             };
 
@@ -242,6 +265,29 @@ impl FileInput {
             if size < t.offset {
                 tracing::info!("file {} truncated; restarting from 0", path.display());
                 t.offset = 0;
+            }
+            // FILE-004: copy-truncate race on Unix — file was truncated AND
+            // regrown past the old offset within one poll interval, so the
+            // `size < offset` check above doesn't fire (size already exceeds
+            // offset). The first line changes on truncate+rewrite but is stable
+            // for normal appends, so a hash mismatch is a reliable rotation
+            // signal that `dev:ino` cannot provide (inode survives truncate).
+            // The fingerprint is recomputed every poll (cheap: ≤512 bytes, one
+            // read) so a truncate between the first and second poll is caught
+            // even before offset has had a chance to advance from 0.
+            #[cfg(unix)]
+            {
+                let prev = t.first_line_hash;
+                if let Some(curr) = head_fingerprint(&path) {
+                    if t.offset > 0 && prev.is_some() && prev != Some(curr) {
+                        tracing::info!(
+                            "file {} first line changed since last poll; restarting from 0",
+                            path.display()
+                        );
+                        t.offset = 0;
+                    }
+                    t.first_line_hash = Some(curr);
+                }
             }
             if size == t.offset {
                 state.set_cursor(id, &t.identity, &path_str, t.offset);
@@ -463,6 +509,55 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(collect(&mut rx).await, vec!["after-trunc"]);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn detects_copy_truncate_race_on_unix() {
+        // FILE-004 regression: on Unix, `dev:ino` survives truncate, so when a
+        // file is truncated AND regrown past the old offset between two polls,
+        // the `size < offset` check does not fire and the bytes written into
+        // the byte range 0..old_offset are silently lost. The first-line
+        // fingerprint must catch this.
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let state_dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("app.log");
+        std::fs::write(&log, "first line\nsecond line\n").unwrap();
+
+        let input = input_for(dir.path());
+        let state = Arc::new(StateManager::open(state_dir.path()).unwrap());
+        let metrics = Arc::new(Metrics::default());
+        let (tx, mut rx) = mpsc::channel(100);
+        let cancel = CancellationToken::new();
+        let mut tracked = HashMap::new();
+
+        // Initial read: offset advances to 23 and the fingerprint is recorded.
+        input
+            .poll_once(&tx, &state, &metrics, &mut tracked, false, &cancel)
+            .await
+            .unwrap();
+        assert_eq!(collect(&mut rx).await, vec!["first line", "second line"]);
+
+        // Single-step truncate + regrow past the old offset (23 bytes). The new
+        // first line differs from the stored fingerprint, forcing a reset to 0.
+        let mut f = std::fs::File::create(&log).unwrap();
+        f.write_all(b"replacement A\nreplacement B\nreplacement C\n").unwrap();
+        drop(f);
+
+        input
+            .poll_once(&tx, &state, &metrics, &mut tracked, false, &cancel)
+            .await
+            .unwrap();
+
+        // Without the fix: only "replacement C" (the bytes past offset 23)
+        // would arrive. With the fix: all three lines, read from offset 0.
+        let got = collect(&mut rx).await;
+        assert_eq!(
+            got,
+            vec!["replacement A", "replacement B", "replacement C"],
+            "copy-truncate race should be detected; got {got:?}"
+        );
     }
 
     #[tokio::test]
