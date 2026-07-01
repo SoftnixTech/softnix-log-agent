@@ -115,7 +115,9 @@ impl SyslogInput {
                             }
                         }
                         Err(e) => {
-                            metrics.record_error(format!("syslog {} udp recv: {e}", self.cfg.id));
+                            let msg = format!("syslog {} udp recv: {e}", self.cfg.id);
+                            tracing::warn!("{msg}");
+                            metrics.record_error(&msg);
                             status.update_input(&self.cfg.id, |s| s.last_error = Some(e.to_string()));
                             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                         }
@@ -145,7 +147,9 @@ impl SyslogInput {
                     let (stream, peer) = match res {
                         Ok(x) => x,
                         Err(e) => {
-                            metrics.record_error(format!("syslog {} accept: {e}", me.cfg.id));
+                            let msg = format!("syslog {} accept: {e}", me.cfg.id);
+                            tracing::warn!("{msg}");
+                            metrics.record_error(&msg);
                             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                             continue;
                         }

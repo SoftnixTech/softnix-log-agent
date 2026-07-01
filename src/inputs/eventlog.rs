@@ -37,6 +37,16 @@ use windows::Win32::System::Threading::{CreateEventW, ResetEvent, WaitForSingleO
 const BATCH: usize = 64;
 /// How often the WaitForSingleObject loop wakes to re-check cancellation.
 const WAIT_MS: u32 = 1000;
+/// Re-subscribe backoff (milliseconds): starts here, doubles, capped at 30 s.
+const RESUBSCRIBE_INITIAL_BACKOFF_MS: u64 = 500;
+const RESUBSCRIBE_MAX_BACKOFF_MS: u64 = 30_000;
+/// Demote a flapping channel to fatal after this many consecutive transient
+/// failures, so a permanently broken channel does not spin silently.
+const RESUBSCRIBE_MAX_ATTEMPTS: u32 = 10;
+/// `HRESULT_FROM_WIN32(ERROR_INVALID_OPERATION)` — observed at the
+/// real-time transition when the agent runs in Session 0 (Windows Service).
+/// Re-subscribing from the persisted bookmark typically clears it.
+const HRESULT_INVALID_OPERATION: i32 = 0x8007_10DD_u32 as i32;
 
 pub struct EventLogInput {
     cfg: EventLogInputConfig,
@@ -92,10 +102,9 @@ impl EventLogInput {
                         &metrics,
                         &cancel,
                     ) {
-                        metrics.record_error(format!(
-                            "eventlog {} channel {channel}: {e}",
-                            cfg.id
-                        ));
+                        let msg = format!("eventlog {} channel {channel}: {e}", cfg.id);
+                        tracing::error!("{msg}");
+                        metrics.record_error(&msg);
                         status.update_input(&cfg.id, |s| s.last_error = Some(e.to_string()));
                     }
                 }));
@@ -131,67 +140,153 @@ fn run_channel(
     let chan_w = wide(channel);
     let query_w = wide(&cfg.query);
 
-    unsafe {
-        // Manual-reset signal event fired by the subscription on new records.
-        let signal: HANDLE = CreateEventW(None, true, false, PCWSTR::null())?;
+    let mut backoff_ms = RESUBSCRIBE_INITIAL_BACKOFF_MS;
+    let mut consecutive_failures = 0u32;
 
-        // Bookmark used to checkpoint progress (and to render the resume token).
-        let upd_bookmark = EvtCreateBookmark(PCWSTR::null())?;
-
-        // Resume position: after the saved bookmark if we have one, else from
-        // the oldest record (read_existing) or only future events.
+    loop {
+        if cancel.is_cancelled() {
+            return Ok(());
+        }
+        // Read the latest bookmark before every attempt: a previous iteration
+        // may have advanced it before failing, and re-subscribing from the
+        // stale position would re-send already-delivered events.
         let saved = state.get_checkpoint(cfg.id.as_str(), channel);
-        let (start_bookmark, flags) = match &saved {
-            Some(xml) => {
-                let bw = wide(xml);
-                (
-                    Some(EvtCreateBookmark(PCWSTR(bw.as_ptr()))?),
-                    EvtSubscribeStartAfterBookmark.0,
-                )
-            }
-            None if cfg.read_existing => (None, EvtSubscribeStartAtOldestRecord.0),
-            None => (None, EvtSubscribeToFutureEvents.0),
+
+        let attempt = unsafe {
+            subscribe_and_drain(
+                &chan_w,
+                &query_w,
+                saved.as_deref(),
+                cfg,
+                channel,
+                source_type,
+                tx,
+                state,
+                status,
+                metrics,
+                cancel,
+            )
         };
 
-        let sub = EvtSubscribe(
-            null_handle(),
-            signal,
-            PCWSTR(chan_w.as_ptr()),
-            PCWSTR(query_w.as_ptr()),
-            start_bookmark.unwrap_or_default(),
-            None,
-            None,
-            flags,
-        )?;
-        if let Some(b) = start_bookmark {
-            let _ = EvtClose(b);
+        match attempt {
+            Ok(()) => return Ok(()),
+            Err(e) if is_transient(&e) => {
+                consecutive_failures += 1;
+                if consecutive_failures >= RESUBSCRIBE_MAX_ATTEMPTS {
+                    tracing::error!(
+                        "eventlog {} channel {channel}: {consecutive_failures} consecutive \
+                         transient failures (last: {e}); giving up",
+                        cfg.id
+                    );
+                    return Err(e);
+                }
+                tracing::warn!(
+                    "eventlog {} channel {channel}: transient error {e} (attempt \
+                     {consecutive_failures}); re-subscribing from bookmark in {backoff_ms}ms",
+                    cfg.id
+                );
+                status.update_input(&cfg.id, |s| {
+                    s.last_error = Some(format!("{e} (re-subscribing, attempt {consecutive_failures})"));
+                });
+                // Sleep on the blocking thread, but wake frequently enough to
+                // honor cancellation promptly.
+                let until = Instant::now() + Duration::from_millis(backoff_ms);
+                while Instant::now() < until {
+                    if cancel.is_cancelled() {
+                        return Ok(());
+                    }
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+                backoff_ms = (backoff_ms * 2).min(RESUBSCRIBE_MAX_BACKOFF_MS);
+            }
+            Err(e) => return Err(e),
         }
-
-        let mut last_flush = Instant::now();
-        let result = drain_loop(
-            sub,
-            signal,
-            upd_bookmark,
-            cfg,
-            channel,
-            source_type,
-            tx,
-            state,
-            status,
-            metrics,
-            cancel,
-            &mut last_flush,
-        );
-
-        // Persist final position and release handles.
-        if let Ok(xml) = render_bookmark(upd_bookmark) {
-            state.set_checkpoint(cfg.id.as_str(), channel, &xml);
-        }
-        let _ = EvtClose(sub);
-        let _ = EvtClose(upd_bookmark);
-        let _ = CloseHandle(signal);
-        result
     }
+}
+
+/// Returns true if the error is potentially recoverable by re-subscribing from
+/// the persisted bookmark. Kept narrow on purpose: only errors we have evidence
+/// are recoverable. Add to this allowlist as new transient codes are confirmed.
+fn is_transient(e: &windows::core::Error) -> bool {
+    e.code().0 == HRESULT_INVALID_OPERATION
+}
+
+/// One full subscription lifecycle: create handles, EvtSubscribe, drain until
+/// error/cancellation, persist bookmark, close handles. Returns the underlying
+/// error so the caller can decide whether to retry.
+#[allow(clippy::too_many_arguments)]
+unsafe fn subscribe_and_drain(
+    chan_w: &[u16],
+    query_w: &[u16],
+    saved_bookmark: Option<&str>,
+    cfg: &EventLogInputConfig,
+    channel: &str,
+    source_type: &str,
+    tx: &mpsc::Sender<Event>,
+    state: &StateManager,
+    status: &StatusRegistry,
+    metrics: &Metrics,
+    cancel: &CancellationToken,
+) -> windows::core::Result<()> {
+    // Manual-reset signal event fired by the subscription on new records.
+    let signal: HANDLE = CreateEventW(None, true, false, PCWSTR::null())?;
+
+    // Bookmark used to checkpoint progress (and to render the resume token).
+    let upd_bookmark = EvtCreateBookmark(PCWSTR::null())?;
+
+    // Resume position: after the saved bookmark if we have one, else from
+    // the oldest record (read_existing) or only future events.
+    let (start_bookmark, flags) = match saved_bookmark {
+        Some(xml) => {
+            let bw = wide(xml);
+            (
+                Some(EvtCreateBookmark(PCWSTR(bw.as_ptr()))?),
+                EvtSubscribeStartAfterBookmark.0,
+            )
+        }
+        None if cfg.read_existing => (None, EvtSubscribeStartAtOldestRecord.0),
+        None => (None, EvtSubscribeToFutureEvents.0),
+    };
+
+    let sub = EvtSubscribe(
+        null_handle(),
+        signal,
+        PCWSTR(chan_w.as_ptr()),
+        PCWSTR(query_w.as_ptr()),
+        start_bookmark.unwrap_or_default(),
+        None,
+        None,
+        flags,
+    )?;
+    if let Some(b) = start_bookmark {
+        let _ = EvtClose(b);
+    }
+
+    let mut last_flush = Instant::now();
+    let result = drain_loop(
+        sub,
+        signal,
+        upd_bookmark,
+        cfg,
+        channel,
+        source_type,
+        tx,
+        state,
+        status,
+        metrics,
+        cancel,
+        &mut last_flush,
+    );
+
+    // Persist the latest position so the next attempt (or the next process
+    // start) resumes here, not at the bookmark captured at process start.
+    if let Ok(xml) = render_bookmark(upd_bookmark) {
+        state.set_checkpoint(cfg.id.as_str(), channel, &xml);
+    }
+    let _ = EvtClose(sub);
+    let _ = EvtClose(upd_bookmark);
+    let _ = CloseHandle(signal);
+    result
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -251,7 +346,9 @@ unsafe fn drain_loop(
                     }
                     Err(e) => {
                         let _ = EvtClose(ev_handle);
-                        metrics.record_error(format!("eventlog {}: render: {e}", cfg.id));
+                        let msg = format!("eventlog {}: render: {e}", cfg.id);
+                        tracing::warn!("{msg}");
+                        metrics.record_error(&msg);
                     }
                 }
             }
