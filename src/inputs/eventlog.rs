@@ -152,7 +152,7 @@ fn run_channel(
         // stale position would re-send already-delivered events.
         let saved = state.get_checkpoint(cfg.id.as_str(), channel);
 
-        let attempt = unsafe {
+        let (attempt, events) = unsafe {
             subscribe_and_drain(
                 &chan_w,
                 &query_w,
@@ -171,7 +171,18 @@ fn run_channel(
         match attempt {
             Ok(()) => return Ok(()),
             Err(e) if is_transient(&e) => {
-                consecutive_failures += 1;
+                // EVT-001: a *transient* failure is only worth counting if no
+                // progress was made in this attempt. If events were drained
+                // before the failure, the subscription is healthy — the error
+                // was a transient blip — so reset both counter and backoff to
+                // their starting values. Without this, a channel that flaps
+                // once an hour still trips RESUBSCRIBE_MAX_ATTEMPTS over time.
+                if events > 0 {
+                    consecutive_failures = 0;
+                    backoff_ms = RESUBSCRIBE_INITIAL_BACKOFF_MS;
+                } else {
+                    consecutive_failures += 1;
+                }
                 if consecutive_failures >= RESUBSCRIBE_MAX_ATTEMPTS {
                     tracing::error!(
                         "eventlog {} channel {channel}: {consecutive_failures} consecutive \
@@ -213,7 +224,8 @@ fn is_transient(e: &windows::core::Error) -> bool {
 
 /// One full subscription lifecycle: create handles, EvtSubscribe, drain until
 /// error/cancellation, persist bookmark, close handles. Returns the underlying
-/// error so the caller can decide whether to retry.
+/// error and the number of events emitted in this attempt so the caller can
+/// decide whether to retry and whether to reset backoff.
 #[allow(clippy::too_many_arguments)]
 unsafe fn subscribe_and_drain(
     chan_w: &[u16],
@@ -227,28 +239,41 @@ unsafe fn subscribe_and_drain(
     status: &StatusRegistry,
     metrics: &Metrics,
     cancel: &CancellationToken,
-) -> windows::core::Result<()> {
+) -> (windows::core::Result<()>, u64) {
     // Manual-reset signal event fired by the subscription on new records.
-    let signal: HANDLE = CreateEventW(None, true, false, PCWSTR::null())?;
+    let signal = match CreateEventW(None, true, false, PCWSTR::null()) {
+        Ok(h) => h,
+        Err(e) => return (Err(e), 0),
+    };
 
     // Bookmark used to checkpoint progress (and to render the resume token).
-    let upd_bookmark = EvtCreateBookmark(PCWSTR::null())?;
+    let upd_bookmark = match EvtCreateBookmark(PCWSTR::null()) {
+        Ok(b) => b,
+        Err(e) => {
+            let _ = CloseHandle(signal);
+            return (Err(e), 0);
+        }
+    };
 
     // Resume position: after the saved bookmark if we have one, else from
     // the oldest record (read_existing) or only future events.
     let (start_bookmark, flags) = match saved_bookmark {
         Some(xml) => {
             let bw = wide(xml);
-            (
-                Some(EvtCreateBookmark(PCWSTR(bw.as_ptr()))?),
-                EvtSubscribeStartAfterBookmark.0,
-            )
+            match EvtCreateBookmark(PCWSTR(bw.as_ptr())) {
+                Ok(b) => (Some(b), EvtSubscribeStartAfterBookmark.0),
+                Err(e) => {
+                    let _ = EvtClose(upd_bookmark);
+                    let _ = CloseHandle(signal);
+                    return (Err(e), 0);
+                }
+            }
         }
         None if cfg.read_existing => (None, EvtSubscribeStartAtOldestRecord.0),
         None => (None, EvtSubscribeToFutureEvents.0),
     };
 
-    let sub = EvtSubscribe(
+    let sub = match EvtSubscribe(
         null_handle(),
         signal,
         PCWSTR(chan_w.as_ptr()),
@@ -257,12 +282,28 @@ unsafe fn subscribe_and_drain(
         None,
         None,
         flags,
-    )?;
+    ) {
+        Ok(s) => s,
+        Err(e) => {
+            if let Some(b) = start_bookmark {
+                let _ = EvtClose(b);
+            }
+            let _ = EvtClose(upd_bookmark);
+            let _ = CloseHandle(signal);
+            return (Err(e), 0);
+        }
+    };
     if let Some(b) = start_bookmark {
         let _ = EvtClose(b);
     }
 
     let mut last_flush = Instant::now();
+    // Tracks whether `upd_bookmark` has ever been advanced via
+    // EvtUpdateBookmark. An unupdated bookmark renders as a valid-but-empty
+    // XML token that Windows interprets as "start at the oldest record"; if
+    // we persisted it over a real bookmark we'd replay the entire log on
+    // the next start (EVT-004 / EVT-005).
+    let mut bookmark_updated = false;
     let result = drain_loop(
         sub,
         signal,
@@ -276,17 +317,25 @@ unsafe fn subscribe_and_drain(
         metrics,
         cancel,
         &mut last_flush,
+        &mut bookmark_updated,
     );
 
     // Persist the latest position so the next attempt (or the next process
-    // start) resumes here, not at the bookmark captured at process start.
-    if let Ok(xml) = render_bookmark(upd_bookmark) {
-        state.set_checkpoint(cfg.id.as_str(), channel, &xml);
+    // start) resumes here, not at the bookmark captured at process start —
+    // but only if we actually advanced the bookmark this attempt.
+    let (mapped, events_count) = match result {
+        Ok(n) => (Ok(()), n),
+        Err(e) => (Err(e), 0),
+    };
+    if bookmark_updated {
+        if let Ok(xml) = render_bookmark(upd_bookmark) {
+            state.set_checkpoint(cfg.id.as_str(), channel, &xml);
+        }
     }
     let _ = EvtClose(sub);
     let _ = EvtClose(upd_bookmark);
     let _ = CloseHandle(signal);
-    result
+    (mapped, events_count)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -303,25 +352,38 @@ unsafe fn drain_loop(
     metrics: &Metrics,
     cancel: &CancellationToken,
     last_flush: &mut Instant,
-) -> windows::core::Result<()> {
+    bookmark_updated: &mut bool,
+) -> windows::core::Result<u64> {
+    let mut total_emitted = 0u64;
     loop {
         if cancel.is_cancelled() {
-            return Ok(());
+            return Ok(total_emitted);
         }
         // Block (briefly) until new records arrive, then drain them all.
         let _ = WaitForSingleObject(signal, WAIT_MS);
 
         loop {
             if cancel.is_cancelled() {
-                return Ok(());
+                return Ok(total_emitted);
             }
             let mut events = [0isize; BATCH];
             let mut returned = 0u32;
             let next = EvtNext(sub, &mut events, 0, 0, &mut returned);
             if let Err(e) = next {
-                if e.code() == ERROR_NO_MORE_ITEMS.to_hresult() {
+                let code = e.code();
+                if code == ERROR_NO_MORE_ITEMS.to_hresult() {
                     let _ = ResetEvent(signal);
                     break; // wait for the next signal
+                }
+                // EVT-001: ERROR_INVALID_OPERATION (0x800710DD) surfaces from
+                // EvtNext after ~2 s of channel idleness on a healthy pull
+                // subscription. Treating it as fatal burns a re-subscribe
+                // attempt every idle gap and runs the input into "giving up"
+                // within minutes. The subscription is fine — break and wait
+                // for the next signal, exactly like ERROR_NO_MORE_ITEMS.
+                if code.0 as u32 == HRESULT_INVALID_OPERATION as u32 {
+                    let _ = ResetEvent(signal);
+                    break;
                 }
                 return Err(e);
             }
@@ -339,9 +401,10 @@ unsafe fn drain_loop(
                         // Advance the bookmark before handing the event off so a
                         // crash re-sends at most the in-flight record.
                         let _ = EvtUpdateBookmark(upd_bookmark, ev_handle);
+                        *bookmark_updated = true;
                         let _ = EvtClose(ev_handle);
                         if tx.blocking_send(event).is_err() {
-                            return Ok(()); // pipeline shut down
+                            return Ok(total_emitted + emitted); // pipeline shut down
                         }
                     }
                     Err(e) => {
@@ -352,12 +415,16 @@ unsafe fn drain_loop(
                     }
                 }
             }
+            total_emitted += emitted;
 
             if emitted > 0 {
                 status.update_input(&cfg.id, |s| s.events += emitted);
             }
             // Checkpoint at most once per second to bound state-file writes.
-            if last_flush.elapsed() >= Duration::from_secs(1) {
+            // Skip if no event has ever advanced `upd_bookmark`: persisting an
+            // empty bookmark would make the next start interpret it as "begin
+            // at oldest record" and replay the whole log (EVT-004/EVT-005).
+            if *bookmark_updated && last_flush.elapsed() >= Duration::from_secs(1) {
                 if let Ok(xml) = render_bookmark(upd_bookmark) {
                     state.set_checkpoint(cfg.id.as_str(), channel, &xml);
                 }

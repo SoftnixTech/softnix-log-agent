@@ -247,8 +247,17 @@ impl FileInput {
                     // Newly discovered path. Resume from saved cursor (same
                     // identity seen before, e.g. after agent restart), else
                     // start at 0 — or at EOF on the input's first ever run.
+                    //
+                    // NOTE: do NOT clamp `c.offset` against `size`. If the path
+                    // was deleted and recreated with the same identity (NTFS
+                    // tunneling on Windows, inode reuse on Linux), the new file
+                    // is typically smaller than the saved offset. Clamping
+                    // would hide that fact from the truncation check below and
+                    // silently skip the head of the new file (FILE-007). The
+                    // `size < offset` check a few lines down catches this and
+                    // resets the offset to 0.
                     let offset = match state.get_cursor(id, &identity) {
-                        Some(c) => c.offset.min(size),
+                        Some(c) => c.offset,
                         None if skip_existing && !self.cfg.read_from_start => size,
                         None => 0,
                     };
@@ -598,5 +607,55 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(collect(&mut rx).await, vec!["c"]);
+    }
+
+    #[tokio::test]
+    async fn handles_delete_and_recreate_smaller_file() {
+        // FILE-007 regression: when a watched file is deleted and a new file
+        // with the same path is created — and happens to reuse the same
+        // identity (NTFS tunneling on Windows, inode reuse on Linux) — the
+        // agent must not resume from a stale offset larger than the new file's
+        // size. The truncation check must reset offset to 0 so the head of the
+        // new file is read, not silently skipped.
+        let dir = tempfile::tempdir().unwrap();
+        let state_dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("app.log");
+        // Seed a long-ish file so the saved offset clearly exceeds the new
+        // file's size, then advance the offset by polling.
+        std::fs::write(&log, "header banner line\nline2\nline3\nline4\n").unwrap();
+        let input = input_for(dir.path());
+        let state = Arc::new(StateManager::open(state_dir.path()).unwrap());
+        let metrics = Arc::new(Metrics::default());
+        let cancel = CancellationToken::new();
+        let (tx, mut rx) = mpsc::channel(100);
+        let mut tracked = HashMap::new();
+
+        input
+            .poll_once(&tx, &state, &metrics, &mut tracked, false, &cancel)
+            .await
+            .unwrap();
+        // Drain initial reads; offset is now at EOF.
+        let _ = collect(&mut rx).await;
+        state.flush().unwrap();
+
+        // Simulate delete + recreate with a much smaller file. The new file's
+        // first line matches the old one (a "banner" pattern), so the Windows
+        // head-fingerprint would not distinguish them — exactly the report's
+        // failure mode.
+        std::fs::remove_file(&log).unwrap();
+        std::fs::write(&log, "header banner line\nnew short\n").unwrap();
+
+        input
+            .poll_once(&tx, &state, &metrics, &mut tracked, false, &cancel)
+            .await
+            .unwrap();
+
+        let got = collect(&mut rx).await;
+        // Without the fix: silent skip (got empty or partial). With the fix:
+        // both lines from the new file are emitted.
+        assert!(
+            got.contains(&"new short".to_string()),
+            "FILE-007: new file head must not be silently skipped; got {got:?}"
+        );
     }
 }
