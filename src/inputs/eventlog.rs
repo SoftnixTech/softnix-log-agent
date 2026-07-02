@@ -140,8 +140,7 @@ fn run_channel(
     let chan_w = wide(channel);
     let query_w = wide(&cfg.query);
 
-    let mut backoff_ms = RESUBSCRIBE_INITIAL_BACKOFF_MS;
-    let mut consecutive_failures = 0u32;
+    let mut backoff = Backoff::start();
 
     loop {
         if cancel.is_cancelled() {
@@ -152,7 +151,7 @@ fn run_channel(
         // stale position would re-send already-delivered events.
         let saved = state.get_checkpoint(cfg.id.as_str(), channel);
 
-        let attempt = unsafe {
+        let (attempt, events) = unsafe {
             subscribe_and_drain(
                 &chan_w,
                 &query_w,
@@ -171,33 +170,42 @@ fn run_channel(
         match attempt {
             Ok(()) => return Ok(()),
             Err(e) if is_transient(&e) => {
-                consecutive_failures += 1;
-                if consecutive_failures >= RESUBSCRIBE_MAX_ATTEMPTS {
+                // EVT-001: a transient failure only counts toward "giving up" if
+                // no progress was made this attempt. Draining events proves the
+                // subscription is healthy and the error was a blip, so the
+                // counter and delay reset — otherwise a channel that flaps once
+                // an hour still trips RESUBSCRIBE_MAX_ATTEMPTS over time.
+                backoff = backoff.after_transient(events > 0);
+                if backoff.should_give_up() {
                     tracing::error!(
-                        "eventlog {} channel {channel}: {consecutive_failures} consecutive \
-                         transient failures (last: {e}); giving up",
-                        cfg.id
+                        "eventlog {} channel {channel}: {} consecutive transient failures \
+                         (last: {e}); giving up",
+                        cfg.id,
+                        backoff.failures
                     );
                     return Err(e);
                 }
                 tracing::warn!(
                     "eventlog {} channel {channel}: transient error {e} (attempt \
-                     {consecutive_failures}); re-subscribing from bookmark in {backoff_ms}ms",
-                    cfg.id
+                     {}); re-subscribing from bookmark in {}ms",
+                    cfg.id,
+                    backoff.failures,
+                    backoff.delay_ms
                 );
+                let attempt = backoff.failures;
                 status.update_input(&cfg.id, |s| {
-                    s.last_error = Some(format!("{e} (re-subscribing, attempt {consecutive_failures})"));
+                    s.last_error = Some(format!("{e} (re-subscribing, attempt {attempt})"));
                 });
                 // Sleep on the blocking thread, but wake frequently enough to
                 // honor cancellation promptly.
-                let until = Instant::now() + Duration::from_millis(backoff_ms);
+                let until = Instant::now() + Duration::from_millis(backoff.delay_ms);
                 while Instant::now() < until {
                     if cancel.is_cancelled() {
                         return Ok(());
                     }
                     std::thread::sleep(Duration::from_millis(100));
                 }
-                backoff_ms = (backoff_ms * 2).min(RESUBSCRIBE_MAX_BACKOFF_MS);
+                backoff = backoff.doubled();
             }
             Err(e) => return Err(e),
         }
@@ -208,12 +216,96 @@ fn run_channel(
 /// the persisted bookmark. Kept narrow on purpose: only errors we have evidence
 /// are recoverable. Add to this allowlist as new transient codes are confirmed.
 fn is_transient(e: &windows::core::Error) -> bool {
-    e.code().0 == HRESULT_INVALID_OPERATION
+    is_transient_code(e.code().0)
+}
+
+/// Pure form of [`is_transient`] over a raw HRESULT, split out so the recovery
+/// policy is unit-testable without a live subscription (the module is
+/// Windows-only, so these tests run on Windows CI).
+fn is_transient_code(code: i32) -> bool {
+    code == HRESULT_INVALID_OPERATION
+}
+
+/// Does an `EvtNext` error just mean "no more records right now" (drain caught
+/// up) rather than a real failure? Both `ERROR_NO_MORE_ITEMS` and the idle
+/// transition `ERROR_INVALID_OPERATION` (0x800710DD) belong here: after ~2 s of
+/// channel silence a healthy pull subscription surfaces the latter, and treating
+/// it as fatal runs the input into "giving up" within minutes (EVT-001). In both
+/// cases the subscription is fine — reset the signal and wait for the next one.
+fn is_drain_idle(code: windows::core::HRESULT) -> bool {
+    code == ERROR_NO_MORE_ITEMS.to_hresult() || code.0 as u32 == HRESULT_INVALID_OPERATION as u32
+}
+
+/// Where a fresh subscription should start reading from. Bookmark wins when we
+/// have one; otherwise `read_existing` chooses between backfilling the whole
+/// channel and only future events. Crucially, the default (no bookmark,
+/// `read_existing: false`) is future-only — never a full replay (EVT-004).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResumeMode {
+    AfterBookmark,
+    OldestRecord,
+    FutureOnly,
+}
+
+fn resume_mode(has_bookmark: bool, read_existing: bool) -> ResumeMode {
+    if has_bookmark {
+        ResumeMode::AfterBookmark
+    } else if read_existing {
+        ResumeMode::OldestRecord
+    } else {
+        ResumeMode::FutureOnly
+    }
+}
+
+/// Re-subscribe backoff after a transient error. Progress in the failed attempt
+/// (events drained) proves the subscription is healthy, so the consecutive-
+/// failure counter and delay reset to their starting values; a run of dry
+/// failures climbs toward [`RESUBSCRIBE_MAX_ATTEMPTS`] before we give up. Kept
+/// as a pure value type so the EVT-001 flap accounting is unit-testable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Backoff {
+    failures: u32,
+    delay_ms: u64,
+}
+
+impl Backoff {
+    fn start() -> Self {
+        Backoff {
+            failures: 0,
+            delay_ms: RESUBSCRIBE_INITIAL_BACKOFF_MS,
+        }
+    }
+
+    /// Account for one transient failure; `made_progress` is whether any event
+    /// was drained during the attempt that failed.
+    fn after_transient(self, made_progress: bool) -> Self {
+        if made_progress {
+            Backoff::start()
+        } else {
+            Backoff {
+                failures: self.failures + 1,
+                delay_ms: self.delay_ms,
+            }
+        }
+    }
+
+    fn should_give_up(self) -> bool {
+        self.failures >= RESUBSCRIBE_MAX_ATTEMPTS
+    }
+
+    /// Double the delay for the next attempt, capped at the maximum.
+    fn doubled(self) -> Self {
+        Backoff {
+            failures: self.failures,
+            delay_ms: (self.delay_ms * 2).min(RESUBSCRIBE_MAX_BACKOFF_MS),
+        }
+    }
 }
 
 /// One full subscription lifecycle: create handles, EvtSubscribe, drain until
 /// error/cancellation, persist bookmark, close handles. Returns the underlying
-/// error so the caller can decide whether to retry.
+/// error and the number of events emitted in this attempt so the caller can
+/// decide whether to retry and whether to reset backoff.
 #[allow(clippy::too_many_arguments)]
 unsafe fn subscribe_and_drain(
     chan_w: &[u16],
@@ -227,28 +319,41 @@ unsafe fn subscribe_and_drain(
     status: &StatusRegistry,
     metrics: &Metrics,
     cancel: &CancellationToken,
-) -> windows::core::Result<()> {
+) -> (windows::core::Result<()>, u64) {
     // Manual-reset signal event fired by the subscription on new records.
-    let signal: HANDLE = CreateEventW(None, true, false, PCWSTR::null())?;
+    let signal = match CreateEventW(None, true, false, PCWSTR::null()) {
+        Ok(h) => h,
+        Err(e) => return (Err(e), 0),
+    };
 
     // Bookmark used to checkpoint progress (and to render the resume token).
-    let upd_bookmark = EvtCreateBookmark(PCWSTR::null())?;
+    let upd_bookmark = match EvtCreateBookmark(PCWSTR::null()) {
+        Ok(b) => b,
+        Err(e) => {
+            let _ = CloseHandle(signal);
+            return (Err(e), 0);
+        }
+    };
 
     // Resume position: after the saved bookmark if we have one, else from
     // the oldest record (read_existing) or only future events.
-    let (start_bookmark, flags) = match saved_bookmark {
-        Some(xml) => {
-            let bw = wide(xml);
-            (
-                Some(EvtCreateBookmark(PCWSTR(bw.as_ptr()))?),
-                EvtSubscribeStartAfterBookmark.0,
-            )
+    let (start_bookmark, flags) = match resume_mode(saved_bookmark.is_some(), cfg.read_existing) {
+        ResumeMode::AfterBookmark => {
+            let bw = wide(saved_bookmark.unwrap_or_default());
+            match EvtCreateBookmark(PCWSTR(bw.as_ptr())) {
+                Ok(b) => (Some(b), EvtSubscribeStartAfterBookmark.0),
+                Err(e) => {
+                    let _ = EvtClose(upd_bookmark);
+                    let _ = CloseHandle(signal);
+                    return (Err(e), 0);
+                }
+            }
         }
-        None if cfg.read_existing => (None, EvtSubscribeStartAtOldestRecord.0),
-        None => (None, EvtSubscribeToFutureEvents.0),
+        ResumeMode::OldestRecord => (None, EvtSubscribeStartAtOldestRecord.0),
+        ResumeMode::FutureOnly => (None, EvtSubscribeToFutureEvents.0),
     };
 
-    let sub = EvtSubscribe(
+    let sub = match EvtSubscribe(
         null_handle(),
         signal,
         PCWSTR(chan_w.as_ptr()),
@@ -257,12 +362,28 @@ unsafe fn subscribe_and_drain(
         None,
         None,
         flags,
-    )?;
+    ) {
+        Ok(s) => s,
+        Err(e) => {
+            if let Some(b) = start_bookmark {
+                let _ = EvtClose(b);
+            }
+            let _ = EvtClose(upd_bookmark);
+            let _ = CloseHandle(signal);
+            return (Err(e), 0);
+        }
+    };
     if let Some(b) = start_bookmark {
         let _ = EvtClose(b);
     }
 
     let mut last_flush = Instant::now();
+    // Tracks whether `upd_bookmark` has ever been advanced via
+    // EvtUpdateBookmark. An unupdated bookmark renders as a valid-but-empty
+    // XML token that Windows interprets as "start at the oldest record"; if
+    // we persisted it over a real bookmark we'd replay the entire log on
+    // the next start (EVT-004 / EVT-005).
+    let mut bookmark_updated = false;
     let result = drain_loop(
         sub,
         signal,
@@ -276,17 +397,22 @@ unsafe fn subscribe_and_drain(
         metrics,
         cancel,
         &mut last_flush,
+        &mut bookmark_updated,
     );
 
     // Persist the latest position so the next attempt (or the next process
-    // start) resumes here, not at the bookmark captured at process start.
-    if let Ok(xml) = render_bookmark(upd_bookmark) {
-        state.set_checkpoint(cfg.id.as_str(), channel, &xml);
+    // start) resumes here, not at the bookmark captured at process start —
+    // but only if we actually advanced the bookmark this attempt.
+    let (events_count, mapped) = result;
+    if bookmark_updated {
+        if let Ok(xml) = render_bookmark(upd_bookmark) {
+            state.set_checkpoint(cfg.id.as_str(), channel, &xml);
+        }
     }
     let _ = EvtClose(sub);
     let _ = EvtClose(upd_bookmark);
     let _ = CloseHandle(signal);
-    result
+    (mapped, events_count)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -303,27 +429,35 @@ unsafe fn drain_loop(
     metrics: &Metrics,
     cancel: &CancellationToken,
     last_flush: &mut Instant,
-) -> windows::core::Result<()> {
+    bookmark_updated: &mut bool,
+) -> (u64, windows::core::Result<()>) {
+    let mut total_emitted = 0u64;
     loop {
         if cancel.is_cancelled() {
-            return Ok(());
+            return (total_emitted, Ok(()));
         }
         // Block (briefly) until new records arrive, then drain them all.
         let _ = WaitForSingleObject(signal, WAIT_MS);
 
         loop {
             if cancel.is_cancelled() {
-                return Ok(());
+                return (total_emitted, Ok(()));
             }
             let mut events = [0isize; BATCH];
             let mut returned = 0u32;
             let next = EvtNext(sub, &mut events, 0, 0, &mut returned);
             if let Err(e) = next {
-                if e.code() == ERROR_NO_MORE_ITEMS.to_hresult() {
+                // EVT-001: both "no more records" and the idle-transition
+                // 0x800710DD mean the drain is caught up on a healthy
+                // subscription — reset the signal and wait for the next one
+                // rather than treating either as a fatal error.
+                if is_drain_idle(e.code()) {
                     let _ = ResetEvent(signal);
-                    break; // wait for the next signal
+                    break;
                 }
-                return Err(e);
+                // Return the count drained before the failure so the caller can
+                // tell this attempt made progress (EVT-001 backoff reset).
+                return (total_emitted, Err(e));
             }
 
             let mut emitted = 0u64;
@@ -339,9 +473,10 @@ unsafe fn drain_loop(
                         // Advance the bookmark before handing the event off so a
                         // crash re-sends at most the in-flight record.
                         let _ = EvtUpdateBookmark(upd_bookmark, ev_handle);
+                        *bookmark_updated = true;
                         let _ = EvtClose(ev_handle);
                         if tx.blocking_send(event).is_err() {
-                            return Ok(()); // pipeline shut down
+                            return (total_emitted + emitted, Ok(())); // pipeline shut down
                         }
                     }
                     Err(e) => {
@@ -352,12 +487,16 @@ unsafe fn drain_loop(
                     }
                 }
             }
+            total_emitted += emitted;
 
             if emitted > 0 {
                 status.update_input(&cfg.id, |s| s.events += emitted);
             }
             // Checkpoint at most once per second to bound state-file writes.
-            if last_flush.elapsed() >= Duration::from_secs(1) {
+            // Skip if no event has ever advanced `upd_bookmark`: persisting an
+            // empty bookmark would make the next start interpret it as "begin
+            // at oldest record" and replay the whole log (EVT-004/EVT-005).
+            if *bookmark_updated && last_flush.elapsed() >= Duration::from_secs(1) {
                 if let Ok(xml) = render_bookmark(upd_bookmark) {
                     state.set_checkpoint(cfg.id.as_str(), channel, &xml);
                 }
@@ -681,5 +820,72 @@ mod tests {
         assert_eq!(level_to_severity(3), 4); // Warning
         assert_eq!(level_to_severity(4), 6); // Information
         assert_eq!(level_to_severity(0), 6); // LogAlways
+    }
+
+    #[test]
+    fn transient_matches_only_known_idle_transition() {
+        // EVT-001: 0x800710DD is the one code we treat as recoverable; anything
+        // else (e.g. ACCESS_DENIED) must stay fatal so we don't spin forever.
+        assert!(is_transient_code(HRESULT_INVALID_OPERATION));
+        assert!(!is_transient_code(0));
+        assert!(!is_transient_code(0x8007_0005u32 as i32)); // ERROR_ACCESS_DENIED
+    }
+
+    #[test]
+    fn drain_idle_covers_no_more_items_and_idle_transition() {
+        use windows::core::HRESULT;
+        // Both of these must break the drain loop and wait for the next signal.
+        assert!(is_drain_idle(ERROR_NO_MORE_ITEMS.to_hresult()));
+        assert!(is_drain_idle(HRESULT(HRESULT_INVALID_OPERATION)));
+        // A genuine error (channel not found) must propagate, not be swallowed.
+        assert!(!is_drain_idle(HRESULT(0x8007_3A9Fu32 as i32)));
+    }
+
+    #[test]
+    fn resume_mode_never_replays_by_default() {
+        // Bookmark always wins, regardless of read_existing.
+        assert_eq!(resume_mode(true, false), ResumeMode::AfterBookmark);
+        assert_eq!(resume_mode(true, true), ResumeMode::AfterBookmark);
+        // Explicit backfill when asked for and no bookmark yet.
+        assert_eq!(resume_mode(false, true), ResumeMode::OldestRecord);
+        // EVT-004: the default (no bookmark, read_existing=false) is future-only.
+        // A regression here replays the entire channel on first start.
+        assert_eq!(resume_mode(false, false), ResumeMode::FutureOnly);
+    }
+
+    #[test]
+    fn backoff_resets_on_progress_but_climbs_on_dry_failures() {
+        // EVT-001: a flap that still drained events must wipe the slate clean so
+        // an occasional blip never accumulates toward "giving up".
+        let mut b = Backoff::start();
+        for _ in 0..5 {
+            b = b.after_transient(false).doubled();
+        }
+        assert_eq!(b.failures, 5);
+        assert!(!b.should_give_up());
+        assert_eq!(b.after_transient(true), Backoff::start());
+    }
+
+    #[test]
+    fn backoff_gives_up_only_after_max_consecutive_dry_failures() {
+        let mut b = Backoff::start();
+        for _ in 0..RESUBSCRIBE_MAX_ATTEMPTS - 1 {
+            b = b.after_transient(false);
+        }
+        assert!(!b.should_give_up(), "must not give up before the limit");
+        b = b.after_transient(false);
+        assert!(b.should_give_up());
+    }
+
+    #[test]
+    fn backoff_delay_doubles_and_caps() {
+        let b = Backoff::start();
+        assert_eq!(b.delay_ms, RESUBSCRIBE_INITIAL_BACKOFF_MS);
+        assert_eq!(b.doubled().delay_ms, RESUBSCRIBE_INITIAL_BACKOFF_MS * 2);
+        let mut b = b;
+        for _ in 0..20 {
+            b = b.doubled();
+        }
+        assert_eq!(b.delay_ms, RESUBSCRIBE_MAX_BACKOFF_MS);
     }
 }
