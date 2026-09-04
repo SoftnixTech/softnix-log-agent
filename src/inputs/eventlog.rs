@@ -481,7 +481,7 @@ unsafe fn drain_loop(
                         let _ = EvtUpdateBookmark(upd_bookmark, ev_handle);
                         *bookmark_updated = true;
                         let _ = EvtClose(ev_handle);
-                        if tx.blocking_send(event).is_err() {
+                        if tx.blocking_send(event, cancel).is_err() {
                             return (total_emitted + emitted, Ok(())); // pipeline shut down
                         }
                     }
