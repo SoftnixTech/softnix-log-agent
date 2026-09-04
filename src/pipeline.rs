@@ -204,7 +204,14 @@ pub fn parse_syslog_into(ev: &mut Event, line: &str, format: SyslogFormat) {
             let t = line.trim_start();
             if t.starts_with('{') {
                 parse_json_into(ev, line);
+                return;
             }
+            // Never drop an unparsable line: forward the raw body and let the
+            // downstream SIEM rule on parse_status.
+            ev.fields.insert(
+                "parse_status".to_string(),
+                serde_json::Value::String("unparsed".to_string()),
+            );
         }
     }
 }
@@ -300,10 +307,11 @@ fn parse_rfc3164(ev: &mut Event, line: &str) -> bool {
     ev.facility = Some(facility);
     ev.severity = Some(severity);
 
-    // Timestamp: "Mmm dd hh:mm:ss" (15 chars)
+    // Timestamp: "Mmm dd hh:mm:ss" (15 bytes of ASCII). `get` returns None when
+    // byte 15 lands inside a multi-byte character — a remote sender can and does
+    // arrange exactly that, and `&rest[..15]` would panic (abort) on it.
     let mut remainder = rest;
-    if rest.len() >= 15 {
-        let ts = &rest[..15];
+    if let Some(ts) = rest.get(..15) {
         let now = Utc::now();
         let with_year = format!("{} {}", now.year(), ts);
         if let Ok(naive) = NaiveDateTime::parse_from_str(&with_year, "%Y %b %e %H:%M:%S") {
@@ -745,6 +753,65 @@ mod tests {
         assert_eq!(ev.process_id.as_deref(), Some("2317"));
         assert_eq!(ev.message, "An application event");
         assert!(ev.fields.contains_key("structured_data"));
+    }
+
+    #[test]
+    fn rfc3164_thai_body_does_not_panic() {
+        let line = "<13>x ทดสอบระบบ log message";
+        let mut ev = Event::new("syslog:127.0.0.1", "syslog", line);
+        parse_syslog_into(&mut ev, line, SyslogFormat::Auto);
+        assert_eq!(ev.severity, Some(5));
+        assert!(
+            ev.message.contains("ทดสอบระบบ"),
+            "body lost: {}",
+            ev.message
+        );
+    }
+
+    #[test]
+    fn rfc3164_emoji_body_does_not_panic() {
+        let line = "<13>🔥🔥🔥🔥 disk on fire";
+        let mut ev = Event::new("syslog:127.0.0.1", "syslog", line);
+        parse_syslog_into(&mut ev, line, SyslogFormat::Auto);
+        assert!(
+            ev.message.contains("disk on fire"),
+            "body lost: {}",
+            ev.message
+        );
+    }
+
+    #[test]
+    fn no_panic_on_any_multibyte_offset() {
+        // Walk the multi-byte character across every byte position around 15.
+        for filler in ["ก", "é", "🔥", "日"] {
+            for n in 0..24 {
+                let line = format!("<13>{}{} rest of message", "a".repeat(n), filler);
+                let mut ev = Event::new("s", "syslog", &line);
+                parse_syslog_into(&mut ev, &line, SyslogFormat::Auto);
+            }
+        }
+    }
+
+    #[test]
+    fn ascii_rfc3164_timestamp_still_parses() {
+        let line = "<14>Jun 10 10:00:00 host1 app: hello";
+        let mut ev = Event::new("s", "syslog", line);
+        parse_syslog_into(&mut ev, line, SyslogFormat::Auto);
+        assert_eq!(ev.hostname.as_deref(), Some("host1"));
+        assert_eq!(ev.application.as_deref(), Some("app"));
+        assert_eq!(ev.message, "hello");
+    }
+
+    #[test]
+    fn unparsable_line_is_forwarded_and_tagged() {
+        let line = "this is not syslog at all";
+        let mut ev = Event::new("s", "syslog", line);
+        parse_syslog_into(&mut ev, line, SyslogFormat::Auto);
+        assert_eq!(ev.message, line, "raw body must survive");
+        assert_eq!(
+            ev.fields.get("parse_status").and_then(|v| v.as_str()),
+            Some("unparsed")
+        );
     }
 
     #[test]
