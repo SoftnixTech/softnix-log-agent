@@ -214,6 +214,19 @@ async fn run_agent(
         format!("localhost:{}", cfg.web.port),
         format!("127.0.0.1:{}", cfg.web.port),
     ];
+    // DNS rebinding requires the real server to actually be on loopback —
+    // once an operator explicitly binds non-loopback, `config::validate`
+    // already forces a real `web.auth_token`, and that token becomes the
+    // security boundary instead of same-origin. `.unwrap_or(false)` is a
+    // defensive fallback for a bind value that somehow fails to parse as an
+    // IP here; `config::validate` will already have rejected a genuinely
+    // invalid `web.bind` before this point in normal operation.
+    let host_check_enabled = cfg
+        .web
+        .bind
+        .parse::<std::net::IpAddr>()
+        .map(|ip| ip.is_loopback())
+        .unwrap_or(false);
     let app_state = Arc::new(AppState {
         engine: tokio::sync::RwLock::new(None),
         logs: log_buffer,
@@ -222,6 +235,7 @@ async fn run_agent(
         uptime: metrics::Uptime::default(),
         auth_token: web::resolve_token(&cfg.web, &cfg.agent.data_dir)?,
         allowed_hosts,
+        host_check_enabled,
     });
 
     // Web server lives outside the engine so it survives reloads.

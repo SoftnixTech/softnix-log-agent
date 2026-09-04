@@ -39,6 +39,15 @@ pub struct AppState {
     pub uptime: Uptime,
     pub auth_token: String,
     pub allowed_hosts: Vec<String>,
+    /// Whether the Host/Origin allowlist below is enforced. DNS rebinding's
+    /// entire premise is tricking a browser into treating an attacker's page
+    /// as same-origin with a LOOPBACK-bound service — the attack requires the
+    /// real server to actually be on loopback. Once an operator explicitly
+    /// binds non-loopback, `config::validate` already forces a real
+    /// `web.auth_token`, and that token is the actual security boundary, not
+    /// same-origin — so the Host/Origin checks are skipped entirely in that
+    /// mode rather than 403ing every legitimate remote-admin request.
+    pub host_check_enabled: bool,
 }
 
 type S = State<Arc<AppState>>;
@@ -100,23 +109,40 @@ async fn auth_layer(State(state): S, req: Request, next: Next) -> Response {
     // only thing that distinguishes it from a real local request. Checked
     // before the token compare so a rebound/cross-origin request never even
     // reaches it (audit H-1).
-    let host_ok = match req.headers().get("host").and_then(|v| v.to_str().ok()) {
-        None => true, // HTTP/2 requests carry :authority instead
-        Some(h) => state.allowed_hosts.iter().any(|a| a == h),
-    };
-    if !host_ok {
-        return (StatusCode::FORBIDDEN, "host not allowed").into_response();
-    }
+    //
+    // Enforced only when `web.bind` is loopback. DNS rebinding requires the
+    // real server to actually be on loopback; once an operator explicitly
+    // binds non-loopback, `config::validate` already forces a real
+    // `web.auth_token`, and that token becomes the security boundary instead
+    // — so both checks are skipped entirely rather than 403ing every request
+    // from a remote admin whose Host/Origin can never match this allowlist.
+    if state.host_check_enabled {
+        let host_ok = match req.headers().get("host").and_then(|v| v.to_str().ok()) {
+            None => true, // HTTP/2 requests carry :authority instead
+            Some(h) => state
+                .allowed_hosts
+                .iter()
+                .any(|a| a.eq_ignore_ascii_case(h)),
+        };
+        if !host_ok {
+            return (StatusCode::FORBIDDEN, "host not allowed").into_response();
+        }
 
-    // Cross-site requests: an Origin from anywhere else is never legitimate for
-    // this API. A same-origin fetch either omits Origin or matches our host.
-    if let Some(origin) = req.headers().get("origin").and_then(|v| v.to_str().ok()) {
-        let origin_host = origin
-            .split_once("://")
-            .map(|(_, rest)| rest)
-            .unwrap_or(origin);
-        if !state.allowed_hosts.iter().any(|a| a == origin_host) {
-            return (StatusCode::FORBIDDEN, "cross-origin request rejected").into_response();
+        // Cross-site requests: an Origin from anywhere else is never legitimate
+        // for this API. A same-origin fetch either omits Origin or matches our
+        // host.
+        if let Some(origin) = req.headers().get("origin").and_then(|v| v.to_str().ok()) {
+            let origin_host = origin
+                .split_once("://")
+                .map(|(_, rest)| rest)
+                .unwrap_or(origin);
+            if !state
+                .allowed_hosts
+                .iter()
+                .any(|a| a.eq_ignore_ascii_case(origin_host))
+            {
+                return (StatusCode::FORBIDDEN, "cross-origin request rejected").into_response();
+            }
         }
     }
 
@@ -528,6 +554,10 @@ mod tests {
     use tower::ServiceExt;
 
     fn test_state(token: &str) -> Arc<AppState> {
+        test_state_with_host_check(token, true)
+    }
+
+    fn test_state_with_host_check(token: &str, host_check_enabled: bool) -> Arc<AppState> {
         let (control, _rx) = mpsc::channel(1);
         Arc::new(AppState {
             engine: RwLock::new(None),
@@ -537,6 +567,7 @@ mod tests {
             uptime: Uptime::default(),
             auth_token: token.to_string(),
             allowed_hosts: vec!["127.0.0.1:8080".to_string(), "localhost:8080".to_string()],
+            host_check_enabled,
         })
     }
 
@@ -731,13 +762,16 @@ mod tests {
     }
 
     /// audit H-1: a genuine same-origin request (matching Host and Origin,
-    /// both in the allowlist) must not be caught by the new checks.
+    /// both in the allowlist) must not be caught by the new checks. Uses
+    /// `/api/about` (not `/api/config/reload`, which returns 500 due to an
+    /// unrelated test-harness limitation with the control channel) so a hard
+    /// 200 actually proves the request reached the handler.
     #[tokio::test]
     async fn same_origin_post_is_allowed() {
         let app = router(test_state("t"));
         let res = app
             .oneshot(
-                Request::post("/api/config/reload")
+                Request::get("/api/about")
                     .header("authorization", "Bearer t")
                     .header("origin", "http://127.0.0.1:8080")
                     .header("host", "127.0.0.1:8080")
@@ -746,7 +780,30 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_ne!(res.status(), StatusCode::FORBIDDEN);
+        assert_eq!(res.status(), StatusCode::OK);
+    }
+
+    /// Fix round: once an operator explicitly binds `web.bind` non-loopback,
+    /// `config::validate` already forces a real `web.auth_token`, and that
+    /// token becomes the security boundary instead of same-origin — so with
+    /// `host_check_enabled: false`, a request with a Host/Origin that could
+    /// never match the allowlist (e.g. a remote admin's own IP) must still
+    /// reach the handler as long as the token is valid.
+    #[tokio::test]
+    async fn host_and_origin_checks_are_skipped_when_disabled() {
+        let app = router(test_state_with_host_check("t", false));
+        let res = app
+            .oneshot(
+                Request::get("/api/about")
+                    .header("authorization", "Bearer t")
+                    .header("origin", "http://203.0.113.5:8080")
+                    .header("host", "203.0.113.5:8080")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
     }
 
     #[test]
