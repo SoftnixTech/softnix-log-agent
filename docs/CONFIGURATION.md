@@ -340,7 +340,7 @@ Per-destination, crash-safe disk queue between the pipeline and each output.
 
 | Value | Behaviour |
 |---|---|
-| `block` | Never drop while there's room. Room is the destination's own on-disk queue (`max_size_mb`) *plus* a small (~4096-event) in-memory buffer that absorbs brief bursts and disk-queue lock contention — not inputs pausing. Once both are exhausted, new events for that destination are shed (counted per destination in `agent_router_shed_total`, logged) rather than stalling other destinations, the pipeline, or any input. A config reload or graceful stop force-delivers everything still in flight instead of shedding it. |
+| `block` | Never drop while there's room. Room is the destination's own on-disk queue (`max_size_mb`) *plus* a small (~4096-event) in-memory buffer that absorbs brief bursts and disk-queue lock contention — not inputs pausing. Once both are exhausted, new events for that destination are shed (counted per destination in `agent_router_shed_total`, logged) rather than stalling other destinations, the pipeline, or any input. A config reload or graceful stop force-delivers everything still sitting in the in-memory buffer into the on-disk queue instead of shedding it — except when that destination's on-disk queue is already full at the time, in which case there is nowhere left to put those events and they are still counted as dropped (`agent_events_dropped_total`). |
 | `drop_oldest` | Evict the oldest queued events to make room — favors fresh data. |
 | `drop_newest` | Reject new events when full — favors history. |
 

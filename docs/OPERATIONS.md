@@ -67,8 +67,13 @@ and per destination in `agent_router_shed_total`) rather than stalling the
 agent, while the destination's queue itself continues obeying `block`
 semantics for everything already accepted into it. A config reload or
 graceful stop is the one exception: the drain that runs at that point
-force-delivers everything still in flight instead of shedding, so a routine
-`SIGHUP` or Save & Reload does not itself lose events.
+force-delivers everything still sitting in the in-memory channel into each
+destination's on-disk queue instead of shedding, so a routine `SIGHUP` or
+Save & Reload does not itself lose events that were only waiting in that
+channel — the one case it cannot save is a destination whose on-disk queue
+is *already* full at that moment, since there is genuinely nowhere left to
+put those events; they are still counted as dropped
+(`agent_events_dropped_total`).
 
 If a particular destination is noisy or non-critical and you would rather
 shed load than stall, override the policy for that output alone:
