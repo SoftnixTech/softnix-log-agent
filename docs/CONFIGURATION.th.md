@@ -43,8 +43,17 @@ web:      { … }      # GUI / API สำหรับจัดการ
 ```yaml
 enrich:
   environment: ${ENVIRONMENT:-production}
+```
+
+ห้ามใช้รูปแบบ `:-` (default) กับ `web.auth_token` (หรือ secret อื่นใด):
+`${WEB_TOKEN:-}` เมื่อไม่ได้ตั้งค่า `WEB_TOKEN` จะขยายเป็น string ว่าง ซึ่งตอนนี้
+agent จะถือว่า "ยังไม่ได้ตั้งค่า" แล้วสร้าง token ใหม่ให้แทน — แต่ string ว่างไม่ใช่
+ค่าที่ปลอดภัยสำหรับ secret จริง ให้ใช้รูปแบบบังคับแทน เพื่อให้ validate ล้มเหลว
+ทันทีหากลืมตั้งค่าตัวแปร:
+
+```yaml
 web:
-  auth_token: ${WEB_TOKEN:-}
+  auth_token: ${WEB_TOKEN}
 ```
 
 ---
@@ -438,7 +447,7 @@ web:
   enabled: true
   bind: 127.0.0.1
   port: 8080
-  # auth_token: ${WEB_TOKEN:-}
+  # auth_token: ${WEB_TOKEN}
 ```
 
 ---

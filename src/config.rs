@@ -720,7 +720,9 @@ pub fn validate(cfg: &Config) -> Result<Vec<String>> {
                 format!("web.bind must be an IP address (got {:?})", cfg.web.bind)
             })?;
         if !ip.is_loopback() {
-            if cfg.web.auth_token.is_none() {
+            let is_blank = cfg.web.auth_token.is_none()
+                || cfg.web.auth_token.as_deref().map(str::trim) == Some("");
+            if is_blank {
                 bail!(
                     "web.bind is {} (not loopback) but web.auth_token is not set — \
                      refusing to expose an unauthenticated config API. Set web.auth_token \
@@ -891,6 +893,23 @@ outputs:
         let s = r#"
 web:
   bind: 0.0.0.0
+outputs:
+  - id: console
+    type: stdout
+"#;
+        let err = parse(s).unwrap_err();
+        assert!(format!("{err:#}").contains("auth_token"));
+    }
+
+    /// audit C-1: `auth_token: ""` (e.g. from `${WEB_TOKEN:-}` with WEB_TOKEN
+    /// unset) must be treated the same as an absent token on a non-loopback
+    /// bind — a blank string must not sail past this hard-error gate.
+    #[test]
+    fn errors_on_public_bind_with_blank_token() {
+        let s = r#"
+web:
+  bind: 0.0.0.0
+  auth_token: ""
 outputs:
   - id: console
     type: stdout

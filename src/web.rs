@@ -94,7 +94,18 @@ pub fn router(state: Arc<AppState>) -> Router {
 }
 
 async fn auth_layer(State(state): S, req: Request, next: Next) -> Response {
-    let supplied = req
+    // An empty stored token must never authenticate anything, no matter what
+    // is (or isn't) supplied — belt and suspenders against the regression
+    // class in `resolve_token`/`config::validate` that let a blank
+    // `web.auth_token` slip through (audit C-1).
+    if state.auth_token.is_empty() {
+        return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
+    }
+    // A missing Authorization/X-Auth-Token header must be rejected outright —
+    // it must NOT be treated as an empty supplied token, or an empty
+    // configured token would compare `"" == ""` and let every request in
+    // unauthenticated (audit C-1).
+    let Some(supplied) = req
         .headers()
         .get("authorization")
         .and_then(|v| v.to_str().ok())
@@ -104,7 +115,9 @@ async fn auth_layer(State(state): S, req: Request, next: Next) -> Response {
                 .get("x-auth-token")
                 .and_then(|v| v.to_str().ok())
         })
-        .unwrap_or("");
+    else {
+        return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
+    };
     if !constant_time_eq(supplied.as_bytes(), state.auth_token.as_bytes()) {
         return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
     }
@@ -133,25 +146,35 @@ pub fn generate_token() -> String {
 
 /// The configured token, or a persistent one under the data dir.
 pub fn resolve_token(cfg: &WebConfig, data_dir: &std::path::Path) -> anyhow::Result<String> {
+    // A blank or all-whitespace configured token (e.g. `auth_token: ${WEB_TOKEN:-}`
+    // with WEB_TOKEN unset) is treated as NOT configured — fall through to the
+    // file-reuse/generate path below, exactly like a blank token file already
+    // is. An empty configured token must never be handed back verbatim (audit C-1).
     if let Some(t) = &cfg.auth_token {
-        return Ok(t.clone());
+        if !t.trim().is_empty() {
+            return Ok(t.clone());
+        }
     }
     let path = data_dir.join("web-token");
     if let Ok(existing) = std::fs::read_to_string(&path) {
         let t = existing.trim().to_string();
         if !t.is_empty() {
+            // Don't silently trust the existing file's permissions — re-assert
+            // 0600 on it too. No exposure window here: the content already
+            // exists, so rewriting permissions is purely a hardening step
+            // (audit I-1).
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+            }
             return Ok(t);
         }
     }
     let token = generate_token();
     std::fs::create_dir_all(data_dir)
         .with_context(|| format!("cannot create data dir {}", data_dir.display()))?;
-    crate::fsutil::write_atomic(&path, token.as_bytes())?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
-    }
+    write_token_file(&path, token.as_bytes())?;
     tracing::warn!(
         "web.auth_token was not configured; generated one and stored it at {} \
          (read it with: cat {})",
@@ -159,6 +182,43 @@ pub fn resolve_token(cfg: &WebConfig, data_dir: &std::path::Path) -> anyhow::Res
         path.display()
     );
     Ok(token)
+}
+
+/// Write the generated token file with mode 0600 set AT CREATION TIME on
+/// Unix, so there is no window where the file exists world/group-readable
+/// before a follow-up `set_permissions` call (audit I-1). Falls back to the
+/// generic atomic writer (default `OpenOptions` mode) on non-Unix targets.
+#[cfg(unix)]
+fn write_token_file(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let tmp = path.with_extension(match path.extension() {
+        Some(ext) => format!("{}.tmp", ext.to_string_lossy()),
+        None => "tmp".to_string(),
+    });
+    {
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp, path)?;
+    if let Some(parent) = path.parent() {
+        if let Ok(d) = std::fs::File::open(parent) {
+            let _ = d.sync_all();
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn write_token_file(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    crate::fsutil::write_atomic(path, bytes)
 }
 
 async fn ui() -> Html<&'static str> {
@@ -445,10 +505,26 @@ mod tests {
         })
     }
 
+    /// A minimal JSON body for the two POST routes that deserialize one
+    /// (`/api/config/validate`, `/api/config/save`). Built via
+    /// `http-body-util` rather than `axum::body::Body::from` so the
+    /// dev-dependency is actually exercised (audit I-2).
+    fn json_body(json: &'static str) -> Body {
+        Body::new(http_body_util::Full::new(axum::body::Bytes::from_static(
+            json.as_bytes(),
+        )))
+    }
+
+    /// All 12 guarded routes — the 8 GET reads plus the 4 POST mutation
+    /// endpoints (`/api/config/validate`, `/api/config/save`,
+    /// `/api/config/reload`, `/api/config/rollback`) — must 401 with no
+    /// Authorization header. The 4 POSTs are the most dangerous to leave
+    /// untested: they write config to disk or trigger a reload/rollback
+    /// (audit I-2). Only `/` and `/healthz` stay public.
     #[tokio::test]
-    async fn only_root_and_healthz_are_unauthenticated() {
+    async fn all_guarded_routes_reject_missing_auth() {
         let app = router(test_state("secret-token"));
-        let guarded = [
+        let guarded_get = [
             "/metrics",
             "/api/status",
             "/api/inputs",
@@ -458,7 +534,7 @@ mod tests {
             "/api/about",
             "/api/config",
         ];
-        for path in guarded {
+        for path in guarded_get {
             let res = app
                 .clone()
                 .oneshot(Request::get(path).body(Body::empty()).unwrap())
@@ -466,6 +542,30 @@ mod tests {
                 .unwrap();
             assert_eq!(res.status(), StatusCode::UNAUTHORIZED, "{path} was open");
         }
+
+        for path in ["/api/config/validate", "/api/config/save"] {
+            let res = app
+                .clone()
+                .oneshot(
+                    Request::post(path)
+                        .header("content-type", "application/json")
+                        .body(json_body(r#"{"content":""}"#))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(res.status(), StatusCode::UNAUTHORIZED, "{path} was open");
+        }
+
+        for path in ["/api/config/reload", "/api/config/rollback"] {
+            let res = app
+                .clone()
+                .oneshot(Request::post(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(res.status(), StatusCode::UNAUTHORIZED, "{path} was open");
+        }
+
         for path in ["/", "/healthz"] {
             let res = app
                 .clone()
@@ -478,6 +578,21 @@ mod tests {
                 "{path} should be public"
             );
         }
+    }
+
+    /// audit C-1: `web.auth_token: ""` (e.g. from an unset
+    /// `${WEB_TOKEN:-}`) must never authenticate a request that carries no
+    /// Authorization header at all. The old middleware defaulted a missing
+    /// header to `""`, so `"" == ""` let every guarded route through
+    /// unauthenticated — this pins the fix.
+    #[tokio::test]
+    async fn empty_configured_token_still_rejects_requests_with_no_header() {
+        let app = router(test_state(""));
+        let res = app
+            .oneshot(Request::get("/api/about").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
     }
 
     /// The GUI shell (`/`) must load with no Authorization header at all — a
@@ -519,11 +634,100 @@ mod tests {
         assert_eq!(res.status(), StatusCode::OK);
     }
 
+    /// audit I-3: a wrong token of the SAME length as the real one must be
+    /// rejected by content comparison, not accidentally waved through by the
+    /// length-mismatch early return in `constant_time_eq` (every prior test
+    /// only exercised a length mismatch).
+    #[tokio::test]
+    async fn a_same_length_wrong_token_is_rejected() {
+        let real = "secret-token";
+        let wrong = "secret-tokeN"; // one character flipped, same length
+        assert_eq!(real.len(), wrong.len());
+        let app = router(test_state(real));
+        let res = app
+            .oneshot(
+                Request::get("/api/about")
+                    .header("authorization", format!("Bearer {wrong}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+    }
+
     #[test]
     fn generated_tokens_are_long_and_unique() {
         let a = generate_token();
         let b = generate_token();
         assert_eq!(a.len(), 64);
         assert_ne!(a, b);
+    }
+
+    // audit I-3: direct unit tests on the comparison primitive itself, so a
+    // future refactor of `constant_time_eq` can't silently break equality or
+    // inequality without a test-level signal, independent of the HTTP layer.
+    #[test]
+    fn constant_time_eq_rejects_a_single_differing_byte() {
+        assert!(!constant_time_eq(b"aaaa", b"aaab"));
+    }
+
+    #[test]
+    fn constant_time_eq_accepts_identical_bytes() {
+        assert!(constant_time_eq(b"abc", b"abc"));
+    }
+
+    #[test]
+    fn resolve_token_falls_through_on_blank_configured_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = WebConfig {
+            auth_token: Some("   ".to_string()),
+            ..WebConfig::default()
+        };
+        let token = resolve_token(&cfg, dir.path()).unwrap();
+        // A blank configured token must not be handed back verbatim; a real
+        // generated token (and its backing file) takes its place (audit C-1).
+        assert_ne!(token.trim(), "");
+        assert!(dir.path().join("web-token").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_token_writes_the_generated_file_with_mode_0600() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = WebConfig::default();
+        resolve_token(&cfg, dir.path()).unwrap();
+        let perms = std::fs::metadata(dir.path().join("web-token"))
+            .unwrap()
+            .permissions();
+        assert_eq!(
+            perms.mode() & 0o777,
+            0o600,
+            "audit I-1: no wide-open window"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_token_reasserts_0600_on_a_reused_token_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("web-token");
+        std::fs::write(&path, b"existing-token-value").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let cfg = WebConfig::default();
+        let token = resolve_token(&cfg, dir.path()).unwrap();
+        assert_eq!(token, "existing-token-value");
+
+        let perms = std::fs::metadata(&path).unwrap().permissions();
+        assert_eq!(
+            perms.mode() & 0o777,
+            0o600,
+            "audit I-1: reused file re-chmod'd"
+        );
     }
 }

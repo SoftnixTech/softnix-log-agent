@@ -43,8 +43,17 @@ comments). Always use the `:-` form for variables that may be unset.
 ```yaml
 enrich:
   environment: ${ENVIRONMENT:-production}
+```
+
+Do not use the `:-` default form for `web.auth_token` (or any other secret):
+`${WEB_TOKEN:-}` with `WEB_TOKEN` unset expands to an empty string, which the
+agent now treats as "not configured" and replaces with a freshly generated
+token — but an empty string is never a safe stand-in for a real secret. Use
+the required form instead so a missing variable fails validation loudly:
+
+```yaml
 web:
-  auth_token: ${WEB_TOKEN:-}
+  auth_token: ${WEB_TOKEN}
 ```
 
 ---
@@ -439,7 +448,7 @@ web:
   enabled: true
   bind: 127.0.0.1
   port: 8080
-  # auth_token: ${WEB_TOKEN:-}
+  # auth_token: ${WEB_TOKEN}
 ```
 
 ---
