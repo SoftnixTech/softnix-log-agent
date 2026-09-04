@@ -277,7 +277,7 @@ impl DiskQueue {
         }
 
         let cursor_path = inner.dir.join("cursor.json");
-        std::fs::write(&cursor_path, serde_json::to_vec(&inner.cursor)?)
+        crate::fsutil::write_atomic(&cursor_path, &serde_json::to_vec(&inner.cursor)?)
             .with_context(|| format!("cannot persist queue cursor {}", cursor_path.display()))?;
         drop(inner);
         self.space_notify.notify_waiters();
@@ -586,5 +586,29 @@ mod tests {
         assert_eq!(batch.len(), 12);
         q.ack(12).unwrap();
         assert_eq!(q.len(), 0);
+    }
+
+    #[test]
+    fn cursor_is_written_atomically_and_survives_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = BufferConfig::default();
+        let q = DiskQueue::open(dir.path(), "dest", &cfg).unwrap();
+        for i in 0..10 {
+            q.push(&Event::new("s", "test", &format!("event {i}")))
+                .unwrap();
+        }
+        let batch = q.peek_batch(10).unwrap();
+        assert_eq!(batch.len(), 10);
+        q.ack(10).unwrap();
+
+        // No temp file must survive an ack.
+        assert!(!dir.path().join("dest").join("cursor.json.tmp").exists());
+
+        drop(q);
+        let q2 = DiskQueue::open(dir.path(), "dest", &cfg).unwrap();
+        assert!(
+            q2.peek_batch(10).unwrap().is_empty(),
+            "acked events replayed"
+        );
     }
 }

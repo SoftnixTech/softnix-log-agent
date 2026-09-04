@@ -5,6 +5,7 @@ pub mod buffer;
 pub mod config;
 pub mod engine;
 pub mod event;
+pub mod fsutil;
 pub mod inputs;
 pub mod logbuf;
 pub mod metrics;

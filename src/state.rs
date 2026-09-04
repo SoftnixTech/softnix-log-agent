@@ -126,11 +126,8 @@ impl StateManager {
             let st = self.state.lock().unwrap();
             serde_json::to_vec_pretty(&*st)?
         };
-        let tmp = self.path.with_extension("json.tmp");
-        std::fs::write(&tmp, &bytes)
-            .with_context(|| format!("cannot write state file {}", tmp.display()))?;
-        std::fs::rename(&tmp, &self.path)
-            .with_context(|| format!("cannot replace state file {}", self.path.display()))?;
+        crate::fsutil::write_atomic(&self.path, &bytes)
+            .with_context(|| format!("cannot write state file {}", self.path.display()))?;
         Ok(())
     }
 }
