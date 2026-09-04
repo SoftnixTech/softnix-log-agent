@@ -207,6 +207,13 @@ async fn run_agent(
 
     let shutdown = external_shutdown.unwrap_or_default();
     let (control_tx, mut control_rx) = mpsc::channel::<ControlMsg>(4);
+    // DNS rebinding protection: the only hostnames a legitimate browser
+    // request for this agent's own GUI can carry in Host/Origin (audit H-1).
+    let allowed_hosts = vec![
+        format!("{}:{}", cfg.web.bind, cfg.web.port),
+        format!("localhost:{}", cfg.web.port),
+        format!("127.0.0.1:{}", cfg.web.port),
+    ];
     let app_state = Arc::new(AppState {
         engine: tokio::sync::RwLock::new(None),
         logs: log_buffer,
@@ -214,6 +221,7 @@ async fn run_agent(
         control: control_tx,
         uptime: metrics::Uptime::default(),
         auth_token: web::resolve_token(&cfg.web, &cfg.agent.data_dir)?,
+        allowed_hosts,
     });
 
     // Web server lives outside the engine so it survives reloads.

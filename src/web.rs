@@ -38,6 +38,7 @@ pub struct AppState {
     pub control: mpsc::Sender<ControlMsg>,
     pub uptime: Uptime,
     pub auth_token: String,
+    pub allowed_hosts: Vec<String>,
 }
 
 type S = State<Arc<AppState>>;
@@ -94,6 +95,31 @@ pub fn router(state: Arc<AppState>) -> Router {
 }
 
 async fn auth_layer(State(state): S, req: Request, next: Next) -> Response {
+    // DNS rebinding: an attacker page whose hostname resolves to 127.0.0.1 is
+    // same-origin from the browser's point of view, so the Host header is the
+    // only thing that distinguishes it from a real local request. Checked
+    // before the token compare so a rebound/cross-origin request never even
+    // reaches it (audit H-1).
+    let host_ok = match req.headers().get("host").and_then(|v| v.to_str().ok()) {
+        None => true, // HTTP/2 requests carry :authority instead
+        Some(h) => state.allowed_hosts.iter().any(|a| a == h),
+    };
+    if !host_ok {
+        return (StatusCode::FORBIDDEN, "host not allowed").into_response();
+    }
+
+    // Cross-site requests: an Origin from anywhere else is never legitimate for
+    // this API. A same-origin fetch either omits Origin or matches our host.
+    if let Some(origin) = req.headers().get("origin").and_then(|v| v.to_str().ok()) {
+        let origin_host = origin
+            .split_once("://")
+            .map(|(_, rest)| rest)
+            .unwrap_or(origin);
+        if !state.allowed_hosts.iter().any(|a| a == origin_host) {
+            return (StatusCode::FORBIDDEN, "cross-origin request rejected").into_response();
+        }
+    }
+
     // An empty stored token must never authenticate anything, no matter what
     // is (or isn't) supplied — belt and suspenders against the regression
     // class in `resolve_token`/`config::validate` that let a blank
@@ -510,6 +536,7 @@ mod tests {
             control,
             uptime: Uptime::default(),
             auth_token: token.to_string(),
+            allowed_hosts: vec!["127.0.0.1:8080".to_string(), "localhost:8080".to_string()],
         })
     }
 
@@ -662,6 +689,64 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// audit H-1: a cross-site `fetch` (e.g. from an attacker's page) that
+    /// somehow also carries a valid Authorization header must still be
+    /// rejected, because a mismatched Origin is never legitimate for this
+    /// local-only API.
+    #[tokio::test]
+    async fn cross_origin_post_is_rejected() {
+        let app = router(test_state("t"));
+        let res = app
+            .oneshot(
+                Request::post("/api/config/reload")
+                    .header("authorization", "Bearer t")
+                    .header("origin", "https://evil.example")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+    }
+
+    /// audit H-1: DNS rebinding — an attacker's hostname resolving to
+    /// 127.0.0.1 makes the browser treat the page as same-origin, so a wrong
+    /// Host header is the only signal left to reject on.
+    #[tokio::test]
+    async fn rebound_host_header_is_rejected() {
+        let app = router(test_state("t"));
+        let res = app
+            .oneshot(
+                Request::get("/api/about")
+                    .header("authorization", "Bearer t")
+                    .header("host", "attacker.example")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+    }
+
+    /// audit H-1: a genuine same-origin request (matching Host and Origin,
+    /// both in the allowlist) must not be caught by the new checks.
+    #[tokio::test]
+    async fn same_origin_post_is_allowed() {
+        let app = router(test_state("t"));
+        let res = app
+            .oneshot(
+                Request::post("/api/config/reload")
+                    .header("authorization", "Bearer t")
+                    .header("origin", "http://127.0.0.1:8080")
+                    .header("host", "127.0.0.1:8080")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_ne!(res.status(), StatusCode::FORBIDDEN);
     }
 
     #[test]
