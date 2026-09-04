@@ -95,7 +95,13 @@ impl OutputWorker {
             }
 
             let batch = match self.queue.peek_batch(self.cfg.retry.batch_size) {
-                Ok(b) if b.is_empty() => continue,
+                // wait_data can report "data available" while peek_batch returns
+                // nothing (all remaining records were skipped as corrupt). Without
+                // a floor this becomes a tight loop that pins a core forever.
+                Ok(b) if b.is_empty() => {
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    continue;
+                }
                 Ok(b) => b,
                 Err(e) => {
                     metrics.record_error(format!("output {id}: queue read: {e}"));
