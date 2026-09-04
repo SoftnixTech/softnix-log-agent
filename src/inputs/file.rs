@@ -62,21 +62,10 @@ fn file_identity(path: &Path, md: &std::fs::Metadata) -> String {
 /// duplicate data.
 ///
 /// On Windows this is part of `file_identity`. On Unix it backs the copy-truncate
-/// race detector in `poll_once` (see FILE-004): `dev:ino` is stable across
+/// race detector in `tail_once` (see FILE-004): `dev:ino` is stable across
 /// truncate+regrow, so the `size < offset` check alone misses a truncation that
 /// regrows past the old offset within one poll interval — comparing the first
 /// line catches it.
-/// Counts calls to `head_fingerprint`, so tests can assert the gate in
-/// `tail_once` actually skips the open+read when a file's size hasn't
-/// changed since the last poll.
-#[cfg(test)]
-static FINGERPRINT_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-/// Counts calls to `discover_paths` (the glob walk), so tests can assert
-/// tailing never re-triggers discovery.
-#[cfg(test)]
-static DISCOVER_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
 #[cfg(any(unix, windows, test))]
 fn head_fingerprint(path: &Path) -> Option<u32> {
     #[cfg(test)]
@@ -105,19 +94,53 @@ fn head_fingerprint(path: &Path) -> Option<u32> {
     Some(crc32fast::hash(&buf[..end]))
 }
 
+/// Counts calls to `head_fingerprint`, so tests can assert the gate in
+/// `tail_once` actually skips the open+read when a file's size hasn't
+/// changed since the last poll.
+#[cfg(test)]
+static FINGERPRINT_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Counts calls to `discover_paths` (the glob walk), so tests can assert
+/// tailing never re-triggers discovery.
+#[cfg(test)]
+static DISCOVER_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 struct Tracked {
     identity: String,
     offset: u64,
     /// Size observed at the previous poll. Lets the Unix fingerprint check
-    /// below skip its open+read entirely when the size hasn't moved, since
-    /// nothing could have changed the file's identity in that case.
+    /// below skip its open+read entirely when neither size nor mtime has
+    /// moved, since nothing could have changed the file's identity in that
+    /// case.
     last_size: u64,
+    /// Modification time observed at the previous poll. A same-size
+    /// truncate+rewrite (e.g. a fixed-width status file) leaves `last_size`
+    /// unchanged across the poll boundary, so `last_size` alone is not a
+    /// reliable "nothing happened" signal -- mtime is the second half of
+    /// that gate. Not `#[cfg(unix)]`-gated: `Metadata::modified()` is
+    /// cross-platform, even though only the Unix fingerprint check below
+    /// consults it today.
+    last_mtime: Option<std::time::SystemTime>,
     /// Hash of the file's first line, recorded once we've advanced `offset`
     /// past 0. Used on Unix to detect the copy-truncate race (FILE-004):
     /// `dev:ino` is stable across truncate+regrow, so a content-based signal
     /// is needed when the file has already regrown past the old offset.
     #[cfg(unix)]
     first_line_hash: Option<u32>,
+}
+
+/// Per-path output of `FileInput::tail_paths_blocking`, handed back to the
+/// async caller so it can parse+send `lines` and persist the resulting
+/// cursor. `lines` is empty when the file's size hasn't moved past `offset`
+/// (nothing new to read) but the cursor may still need a `touched` refresh.
+struct TailReadResult {
+    path_str: String,
+    identity: String,
+    lines: Vec<String>,
+    /// Offset to persist: unchanged from before this poll if `lines` is
+    /// empty, or the new post-read offset otherwise.
+    offset: u64,
+    hash: Option<u32>,
 }
 
 pub struct FileInput {
@@ -351,16 +374,18 @@ impl FileInput {
                     Tracked {
                         identity,
                         offset,
-                        // Deliberately NOT `size`: a hash restored from a
-                        // saved cursor above has not yet been verified
-                        // against this file's *current* content (which may
-                        // already have been rewritten by the time discovery
-                        // ran). Seeding `last_size` at 0 forces `tail_once`'s
-                        // fingerprint gate to run at least once for this
-                        // freshly (re)tracked entry, whatever the size turns
-                        // out to be, rather than trusting a restored hash it
-                        // never actually checked.
+                        // Deliberately NOT `size`/the real mtime: a hash
+                        // restored from a saved cursor above has not yet
+                        // been verified against this file's *current*
+                        // content (which may already have been rewritten by
+                        // the time discovery ran). Seeding both at
+                        // 0/`None` forces `tail_once`'s fingerprint gate to
+                        // run at least once for this freshly (re)tracked
+                        // entry, whatever the size/mtime turn out to be,
+                        // rather than trusting a restored hash it never
+                        // actually checked.
                         last_size: 0,
+                        last_mtime: None,
                         #[cfg(unix)]
                         first_line_hash,
                     },
@@ -383,18 +408,90 @@ impl FileInput {
     /// (Unix), and reads any newly appended lines. Never walks the
     /// filesystem for paths it doesn't already know about — that's
     /// `discover_once`'s job. Returns events emitted.
+    ///
+    /// This runs once per `poll_interval_ms` (500ms default) — far more
+    /// often than `discover_once`'s `discovery_interval_ms` (30s default) —
+    /// so its per-file blocking I/O (`std::fs::metadata`, `file_identity`,
+    /// the Unix fingerprint check, `read_new_lines`) is the dominant
+    /// steady-state blocking cost of this whole input. All of it runs inside
+    /// `spawn_blocking`, mirroring how `discover_once` isolates its glob
+    /// walk, so it never blocks whichever tokio worker thread this task
+    /// happens to be scheduled on. Only parsing (CPU-bound) and sending
+    /// (genuinely async, cancellation-aware) run on the async task itself.
     async fn tail_once(
         &self,
         tx: &EventSender,
-        state: &StateManager,
+        state: &Arc<StateManager>,
         metrics: &Metrics,
         tracked: &mut HashMap<PathBuf, Tracked>,
         cancel: &CancellationToken,
     ) -> Result<u64> {
-        let id = &self.cfg.id;
+        let id = self.cfg.id.clone();
         let mut emitted = 0u64;
 
-        let paths: Vec<PathBuf> = tracked.keys().cloned().collect();
+        let owned = std::mem::take(tracked);
+        let paths: Vec<PathBuf> = owned.keys().cloned().collect();
+        let state_for_blocking = Arc::clone(state);
+        let cancel_for_blocking = cancel.clone();
+        let id_for_blocking = id.clone();
+
+        let (owned, results) = tokio::task::spawn_blocking(move || {
+            Self::tail_paths_blocking(
+                owned,
+                paths,
+                &id_for_blocking,
+                &state_for_blocking,
+                &cancel_for_blocking,
+            )
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("file tail task panicked: {e}"))?;
+
+        *tracked = owned;
+
+        for r in results {
+            if cancel.is_cancelled() {
+                break;
+            }
+            for line in r.lines {
+                let ev = self.parser.parse(&line, &r.path_str, &self.source_type);
+                metrics
+                    .events_received
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                emitted += 1;
+                tokio::select! {
+                    res = tx.send(ev) => {
+                        if res.is_err() {
+                            return Ok(emitted);
+                        }
+                    }
+                    _ = cancel.cancelled() => return Ok(emitted),
+                }
+            }
+            state.set_cursor(&id, &r.identity, &r.path_str, r.offset, r.hash);
+        }
+
+        Ok(emitted)
+    }
+
+    /// The genuinely-blocking half of `tail_once`: per already-tracked path,
+    /// stat, rotation/truncation detection, the gated Unix fingerprint
+    /// check, and reading any newly appended lines. A free function (rather
+    /// than a `&self` method) so it can be moved wholesale into
+    /// `spawn_blocking`, mirroring `discover_paths`. Takes ownership of
+    /// `tracked` (via the caller's `std::mem::take`, as `discover_once` also
+    /// does) since it both reads and updates each path's entry, and hands it
+    /// back alongside the per-path read results the async caller needs to
+    /// parse, send, and persist.
+    fn tail_paths_blocking(
+        mut tracked: HashMap<PathBuf, Tracked>,
+        paths: Vec<PathBuf>,
+        id: &str,
+        state: &StateManager,
+        cancel: &CancellationToken,
+    ) -> (HashMap<PathBuf, Tracked>, Vec<TailReadResult>) {
+        let mut results = Vec::new();
+
         for path in paths {
             if cancel.is_cancelled() {
                 break;
@@ -425,6 +522,7 @@ impl FileInput {
                     // just-rotated entry rather than trusting a same-size
                     // coincidence or a restored-but-unverified hash.
                     last_size: 0,
+                    last_mtime: None,
                     #[cfg(unix)]
                     first_line_hash,
                 };
@@ -435,6 +533,7 @@ impl FileInput {
                 tracing::info!("file {} truncated; restarting from 0", path.display());
                 t.offset = 0;
             }
+            let mtime = md.modified().ok();
             // FILE-004: copy-truncate race on Unix — file was truncated AND
             // regrown past the old offset within one poll interval, so the
             // `size < offset` check above doesn't fire (size already exceeds
@@ -442,12 +541,15 @@ impl FileInput {
             // for normal appends, so a hash mismatch is a reliable rotation
             // signal that `dev:ino` cannot provide (inode survives truncate).
             // The fingerprint costs an open+read+close, so it's only
-            // recomputed when the size has actually moved since the last
-            // poll (or no baseline has been established yet) — nothing could
-            // have changed the identity of a file whose size is unchanged.
+            // recomputed when size or mtime has actually moved since the last
+            // poll (or no baseline has been established yet) — an idle file
+            // has neither changed. Gating on size alone would miss a
+            // same-size truncate+rewrite (e.g. a fixed-width status file):
+            // size crosses the poll boundary unchanged even though the
+            // content did, so mtime is needed as the second signal.
             #[cfg(unix)]
             {
-                if size != t.last_size || t.first_line_hash.is_none() {
+                if size != t.last_size || mtime != t.last_mtime || t.first_line_hash.is_none() {
                     let prev = t.first_line_hash;
                     if let Some(curr) = head_fingerprint(&path) {
                         if t.offset > 0 && prev.is_some() && prev != Some(curr) {
@@ -462,6 +564,7 @@ impl FileInput {
                 }
             }
             t.last_size = size;
+            t.last_mtime = mtime;
 
             #[cfg(unix)]
             let hash = t.first_line_hash;
@@ -469,29 +572,26 @@ impl FileInput {
             let hash = None;
 
             if size == t.offset {
-                state.set_cursor(id, &t.identity, &path_str, t.offset, hash);
+                results.push(TailReadResult {
+                    path_str,
+                    identity: t.identity.clone(),
+                    lines: Vec::new(),
+                    offset: t.offset,
+                    hash,
+                });
                 continue;
             }
 
-            match self.read_new_lines(&path, t.offset, size) {
+            match Self::read_new_lines(&path, t.offset, size) {
                 Ok((lines, new_offset)) => {
-                    for line in lines {
-                        let ev = self.parser.parse(&line, &path_str, &self.source_type);
-                        metrics
-                            .events_received
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        emitted += 1;
-                        tokio::select! {
-                            res = tx.send(ev) => {
-                                if res.is_err() {
-                                    return Ok(emitted);
-                                }
-                            }
-                            _ = cancel.cancelled() => return Ok(emitted),
-                        }
-                    }
                     t.offset = new_offset;
-                    state.set_cursor(id, &t.identity, &path_str, t.offset, hash);
+                    results.push(TailReadResult {
+                        path_str,
+                        identity: t.identity.clone(),
+                        lines,
+                        offset: t.offset,
+                        hash,
+                    });
                 }
                 Err(e) => {
                     tracing::warn!("cannot read {}: {e}", path.display());
@@ -499,12 +599,17 @@ impl FileInput {
             }
         }
 
-        Ok(emitted)
+        (tracked, results)
     }
 
     /// Read complete lines from `offset`, never past `size`. The offset only
     /// advances past the last full newline so partial writes are re-read.
-    fn read_new_lines(&self, path: &Path, offset: u64, size: u64) -> Result<(Vec<String>, u64)> {
+    ///
+    /// A free function (rather than a `&self` method) since it touches
+    /// nothing but its arguments, so it can be called from
+    /// `tail_paths_blocking` inside `spawn_blocking` without needing to move
+    /// a non-`'static` `&self` across that boundary.
+    fn read_new_lines(path: &Path, offset: u64, size: u64) -> Result<(Vec<String>, u64)> {
         let mut f = File::open(path)?;
         f.seek(SeekFrom::Start(offset))?;
         let to_read = (size - offset).min(READ_BUDGET);
@@ -773,6 +878,70 @@ mod tests {
             got,
             vec!["replacement A", "replacement B", "replacement C"],
             "copy-truncate race should be detected; got {got:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn detects_same_size_truncate_rewrite_on_unix() {
+        let _guard = lock_counters();
+        // Fix round 1, FIX-1 regression: gating the fingerprint check on
+        // `size != last_size` alone misses a truncate+rewrite that happens
+        // to land on the EXACT SAME byte count as the previous poll (a
+        // fixed-width status file, a timestamp-prefixed log of constant
+        // width, ...). Size is identical across the poll boundary even
+        // though the content changed, so `t.first_line_hash` never gets
+        // rechecked and the rewritten content is silently dropped forever
+        // if the file then goes idle at that size. The gate must also fire
+        // on a changed mtime.
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let state_dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("app.log");
+        // Pad both writes to the same fixed width so their total byte counts
+        // are guaranteed identical while their content (and hence first-line
+        // hash) differs.
+        let line1 = format!("{:<40}", "status=OK");
+        let line2 = format!("{:<40}", "status=FAILED-DIFFERENT-CONTENT");
+        assert_eq!(
+            line1.len(),
+            line2.len(),
+            "test setup: both lines must be equal width"
+        );
+        std::fs::write(&log, format!("{line1}\n")).unwrap();
+
+        let input = input_for(dir.path());
+        let state = Arc::new(StateManager::open(state_dir.path()).unwrap());
+        let metrics = Arc::new(Metrics::default());
+        let (raw_tx, mut rx) = mpsc::channel(100);
+        let tx = EventSender::with_budget(raw_tx, 16 * 1024 * 1024);
+        let cancel = CancellationToken::new();
+        let mut tracked = HashMap::new();
+
+        input
+            .poll_once(&tx, &state, &metrics, &mut tracked, false, &cancel)
+            .await
+            .unwrap();
+        assert_eq!(collect(&mut rx).await, vec![line1.clone()]);
+
+        // Truncate and rewrite to the IDENTICAL byte count. Sleep briefly
+        // first so the rewrite's mtime is observably distinct even on
+        // filesystems with coarse mtime resolution.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let mut f = std::fs::File::create(&log).unwrap();
+        f.write_all(format!("{line2}\n").as_bytes()).unwrap();
+        drop(f);
+
+        input
+            .poll_once(&tx, &state, &metrics, &mut tracked, false, &cancel)
+            .await
+            .unwrap();
+
+        let got = collect(&mut rx).await;
+        assert_eq!(
+            got,
+            vec![line2],
+            "same-size truncate+rewrite must still be detected via mtime; got {got:?}"
         );
     }
 

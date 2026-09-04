@@ -625,6 +625,13 @@ pub fn validate(cfg: &Config) -> Result<Vec<String>> {
                 f.poll_interval_ms
             );
         }
+        if f.discovery_interval_ms < 50 {
+            bail!(
+                "inputs.files[{}]: discovery_interval_ms must be >= 50 (got {})",
+                f.id,
+                f.discovery_interval_ms
+            );
+        }
         validate_parser(&f.parser, &format!("inputs.files[{}]", f.id))?;
     }
 
@@ -955,6 +962,30 @@ inputs:
     #[test]
     fn rejects_unknown_fields() {
         assert!(parse("agent:\n  bogus_key: 1\n").is_err());
+    }
+
+    /// Fix round 1, FIX 2: `tokio::time::interval` panics on a zero period,
+    /// and this crate's release profile sets `panic = "abort"`, so an
+    /// unvalidated `discovery_interval_ms: 0` would abort the whole agent
+    /// process. `poll_interval_ms` already has this floor; discovery_interval_ms
+    /// must get the same one.
+    #[test]
+    fn rejects_zero_discovery_interval_ms() {
+        let bad = r#"
+inputs:
+  files:
+    - id: a
+      paths: ["/x/*.log"]
+      discovery_interval_ms: 0
+outputs:
+  - id: console
+    type: stdout
+"#;
+        let err = parse(bad).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("discovery_interval_ms"),
+            "expected a discovery_interval_ms error, got: {err:#}"
+        );
     }
 
     #[test]

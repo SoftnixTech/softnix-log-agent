@@ -108,6 +108,7 @@ rather than a liveness/restart trigger. If you need a pure liveness signal
 | Knob | Default | Notes |
 |---|---|---|
 | `inputs.files[].poll_interval_ms` | 500 | Lower = fresher + slightly more CPU; min 50. |
+| `inputs.files[].discovery_interval_ms` | 30000 | Interval between filesystem discovery passes (the glob walk for new/removed files), kept separate from and much slower than `poll_interval_ms`. Lower = new/removed files noticed sooner, more discovery overhead; min 50. |
 | `buffer.max_size_mb` | 1024 | Per destination. Outage capacity ≈ rate × event size × outage duration. |
 | `buffer.full_policy` | block | `block` never blocks inputs directly: the pipeline fans out to each destination with a non-blocking send and sheds (per destination, counted and logged) once that destination's ~4096-event in-memory buffer is exhausted — room beyond that depends on the destination's own on-disk queue capacity. `drop_oldest` favors fresh data; `drop_newest` favors history. |
 | `outputs[].retry.batch_size` | 200 | Larger batches = higher throughput, larger duplicate window on crash. |
