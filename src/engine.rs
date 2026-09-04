@@ -11,16 +11,29 @@ use crate::pipeline::{eval_condition, Enricher, Transformer};
 use crate::state::StateManager;
 use anyhow::{Context, Result};
 use std::collections::HashMap;
+use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
+/// A fan-out target: an output's config, the sender into its router task,
+/// and the per-destination "router channel full" shed counter (also held in
+/// `EngineShared::router_shed` for `/metrics`).
+type RouterEntry = (OutputConfig, mpsc::Sender<Arc<Event>>, Arc<AtomicU64>);
+
 const CHANNEL_CAPACITY: usize = 8192;
-/// Capacity of each per-destination router channel. Small on purpose: it is
-/// only meant to absorb transient bursts between the pipeline and a router,
-/// not to let one slow destination buffer memory unboundedly on top of its
-/// own on-disk queue.
-const ROUTER_CAPACITY: usize = 256;
+/// Capacity of each per-destination router channel. This exists to absorb
+/// transient bursts and, in particular, the brief lock contention between a
+/// router's `push`/`push_blocking` and the output worker's `ack`/
+/// `peek_batch` on `DiskQueue`'s shared mutex (`ack` holds it across two
+/// `fsync` calls per batch) — not to let one slow destination buffer memory
+/// unboundedly beyond its own on-disk queue. 4096 gives routine contention
+/// generous room to be absorbed (each slot is just an `Arc<Event>` pointer +
+/// refcount, not the event body, so the memory cost is small) while still
+/// being finite: a destination that is genuinely stuck, not just briefly
+/// contended, still sheds beyond this — which is intentional, since that is
+/// what makes this task's cross-destination isolation guarantee hold.
+const ROUTER_CAPACITY: usize = 4096;
 
 /// Everything the web UI needs to observe a running engine.
 pub struct EngineShared {
@@ -28,6 +41,11 @@ pub struct EngineShared {
     pub metrics: Arc<Metrics>,
     pub status: Arc<StatusRegistry>,
     pub queues: HashMap<String, Arc<DiskQueue>>,
+    /// Per-destination count of events shed because that destination's
+    /// router channel was full (`route_event`'s `try_send` `Full` arm).
+    /// Distinct from the aggregate `Metrics::events_dropped`, which mixes in
+    /// unrelated causes (disk-queue full/drop policies, transform drops).
+    pub router_shed: HashMap<String, Arc<AtomicU64>>,
     pub state: Arc<StateManager>,
 }
 
@@ -105,11 +123,14 @@ impl Engine {
         // channel. A destination whose queue is full (or whose disk writes are
         // otherwise slow) can only ever stall its own channel, never the
         // pipeline or any other destination.
-        let mut routers: Vec<(OutputConfig, mpsc::Sender<Arc<Event>>)> = Vec::new();
+        let mut routers: Vec<RouterEntry> = Vec::new();
+        let mut router_shed: HashMap<String, Arc<AtomicU64>> = HashMap::new();
         for out in &cfg.outputs {
             let (rtx, rrx) = mpsc::channel::<Arc<Event>>(ROUTER_CAPACITY);
             let policy = out.full_policy.unwrap_or(cfg.buffer.full_policy);
             let block = policy == FullPolicy::Block;
+            let shed = Arc::new(AtomicU64::new(0));
+            router_shed.insert(out.id.clone(), shed.clone());
             tasks.push(tokio::spawn(run_router(
                 rrx,
                 out.clone(),
@@ -118,7 +139,7 @@ impl Engine {
                 metrics.clone(),
                 cancel.child_token(),
             )));
-            routers.push((out.clone(), rtx));
+            routers.push((out.clone(), rtx, shed));
         }
 
         // Pipeline task: transform, enrich, fan out to the per-destination
@@ -216,6 +237,7 @@ impl Engine {
             metrics,
             status,
             queues,
+            router_shed,
             state,
         }))
     }
@@ -285,7 +307,7 @@ async fn run_pipeline(
     mut rx: mpsc::Receiver<Event>,
     transformer: Transformer,
     enricher: Enricher,
-    routers: Vec<(OutputConfig, mpsc::Sender<Arc<Event>>)>,
+    routers: Vec<RouterEntry>,
     status: Arc<StatusRegistry>,
     metrics: Arc<Metrics>,
     cancel: CancellationToken,
@@ -297,24 +319,64 @@ async fn run_pipeline(
                 None => return,
             },
             _ = cancel.cancelled() => {
-                // Drain whatever is already in the channel before exiting.
+                // Drain whatever is already in the channel before exiting. This
+                // runs on every engine stop, including a routine config reload
+                // (SIGHUP / GUI save-and-reload both cancel this same token) —
+                // not just final process shutdown — so it must not silently shed
+                // events the way the hot path's try_send does. Use the
+                // force-deliver path instead: it blocks on each router's channel
+                // until there is room, rather than giving up after one attempt.
+                //
+                // This cannot hang indefinitely: by the time this arm runs,
+                // `cancel` (and therefore every router's child token — see
+                // `run_router`/`push_blocking` in src/buffer.rs) has already been
+                // cancelled, so a router currently parked in `push_blocking`
+                // waiting for disk-queue space unblocks and returns immediately
+                // via `push_blocking`'s own `_ = cancel.cancelled() => return
+                // Ok(false)` arm, instead of waiting for space that may never
+                // come. Draining may still take a little wall-clock time (the
+                // router has to actually work through its backlog), but every
+                // event that was in this channel gets a genuine chance to reach
+                // the destination's disk queue rather than being shed on a
+                // single non-blocking attempt.
                 while let Ok(ev) = rx.try_recv() {
-                    route_event(ev, &transformer, &enricher, &routers, &status, &metrics).await;
+                    route_event(ev, &transformer, &enricher, &routers, &status, &metrics, true)
+                        .await;
                 }
                 return;
             }
         };
-        route_event(ev, &transformer, &enricher, &routers, &status, &metrics).await;
+        route_event(
+            ev,
+            &transformer,
+            &enricher,
+            &routers,
+            &status,
+            &metrics,
+            false,
+        )
+        .await;
     }
 }
 
+/// `force_deliver` selects the fan-out strategy for this one event:
+/// - `false` (the normal hot path): `try_send` — never blocks, sheds this
+///   event for a single saturated destination rather than stalling delivery
+///   to its siblings (or the pipeline, or any input). This is the isolation
+///   guarantee the per-destination routers exist to provide and must not be
+///   reopened.
+/// - `true` (the drain arm only, see `run_pipeline`'s cancel branch): a
+///   blocking send, so a routine stop/reload does not silently shed
+///   already-received events. Safe there, and only there, because cancel has
+///   already fired by that point (see the comment on the cancel arm above).
 async fn route_event(
     mut ev: Event,
     transformer: &Transformer,
     enricher: &Enricher,
-    routers: &[(OutputConfig, mpsc::Sender<Arc<Event>>)],
+    routers: &[RouterEntry],
     status: &StatusRegistry,
     metrics: &Metrics,
+    force_deliver: bool,
 ) {
     if !transformer.apply(&mut ev) {
         metrics
@@ -325,7 +387,7 @@ async fn route_event(
     enricher.apply(&mut ev);
 
     let ev = Arc::new(ev);
-    for (out, tx) in routers {
+    for (out, tx, shed) in routers {
         // Standby outputs only receive traffic while their primary is down.
         if let Some(primary) = &out.failover_for {
             if status.output_healthy(primary) {
@@ -336,6 +398,12 @@ async fn route_event(
             if !eval_condition(cond, &ev) {
                 continue;
             }
+        }
+        if force_deliver {
+            if tx.send(Arc::clone(&ev)).await.is_err() {
+                metrics.record_error(format!("router {} closed", out.id));
+            }
+            continue;
         }
         // A blocking send here would defeat the whole point of per-destination
         // routers: if THIS destination's channel is full because its router is
@@ -355,10 +423,178 @@ async fn route_event(
                 metrics
                     .events_dropped
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                // This can also fire during brief, routine lock contention on
+                // DiskQueue's mutex (shared with the output worker's ack/
+                // peek_batch, which holds it across fsync) — not only when the
+                // destination is genuinely stuck. Make it visible without
+                // spamming: count it per destination (distinct from the
+                // aggregate `events_dropped`, which mixes in unrelated causes)
+                // and log only every 100th occurrence for this destination.
+                let n = shed.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                if n % 100 == 1 {
+                    tracing::warn!(
+                        destination = %out.id,
+                        shed_total = n,
+                        "destination router buffer full; shedding event (logged every 100th occurrence)"
+                    );
+                }
             }
             Err(mpsc::error::TrySendError::Closed(_)) => {
                 metrics.record_error(format!("router {} closed", out.id));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{
+        BufferConfig, EnrichConfig, Framing, OutputFormat, OutputKind, PipelineConfig, RetryConfig,
+        SyslogProtocol,
+    };
+    use std::sync::atomic::Ordering;
+
+    fn test_output(id: &str) -> OutputConfig {
+        OutputConfig {
+            id: id.to_string(),
+            kind: OutputKind::Stdout,
+            address: None,
+            protocol: SyslogProtocol::default(),
+            format: OutputFormat::default(),
+            framing: Framing::default(),
+            tls: None,
+            when: None,
+            failover_for: None,
+            retry: RetryConfig::default(),
+            full_policy: None,
+        }
+    }
+
+    /// Regression guard for the fix-round-2 drain fix: `run_pipeline`'s
+    /// cancel arm must force-deliver every already-received event to its
+    /// destination's router rather than shedding it on a single
+    /// non-blocking `try_send`, the way the normal hot path does. This
+    /// simulates a router channel that is momentarily behind (a small
+    /// capacity plus a slow consumer — the same "router briefly can't keep
+    /// up" shape fix 2's shed counter exists for, just exaggerated so the
+    /// test runs fast and deterministically instead of depending on real
+    /// disk or network timing) and proves every event handed to
+    /// `route_event` with `force_deliver: true` still reaches the
+    /// destination's disk queue — none dropped — even though far more
+    /// events are sent than the channel can hold at once.
+    #[tokio::test]
+    async fn drain_force_delivers_every_event_even_past_channel_capacity() {
+        let dir = tempfile::tempdir().unwrap();
+        let bcfg = BufferConfig {
+            dir: None,
+            max_size_mb: 64,
+            segment_size_mb: 8,
+            full_policy: FullPolicy::Block,
+        };
+        let queue = DiskQueue::open(dir.path(), "dest", &bcfg).unwrap();
+
+        // Capacity 4 (vs. the real ROUTER_CAPACITY of 4096) so a modest
+        // burst reliably exceeds it; the consumer drains one event at a time
+        // with a small delay, standing in for a router that is momentarily
+        // slower than the rate events arrive at.
+        let (rtx, mut rrx) = mpsc::channel::<Arc<Event>>(4);
+        let consumer = tokio::spawn(async move {
+            let mut delivered = 0u64;
+            while let Some(ev) = rrx.recv().await {
+                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+                queue.push(&ev).unwrap();
+                delivered += 1;
+            }
+            (delivered, queue)
+        });
+
+        let out = test_output("dest");
+        let metrics = Metrics::default();
+        let status = StatusRegistry::default();
+        let shed = Arc::new(AtomicU64::new(0));
+        // `rtx` is moved in here (not cloned) so dropping `routers` below is
+        // what closes the channel and lets the consumer's `recv()` loop end.
+        let routers = vec![(out, rtx, shed.clone())];
+        let transformer = Transformer::compile(&PipelineConfig::default()).unwrap();
+        let enricher = Enricher::new(&EnrichConfig::default());
+
+        const N: usize = 50; // well past the channel's capacity of 4
+        for i in 0..N {
+            let ev = Event::new("test", "raw", &format!("drain-{i}"));
+            route_event(
+                ev,
+                &transformer,
+                &enricher,
+                &routers,
+                &status,
+                &metrics,
+                true,
+            )
+            .await;
+        }
+        drop(routers);
+        let (delivered, queue) = consumer.await.unwrap();
+
+        assert_eq!(
+            delivered, N as u64,
+            "every event handed to the force-deliver drain path must reach the router, \
+             not just as many as fit in the channel at once"
+        );
+        assert_eq!(
+            queue.len(),
+            N as u64,
+            "every drained event must actually land in the destination's disk queue"
+        );
+        assert_eq!(
+            shed.load(Ordering::Relaxed),
+            0,
+            "the force-deliver path must never shed - that counter is for the \
+             non-blocking hot path only"
+        );
+    }
+
+    /// Contrast case: the normal hot path (`force_deliver: false`) sheds
+    /// once the router channel is genuinely full, exactly as round 1 fixed
+    /// it to do. This pins that behavior so a future change cannot silently
+    /// make the hot path force-deliver too (which would reopen the
+    /// isolation bug this whole task exists to prevent).
+    #[tokio::test]
+    async fn hot_path_still_sheds_on_a_full_channel() {
+        // Capacity 1 and no consumer at all: the first send fills the
+        // channel, the second must be shed immediately rather than waiting.
+        let (rtx, _rrx) = mpsc::channel::<Arc<Event>>(1);
+        let out = test_output("dest");
+        let metrics = Metrics::default();
+        let status = StatusRegistry::default();
+        let shed = Arc::new(AtomicU64::new(0));
+        let routers = vec![(out, rtx, shed.clone())];
+        let transformer = Transformer::compile(&PipelineConfig::default()).unwrap();
+        let enricher = Enricher::new(&EnrichConfig::default());
+
+        for i in 0..5 {
+            let ev = Event::new("test", "raw", &format!("hot-{i}"));
+            route_event(
+                ev,
+                &transformer,
+                &enricher,
+                &routers,
+                &status,
+                &metrics,
+                false,
+            )
+            .await;
+        }
+
+        assert!(
+            shed.load(Ordering::Relaxed) > 0,
+            "a full channel must shed on the non-blocking hot path, not wait"
+        );
+        assert_eq!(
+            metrics.events_dropped.load(Ordering::Relaxed),
+            shed.load(Ordering::Relaxed),
+            "the aggregate dropped counter and the per-destination shed counter \
+             must agree when shedding is the only drop cause in play"
+        );
     }
 }

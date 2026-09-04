@@ -399,32 +399,43 @@ web:
 
     // Phase 1: flood "stuck" past the point where it can possibly still be
     // absorbing events unimpeded, so its router genuinely parks in
-    // `push_blocking`. This has to overflow *three* buffers, not just the 1
-    // MiB disk queue: the kernel TCP send/receive buffers between the output
-    // worker and the never-reading peer (macOS/Linux both auto-tune these up
-    // to several MiB - observed up to 4 MiB each way on this host, i.e. ~8
-    // MiB of data the OS will silently absorb before a `write` actually
-    // blocks), and the per-destination router channel (`ROUTER_CAPACITY` =
-    // 256 in `src/engine.rs`) sitting in front of the disk queue. Only once
-    // all three are full does the router's `push_blocking` genuinely park
-    // and the channel in front of it back up - which is the only state in
-    // which `tx.send`/`tx.try_send` on that channel is actually exercised at
-    // capacity. A serialized Event carries both `message` and `raw_message`
-    // (roughly doubling the effective size), so a ~8 KiB body comes out to
-    // roughly 16 KiB on the wire; sending well over 1000 of them clears the
-    // ~8 MiB of kernel + disk-queue headroom with margin. Too little data
-    // here means "stuck" never actually parks, its router never blocks, and
-    // the bug this test exists to catch never triggers - which is exactly
-    // what silently happened with an earlier, too-small version of this
-    // test.
+    // `push_blocking` on a full disk queue. Rather than guessing a single
+    // fixed volume up front (fragile: the OS's UDP receive buffer - a few
+    // hundred KB - drops an unpredictable, host- and scheduling-dependent
+    // fraction of a single burst before the agent ever sees it, so a count
+    // picked on one host/run can silently stop being enough on another), keep
+    // sending small batches and polling `is_full()` between them until it
+    // actually reports full (or a generous deadline elapses). Polling in
+    // between batches also gives the input listener and the engine's
+    // internal tasks scheduling turns to actually drain and process what has
+    // been sent so far.
     let padding = "x".repeat(8192);
-    for i in 0..1200 {
-        let line = format!("<14>Jun 10 10:00:00 h1 app: filler {i} {padding}");
-        client
-            .send_to(line.as_bytes(), ("127.0.0.1", in_port))
-            .await
-            .unwrap();
+    let mut filler_sent = 0usize;
+    let fill_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while !engine.shared.queues["stuck"].is_full() && tokio::time::Instant::now() < fill_deadline {
+        for _ in 0..200 {
+            let line = format!("<14>Jun 10 10:00:00 h1 app: filler {filler_sent} {padding}");
+            client
+                .send_to(line.as_bytes(), ("127.0.0.1", in_port))
+                .await
+                .unwrap();
+            filler_sent += 1;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
+
+    // Confirm the filler actually achieved its purpose before relying on it:
+    // if it never did, the assertion below would pass under both this fix AND
+    // the (hypothetical) still-broken pre-fix code, defeating this test's
+    // purpose as a regression guard. Fail loudly instead if the precondition
+    // wasn't met.
+    assert!(
+        engine.shared.queues["stuck"].is_full(),
+        "precondition not met: \"stuck\" destination's disk queue never became full \
+         after sending {filler_sent} filler events, so this test cannot actually \
+         exercise the isolation property it claims to guard (kernel socket buffers \
+         on this host may be absorbing more of the filler than expected)"
+    );
 
     // Phase 2: with "stuck" now genuinely backed up, send events that only
     // the healthy destination should keep receiving. Under the pre-fix

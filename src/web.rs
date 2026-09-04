@@ -361,6 +361,12 @@ async fn metrics_text(State(state): S) -> Response {
             u8::from(q.is_full() && q.policy() == FullPolicy::Block)
         ));
     }
+    for (id, n) in &eng.router_shed {
+        out.push_str(&format!(
+            "agent_router_shed_total{{destination=\"{id}\"}} {}\n",
+            n.load(std::sync::atomic::Ordering::Relaxed)
+        ));
+    }
     for o in eng.status.outputs_snapshot() {
         out.push_str(&format!(
             "agent_output_healthy{{destination=\"{}\"}} {}\n",
