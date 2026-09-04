@@ -485,15 +485,26 @@ fn default_web_port() -> u16 {
     8080
 }
 
-/// Expand ${VAR} and ${VAR:-default} references from the environment.
-pub fn expand_env(raw: &str) -> Result<String> {
+/// Expand `${VAR}` and `${VAR:-default}` references. Returns the expanded text
+/// plus every value that came from a *real environment variable* (not a literal
+/// `:-default`, which isn't a secret pulled from the environment), so error
+/// messages can be scrubbed of them — a validation error that echoes an
+/// expanded value turns /api/config/validate into an oracle for reading the
+/// root process's environment.
+pub fn expand_env(raw: &str) -> Result<(String, Vec<String>)> {
     let re = regex::Regex::new(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}").unwrap();
     let mut missing = Vec::new();
+    let mut secrets = Vec::new();
     let out = re
         .replace_all(raw, |caps: &regex::Captures| {
             let var = &caps[1];
             match std::env::var(var) {
-                Ok(v) => v,
+                Ok(v) => {
+                    if !v.is_empty() {
+                        secrets.push(v.clone());
+                    }
+                    v
+                }
                 Err(_) => match caps.get(2) {
                     Some(d) => d.as_str().to_string(),
                     None => {
@@ -510,13 +521,28 @@ pub fn expand_env(raw: &str) -> Result<String> {
             missing.join(", ")
         );
     }
-    Ok(out)
+    Ok((out, secrets))
+}
+
+/// Replace every substituted env value in an error message with `***`.
+fn redact(msg: String, secrets: &[String]) -> String {
+    let mut msg = msg;
+    for s in secrets {
+        if s.len() >= 2 {
+            msg = msg.replace(s.as_str(), "***");
+        }
+    }
+    msg
 }
 
 /// Parse and validate config text. Returns the config plus non-fatal warnings.
 pub fn parse(raw: &str) -> Result<(Config, Vec<String>)> {
-    let expanded = expand_env(raw)?;
-    let cfg: Config = serde_yaml::from_str(&expanded).map_err(|e| {
+    let (expanded, secrets) = expand_env(raw)?;
+    parse_expanded(&expanded).map_err(|e| anyhow::anyhow!(redact(format!("{e:#}"), &secrets)))
+}
+
+fn parse_expanded(expanded: &str) -> Result<(Config, Vec<String>)> {
+    let cfg: Config = serde_yaml::from_str(expanded).map_err(|e| {
         anyhow::anyhow!(
             "YAML parse error: {e}\nHint: check field names and indentation; run `softnix-log-agent validate` for details"
         )
@@ -849,10 +875,28 @@ outputs:
     #[test]
     fn env_expansion() {
         std::env::set_var("SNX_TEST_PORT", "6601");
-        let s = expand_env("port: ${SNX_TEST_PORT}\nx: ${SNX_NOPE:-fallback}").unwrap();
+        let (s, _secrets) = expand_env("port: ${SNX_TEST_PORT}\nx: ${SNX_NOPE:-fallback}").unwrap();
         assert!(s.contains("6601"));
         assert!(s.contains("fallback"));
         assert!(expand_env("y: ${SNX_DEFINITELY_MISSING}").is_err());
+    }
+
+    /// H-3: `/api/config/validate` must never echo the raw substituted value
+    /// of an env-referenced field back in an error message — that turns the
+    /// endpoint into an oracle for reading the root process's environment
+    /// one variable at a time.
+    #[test]
+    fn parse_errors_never_echo_expanded_env_values() {
+        std::env::set_var("SNX_TEST_SECRET", "hunter2-super-secret");
+        let yaml = "agent:\n  log_level: \"${SNX_TEST_SECRET}\"\n";
+        let err = parse(yaml).expect_err("must reject the log level");
+        let msg = format!("{err:#}");
+        std::env::remove_var("SNX_TEST_SECRET");
+        assert!(
+            !msg.contains("hunter2-super-secret"),
+            "error leaked the env value: {msg}"
+        );
+        assert!(msg.contains("***"), "expected a redaction marker: {msg}");
     }
 
     #[test]
