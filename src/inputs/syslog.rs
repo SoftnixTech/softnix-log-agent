@@ -223,6 +223,12 @@ impl SyslogInput {
             &self.source_type,
             line,
         );
+        // `message` and `raw_message` genuinely differ for syslog (PRI,
+        // timestamp, hostname and tag are stripped from `message`), so
+        // capture the original wire line before parsing when asked to.
+        if self.cfg.keep_raw_message {
+            ev.preserve_raw(line);
+        }
         parse_syslog_into(&mut ev, line, self.cfg.format);
         if ev.hostname.is_none() {
             ev.hostname = Some(peer.ip().to_string());
@@ -249,6 +255,7 @@ mod tests {
             format: SyslogFormat::Auto,
             tls: None,
             source_type: None,
+            keep_raw_message: false,
         }
     }
 

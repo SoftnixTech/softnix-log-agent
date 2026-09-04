@@ -125,6 +125,13 @@ pub struct SyslogInputConfig {
     pub tls: Option<TlsServerOptions>,
     #[serde(default)]
     pub source_type: Option<String>,
+    /// Keep the original wire line (PRI, timestamp, hostname, tag included)
+    /// in `raw_message`. Unlike file input's `parser.mode: raw`, syslog's
+    /// `message` (parsed body) and `raw_message` (full line) genuinely
+    /// differ, so this is real information loss when off. Doubles memory,
+    /// queue usage and wire size per event; off by default.
+    #[serde(default)]
+    pub keep_raw_message: bool,
 }
 
 fn default_bind_all() -> String {
@@ -149,6 +156,10 @@ pub struct EventLogInputConfig {
     /// Override the source_type assigned to events (default: "eventlog").
     #[serde(default)]
     pub source_type: Option<String>,
+    /// Keep the full rendered Event XML (2-4 KB) in `raw_message`. Off by
+    /// default; `message` already carries the human-readable text.
+    #[serde(default)]
+    pub keep_raw_message: bool,
 }
 
 fn default_eventlog_query() -> String {
@@ -216,6 +227,10 @@ pub struct ParserConfig {
     /// chrono format string used to parse a captured `timestamp` group.
     #[serde(default)]
     pub timestamp_format: Option<String>,
+    /// Keep the pre-parse body in `raw_message`. Doubles memory, queue usage
+    /// and wire size per event; off by default.
+    #[serde(default)]
+    pub keep_raw_message: bool,
 }
 
 impl Default for ParserConfig {
@@ -226,6 +241,7 @@ impl Default for ParserConfig {
             pair_separator: default_pair_sep(),
             kv_separator: default_kv_sep(),
             timestamp_format: None,
+            keep_raw_message: false,
         }
     }
 }

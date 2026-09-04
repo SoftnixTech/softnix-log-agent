@@ -20,6 +20,7 @@ pub struct Parser {
     pair_sep: String,
     kv_sep: String,
     ts_format: Option<String>,
+    keep_raw_message: bool,
 }
 
 impl Parser {
@@ -30,11 +31,17 @@ impl Parser {
             pair_sep: cfg.pair_separator.clone(),
             kv_sep: cfg.kv_separator.clone(),
             ts_format: cfg.timestamp_format.clone(),
+            keep_raw_message: cfg.keep_raw_message,
         })
     }
 
     pub fn parse(&self, line: &str, source: &str, source_type: &str) -> Event {
         let mut ev = Event::new(source, source_type, line);
+        // Capture the line as originally received before parsing mutates
+        // `ev.message`, so `raw_message` reflects true pre-parse text.
+        if self.keep_raw_message {
+            ev.preserve_raw(line);
+        }
         match self.mode {
             ParserMode::Raw => {}
             ParserMode::Json => parse_json_into(&mut ev, line),
@@ -929,7 +936,14 @@ transforms:
         .unwrap();
         let t = Transformer::compile(&cfg).unwrap();
 
-        let mut ev = raw_parser().parse("card 4111111111111111 charged", "f", "file");
+        // PIPE-006 needs raw_message populated to exercise the scrub-both-copies
+        // path; keep_raw_message defaults to false since R-2, so opt in here.
+        let mut ev = Parser::compile(&ParserConfig {
+            keep_raw_message: true,
+            ..Default::default()
+        })
+        .unwrap()
+        .parse("card 4111111111111111 charged", "f", "file");
         ev.severity = Some(3);
         assert!(t.apply(&mut ev));
         assert_eq!(ev.fields["datacenter"], Value::String("bkk-1".into()));

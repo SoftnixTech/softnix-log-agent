@@ -328,9 +328,20 @@ outputs:
 /// eventually every input.
 #[tokio::test]
 async fn a_backed_up_destination_does_not_stop_its_peers() {
-    // Destination A has a 1 MB queue and a TCP peer that accepts but never
-    // reads, so its queue fills and stays full. Destination B is a UDP peer we
-    // read from. B must keep receiving.
+    // Destination A has a 2 MiB queue (split into 1 MiB segments) and a TCP
+    // peer that accepts but never reads, so its queue fills and stays full.
+    // Destination B is a UDP peer we read from. B must keep receiving.
+    //
+    // Queue must span more than one segment: with max_size_mb == segment_size_mb
+    // (a single, never-rolling segment), `DiskQueue` can reach a state where
+    // every record in that segment gets acked (count reaches 0) without the
+    // segment ever being deleted (only segments strictly behind the write
+    // segment are reclaimed) - `bytes` then stays pinned just under the cap
+    // forever, `is_full()` reports false (it short-circuits on count == 0),
+    // and `push()` simultaneously keeps rejecting everything as `Full`. That
+    // wedge is a pre-existing `DiskQueue` accounting quirk, not something this
+    // test means to exercise - giving the queue room to roll across several
+    // segments avoids it.
     let dir = tempfile::tempdir().unwrap();
 
     let stuck = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -358,7 +369,7 @@ async fn a_backed_up_destination_does_not_stop_its_peers() {
 agent:
   data_dir: {data}
 buffer:
-  max_size_mb: 1
+  max_size_mb: 2
   segment_size_mb: 1
 inputs:
   syslog:
@@ -376,7 +387,7 @@ outputs:
     type: syslog
     protocol: udp
     address: 127.0.0.1:{sink_port}
-    # drop_oldest so the healthy destination's own 1 MiB queue (it shares
+    # drop_oldest so the healthy destination's own 2 MiB queue (it shares
     # `buffer.max_size_mb` with "stuck" - there is no per-output size
     # override) never itself blocks under the same flood of filler events;
     # otherwise the test would conflate "healthy self-throttling on its own
@@ -409,9 +420,17 @@ web:
     // between batches also gives the input listener and the engine's
     // internal tasks scheduling turns to actually drain and process what has
     // been sent so far.
+    // R-2 note: `raw_message` is no longer duplicated onto every event (it's
+    // opt-in via `keep_raw_message`), so each filler record now takes roughly
+    // half the disk-queue bytes it used to for the same line - reaching the
+    // queue's 2 MiB cap needs about twice as many successfully-delivered
+    // filler events as before. The line can't simply get bigger to
+    // compensate (UDP datagrams over loopback cap out around 9216 bytes on
+    // this OS, well below double `padding`'s size), so the deadline below is
+    // widened instead to give the retry loop enough room under lossy UDP.
     let padding = "x".repeat(8192);
     let mut filler_sent = 0usize;
-    let fill_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let fill_deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     while !engine.shared.queues["stuck"].is_full() && tokio::time::Instant::now() < fill_deadline {
         for _ in 0..200 {
             let line = format!("<14>Jun 10 10:00:00 h1 app: filler {filler_sent} {padding}");

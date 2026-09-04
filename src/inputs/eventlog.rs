@@ -465,7 +465,13 @@ unsafe fn drain_loop(
                 let ev_handle = EVT_HANDLE(raw);
                 match render_xml(ev_handle) {
                     Ok(xml) => {
-                        let event = build_event(&xml, ev_handle, channel, source_type);
+                        let event = build_event(
+                            &xml,
+                            ev_handle,
+                            channel,
+                            source_type,
+                            cfg.keep_raw_message,
+                        );
                         emitted += 1;
                         metrics
                             .events_received
@@ -622,11 +628,18 @@ fn level_to_severity(level: u8) -> u8 {
 }
 
 /// Parse the rendered System/EventData XML and assemble an [`Event`].
-unsafe fn build_event(xml: &str, event: EVT_HANDLE, channel: &str, source_type: &str) -> Event {
+unsafe fn build_event(
+    xml: &str,
+    event: EVT_HANDLE,
+    channel: &str,
+    source_type: &str,
+    keep_raw_message: bool,
+) -> Event {
     let p = parse_event_xml(xml);
 
     // Message: prefer the formatted publisher message, then EventData, then a
-    // synthesized line; the full XML is always retained as raw_message.
+    // synthesized line; the full XML is retained as raw_message only when
+    // `keep_raw_message` is set (see EventLogInputConfig::keep_raw_message).
     let message = format_message(event, &p.provider)
         .or_else(|| {
             if p.data.is_empty() {
@@ -661,7 +674,11 @@ unsafe fn build_event(xml: &str, event: EVT_HANDLE, channel: &str, source_type: 
         });
 
     let mut ev = Event::new(channel, source_type, &message);
-    ev.raw_message = Some(xml.to_string());
+    // The full XML is 2-4 KB, well beyond the already-rendered `message`;
+    // only pay for it when the operator explicitly asks to keep it.
+    if keep_raw_message {
+        ev.raw_message = Some(xml.to_string());
+    }
 
     if let Some(ts) = p
         .time_created

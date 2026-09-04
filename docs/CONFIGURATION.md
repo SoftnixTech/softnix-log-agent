@@ -133,6 +133,7 @@ Receive syslog over the network.
 | `format` | enum | `auto` | `auto`, `rfc3164`, `rfc5424`, `json`, `raw`. `auto` tries RFC5424 → RFC3164 → JSON → raw. |
 | `tls` | object | — | Required when `protocol: tls`. See below. |
 | `source_type` | string | `syslog` | Overrides `source_type` on emitted events. |
+| `keep_raw_message` | bool | `false` | Keep the original wire line (PRI, timestamp, hostname, tag included) in `raw_message`. Before this version this was implicitly always on; `message` (the parsed body) and `raw_message` genuinely differ for syslog, so leaving this off is real information loss, not just savings — enable it if you need the original line (forensics, a downstream SIEM that re-parses raw text). Doubles memory, queue usage and wire size per event. |
 
 **`tls` (server) options** — required for `protocol: tls`:
 
@@ -171,6 +172,7 @@ platforms a configured eventlog input is ignored with a validation warning.
 | `query` | string | `*` | XPath filter applied to each channel. `*` = all events. |
 | `read_existing` | bool | `false` | On first run (no saved bookmark), read existing events from the oldest record. Default collects only events arriving after start. |
 | `source_type` | string | `eventlog` | Overrides `source_type` on emitted events. |
+| `keep_raw_message` | bool | `false` | Keep the full rendered Event XML (2-4 KB) in `raw_message`. Before this version this was implicitly always on. `message` already carries the human-readable text, so this only matters if you need the raw XML downstream. Doubles memory, queue usage and wire size per event. |
 
 ```yaml
 inputs:
@@ -188,7 +190,7 @@ inputs:
   `agent.data_dir` → at-least-once delivery that resumes after a restart.
 - The human-readable message is resolved from the publisher's metadata; if the
   provider's message DLL is unavailable it falls back to the joined `EventData`.
-  The full event XML is always kept in `raw_message`.
+  The full event XML is kept in `raw_message` only when `keep_raw_message: true`.
 - Mapped event fields: `Level` → `severity`, `Provider` → `application`,
   `Computer` → `hostname`, plus `event_id`, `channel`, `record_id`, `keywords`
   and each `EventData` item as `data_<Name>`.
@@ -214,6 +216,7 @@ Used by `inputs.files[].parser`. Syslog inputs parse via their own `format`.
 | `pair_separator` | string | `" "` | Separator between pairs (`kv`). |
 | `kv_separator` | string | `=` | Separator between key and value (`kv`). |
 | `timestamp_format` | string | — | `chrono` format to parse a captured `timestamp` group, e.g. `%d/%b/%Y:%H:%M:%S %z`. |
+| `keep_raw_message` | bool | `false` | Keep the pre-parse line in `raw_message`, even when it's identical to `message` (e.g. `mode: raw`). Before this version this was implicitly always on — `Event::new` stored the body twice unconditionally, doubling memory, queue usage and wire size per event for no benefit under `mode: raw`. Set to `true` to restore the old behavior or to keep the pre-parse text alongside a parsed `message` under `json`/`kv`/`regex`/`syslog`. |
 
 ```yaml
 parser:
@@ -245,7 +248,7 @@ when it matches (see [Conditions](#conditions)).
 | `remove_field` | `field`, `when?` | Delete a field. |
 | `rename_field` | `from`, `to`, `when?` | Rename a field. |
 | `convert` | `field`, `to`, `when?` | Convert a field type. `to`: `int`, `float`, `string`, `bool`. |
-| `mask` | `field`, `pattern`, `replacement?`, `when?` | Regex-replace within a field. `replacement` default `****`. **Masking `message` also masks `raw_message`.** |
+| `mask` | `field`, `pattern`, `replacement?`, `when?` | Regex-replace within a field. `replacement` default `****`. **Masking `message` also masks `raw_message` when present** (only if `keep_raw_message: true`). |
 | `drop` | `when` *(required)* | Discard events matching `when`. |
 | `keep` | `when` *(required)* | Keep only events matching `when`; drop the rest. |
 

@@ -104,7 +104,7 @@ Notes:
 
 - **Privilege:** reading the `Security` channel requires elevated rights. The installed service runs as **LocalSystem**, which satisfies this — no extra configuration. If you run the agent interactively for testing, use an elevated PowerShell, or add the account to the **Event Log Readers** group (sufficient for non-Security channels).
 - **Resume after restart:** progress per channel is checkpointed with an Event Log bookmark stored under `agent.data_dir`; on restart collection resumes where it stopped (at-least-once).
-- **Messages:** the human-readable description is rendered from the publisher's metadata; if a provider's message DLL is unavailable the agent falls back to the joined `EventData`. The full event XML is always preserved in `raw_message`.
+- **Messages:** the human-readable description is rendered from the publisher's metadata; if a provider's message DLL is unavailable the agent falls back to the joined `EventData`. The full event XML is preserved in `raw_message` only when `keep_raw_message: true` is set on the `inputs.eventlog` entry (off by default — see [CONFIGURATION.md](CONFIGURATION.md#inputseventlog-windows-only)).
 - **Channel names:** must match exactly. List available channels with `wevtutil el` (or `Get-WinEvent -ListLog *`).
 - **No firewall rule needed** — Event Log is read locally, not over the network.
 
