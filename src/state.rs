@@ -32,6 +32,11 @@ pub struct FileCursor {
     pub offset: u64,
     /// Last time this cursor was touched (unix seconds), for pruning.
     pub touched: i64,
+    /// Hash of the file's first line, as computed by the file input's
+    /// copy-truncate race detector (FILE-004). `#[serde(default)]` so
+    /// state files written before this field existed still deserialize.
+    #[serde(default)]
+    pub first_line_hash: Option<u32>,
 }
 
 pub struct StateManager {
@@ -79,12 +84,19 @@ impl StateManager {
         self.state.lock().unwrap().files.get(&key).cloned()
     }
 
-    pub fn set_cursor(&self, input_id: &str, identity: &str, path: &str, offset: u64) {
+    pub fn set_cursor(
+        &self,
+        input_id: &str,
+        identity: &str,
+        path: &str,
+        offset: u64,
+        first_line_hash: Option<u32>,
+    ) {
         let key = format!("{input_id}|{identity}");
         let now = now_secs();
         let mut st = self.state.lock().unwrap();
         if let Some(existing) = st.files.get_mut(&key) {
-            if existing.offset == offset {
+            if existing.offset == offset && existing.first_line_hash == first_line_hash {
                 // The tailer calls this on every poll for every idle file. Only
                 // refresh `touched` (and dirty the file) once a minute, or a
                 // host with a few hundred idle files rewrites the whole state
@@ -98,6 +110,7 @@ impl StateManager {
             }
             existing.offset = offset;
             existing.path = path.to_string();
+            existing.first_line_hash = first_line_hash;
             existing.touched = now;
         } else {
             st.files.insert(
@@ -106,6 +119,7 @@ impl StateManager {
                     offset,
                     path: path.to_string(),
                     touched: now,
+                    first_line_hash,
                 },
             );
         }
@@ -178,38 +192,81 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         {
             let sm = StateManager::open(dir.path()).unwrap();
-            sm.set_cursor("in1", "dev:1:42", "/var/log/a.log", 1234);
+            sm.set_cursor("in1", "dev:1:42", "/var/log/a.log", 1234, Some(0xdead_beef));
             sm.mark_known_input("in1");
             sm.flush().unwrap();
         }
         let sm = StateManager::open(dir.path()).unwrap();
         let c = sm.get_cursor("in1", "dev:1:42").unwrap();
         assert_eq!(c.offset, 1234);
+        assert_eq!(
+            c.first_line_hash,
+            Some(0xdead_beef),
+            "first_line_hash must survive a restart"
+        );
         assert!(sm.is_known_input("in1"));
         assert!(!sm.is_known_input("in2"));
+    }
+
+    #[test]
+    fn old_state_files_without_first_line_hash_still_deserialize() {
+        // #[serde(default)] regression: state.json written before this field
+        // existed must still load, with first_line_hash defaulting to None.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        std::fs::write(
+            &path,
+            r#"{"files":{"in1|dev:1:42":{"path":"/var/log/a.log","offset":1234,"touched":0}},"known_inputs":[],"checkpoints":{}}"#,
+        )
+        .unwrap();
+        let sm = StateManager::open(dir.path()).unwrap();
+        let c = sm.get_cursor("in1", "dev:1:42").unwrap();
+        assert_eq!(c.offset, 1234);
+        assert_eq!(c.first_line_hash, None);
     }
 
     #[test]
     fn repeating_the_same_offset_does_not_dirty_the_state() {
         let dir = tempfile::tempdir().unwrap();
         let st = StateManager::open(dir.path()).unwrap();
-        st.set_cursor("in1", "ident", "/var/log/a.log", 100);
+        st.set_cursor("in1", "ident", "/var/log/a.log", 100, None);
         st.flush().unwrap();
         assert!(!st.is_dirty());
-        st.set_cursor("in1", "ident", "/var/log/a.log", 100);
+        st.set_cursor("in1", "ident", "/var/log/a.log", 100, None);
         assert!(
             !st.is_dirty(),
             "an unchanged offset must not force a rewrite"
         );
-        st.set_cursor("in1", "ident", "/var/log/a.log", 200);
+        st.set_cursor("in1", "ident", "/var/log/a.log", 200, None);
         assert!(st.is_dirty(), "a real advance must still be persisted");
+    }
+
+    #[test]
+    fn a_hash_change_alone_still_dirties_the_state() {
+        // A same-offset call that carries a newly-established first_line_hash
+        // is a real update (the copy-truncate race detector just got armed
+        // for the first time) and must not be swallowed by the idempotency
+        // check that only ever looked at offset before.
+        let dir = tempfile::tempdir().unwrap();
+        let st = StateManager::open(dir.path()).unwrap();
+        st.set_cursor("in1", "ident", "/var/log/a.log", 100, None);
+        st.flush().unwrap();
+        assert!(!st.is_dirty());
+        st.set_cursor("in1", "ident", "/var/log/a.log", 100, Some(42));
+        assert!(
+            st.is_dirty(),
+            "a hash change at the same offset must still be persisted"
+        );
+        st.flush().unwrap();
+        let c = st.get_cursor("in1", "ident").unwrap();
+        assert_eq!(c.first_line_hash, Some(42));
     }
 
     #[test]
     fn state_is_written_compactly() {
         let dir = tempfile::tempdir().unwrap();
         let st = StateManager::open(dir.path()).unwrap();
-        st.set_cursor("in1", "ident", "/var/log/a.log", 100);
+        st.set_cursor("in1", "ident", "/var/log/a.log", 100, None);
         st.flush().unwrap();
         let text = std::fs::read_to_string(dir.path().join("state.json")).unwrap();
         assert!(!text.contains("\n  "), "state must not be pretty-printed");

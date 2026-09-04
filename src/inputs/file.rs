@@ -66,8 +66,21 @@ fn file_identity(path: &Path, md: &std::fs::Metadata) -> String {
 /// truncate+regrow, so the `size < offset` check alone misses a truncation that
 /// regrows past the old offset within one poll interval — comparing the first
 /// line catches it.
+/// Counts calls to `head_fingerprint`, so tests can assert the gate in
+/// `tail_once` actually skips the open+read when a file's size hasn't
+/// changed since the last poll.
+#[cfg(test)]
+static FINGERPRINT_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Counts calls to `discover_paths` (the glob walk), so tests can assert
+/// tailing never re-triggers discovery.
+#[cfg(test)]
+static DISCOVER_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 #[cfg(any(unix, windows, test))]
 fn head_fingerprint(path: &Path) -> Option<u32> {
+    #[cfg(test)]
+    FINGERPRINT_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let mut f = File::open(path).ok()?;
     let mut buf = vec![0u8; FINGERPRINT_BYTES];
     let mut filled = 0usize;
@@ -95,6 +108,10 @@ fn head_fingerprint(path: &Path) -> Option<u32> {
 struct Tracked {
     identity: String,
     offset: u64,
+    /// Size observed at the previous poll. Lets the Unix fingerprint check
+    /// below skip its open+read entirely when the size hasn't moved, since
+    /// nothing could have changed the file's identity in that case.
+    last_size: u64,
     /// Hash of the file's first line, recorded once we've advanced `offset`
     /// past 0. Used on Unix to detect the copy-truncate race (FILE-004):
     /// `dev:ino` is stable across truncate+regrow, so a content-based signal
@@ -158,39 +175,62 @@ impl FileInput {
         // On the very first run of this input (no recorded state), existing
         // file content is skipped unless read_from_start is set. Files that
         // appear later are always read from the beginning.
-        let first_run = !state.is_known_input(&id);
+        let mut skip_existing = !state.is_known_input(&id);
         let mut tracked: HashMap<PathBuf, Tracked> = HashMap::new();
-        let interval = std::time::Duration::from_millis(self.cfg.poll_interval_ms);
+        let poll_interval = std::time::Duration::from_millis(self.cfg.poll_interval_ms);
+        let discovery_interval = std::time::Duration::from_millis(self.cfg.discovery_interval_ms);
+
+        // Prime `tracked` with an initial discovery pass so there is
+        // something to tail on the very first poll tick, rather than waiting
+        // up to a full discovery_interval_ms before any file is found.
+        if self
+            .run_discovery(&id, &state, &status, &metrics, &mut tracked, skip_existing)
+            .await
+        {
+            skip_existing = false;
+        }
+
+        let mut poll_ticker = tokio::time::interval(poll_interval);
+        poll_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // Consume the immediate first tick: discovery above already primed
+        // `tracked`, and the initial tick would otherwise tail nothing new.
+        poll_ticker.tick().await;
+
+        let mut discovery_ticker = tokio::time::interval(discovery_interval);
+        discovery_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // Consume the immediate first tick: the priming pass above already
+        // covers it.
+        discovery_ticker.tick().await;
 
         loop {
-            let poll_result = self.poll_once(
-                &tx,
-                &state,
-                &metrics,
-                &mut tracked,
-                first_run && !state.is_known_input(&id),
-                &cancel,
-            );
-            match poll_result.await {
-                Ok(n) => {
-                    state.mark_known_input(&id);
-                    if n > 0 {
-                        let inc = n;
-                        status.update_input(&id, |s| {
-                            s.events += inc;
-                            s.last_error = None;
-                        });
+            tokio::select! {
+                _ = poll_ticker.tick() => {
+                    match self.tail_once(&tx, &state, &metrics, &mut tracked, &cancel).await {
+                        Ok(n) => {
+                            state.mark_known_input(&id);
+                            if n > 0 {
+                                status.update_input(&id, |s| {
+                                    s.events += n;
+                                    s.last_error = None;
+                                });
+                            }
+                        }
+                        Err(e) => {
+                            let msg = format!("file input {id}: {e}");
+                            tracing::warn!("{msg}");
+                            metrics.record_error(&msg);
+                            status.update_input(&id, |s| s.last_error = Some(e.to_string()));
+                        }
                     }
                 }
-                Err(e) => {
-                    let msg = format!("file input {id}: {e}");
-                    tracing::warn!("{msg}");
-                    metrics.record_error(&msg);
-                    status.update_input(&id, |s| s.last_error = Some(e.to_string()));
+                _ = discovery_ticker.tick() => {
+                    if self
+                        .run_discovery(&id, &state, &status, &metrics, &mut tracked, skip_existing)
+                        .await
+                    {
+                        skip_existing = false;
+                    }
                 }
-            }
-            tokio::select! {
-                _ = tokio::time::sleep(interval) => {}
                 _ = cancel.cancelled() => {
                     status.update_input(&id, |s| s.active = false);
                     return;
@@ -199,20 +239,163 @@ impl FileInput {
         }
     }
 
-    /// One discovery + read pass. Returns events emitted.
+    /// Runs `discover_once`, translating a failure into the same
+    /// warn/metrics/status bookkeeping the tailing path uses. Returns
+    /// whether it succeeded, so the caller knows whether it's safe to stop
+    /// treating this input as "first run" (a failed discovery pass must not
+    /// consume `skip_existing`, or a transient error would cause pre-existing
+    /// content to be read as if it were new).
+    async fn run_discovery(
+        &self,
+        id: &str,
+        state: &Arc<StateManager>,
+        status: &StatusRegistry,
+        metrics: &Metrics,
+        tracked: &mut HashMap<PathBuf, Tracked>,
+        skip_existing: bool,
+    ) -> bool {
+        match self.discover_once(state, tracked, skip_existing).await {
+            Ok(()) => {
+                state.mark_known_input(id);
+                true
+            }
+            Err(e) => {
+                let msg = format!("file input {id}: {e}");
+                tracing::warn!("{msg}");
+                metrics.record_error(&msg);
+                status.update_input(id, |s| s.last_error = Some(e.to_string()));
+                false
+            }
+        }
+    }
+
+    /// One discovery + read pass: convenience wrapper combining
+    /// `discover_once` and `tail_once` in sequence, used directly by tests
+    /// that simulate a single production "tick" without needing to run the
+    /// `discovery_interval_ms` vs `poll_interval_ms` cadence split from
+    /// `run` explicitly.
+    #[cfg(test)]
     async fn poll_once(
         &self,
         tx: &EventSender,
-        state: &StateManager,
+        state: &Arc<StateManager>,
         metrics: &Metrics,
         tracked: &mut HashMap<PathBuf, Tracked>,
         skip_existing: bool,
         cancel: &CancellationToken,
     ) -> Result<u64> {
+        self.discover_once(state, tracked, skip_existing).await?;
+        self.tail_once(tx, state, metrics, tracked, cancel).await
+    }
+
+    /// Glob-walks the configured paths, admits any not-yet-tracked files
+    /// (seeding their offset/fingerprint from a saved cursor, or per
+    /// `skip_existing`), and forgets tracked paths that no longer exist.
+    ///
+    /// This is the expensive part of tailing — a full glob walk, plus a stat
+    /// per discovered file — so it is decoupled from `tail_once` and runs on
+    /// its own, much slower cadence (`discovery_interval_ms` vs
+    /// `poll_interval_ms`). The filesystem walk itself runs inside
+    /// `spawn_blocking` so it doesn't block whichever tokio worker thread
+    /// this task happens to be scheduled on.
+    async fn discover_once(
+        &self,
+        state: &Arc<StateManager>,
+        tracked: &mut HashMap<PathBuf, Tracked>,
+        skip_existing: bool,
+    ) -> Result<()> {
+        let patterns = self.cfg.paths.clone();
+        let exclude = self.exclude.clone();
+        let id = self.cfg.id.clone();
+        let read_from_start = self.cfg.read_from_start;
+        let state = Arc::clone(state);
+        let mut owned = std::mem::take(tracked);
+
+        owned = tokio::task::spawn_blocking(move || -> Result<HashMap<PathBuf, Tracked>> {
+            for path in Self::discover_paths(&patterns, &exclude)? {
+                if owned.contains_key(&path) {
+                    continue;
+                }
+                let md = match std::fs::metadata(&path) {
+                    Ok(m) if m.is_file() => m,
+                    _ => continue,
+                };
+                let identity = file_identity(&path, &md);
+                let size = md.len();
+                // Newly discovered path. Resume from saved cursor (same
+                // identity seen before, e.g. after agent restart), else
+                // start at 0 — or at EOF on the input's first ever run.
+                //
+                // NOTE: do NOT clamp `c.offset` against `size`. If the path
+                // was deleted and recreated with the same identity (NTFS
+                // tunneling on Windows, inode reuse on Linux), the new file
+                // is typically smaller than the saved offset. Clamping would
+                // hide that fact from the truncation check in `tail_once`
+                // and silently skip the head of the new file (FILE-007). The
+                // `size < offset` check there catches this and resets the
+                // offset to 0.
+                let cursor = state.get_cursor(&id, &identity);
+                let offset = match &cursor {
+                    Some(c) => c.offset,
+                    None if skip_existing && !read_from_start => size,
+                    None => 0,
+                };
+                // Restore the copy-truncate race detector's baseline from a
+                // persisted cursor, rather than always starting at None. If
+                // this isn't done, the detector is inert on the very first
+                // poll after every agent restart (FILE-004/FILE-007).
+                #[cfg(unix)]
+                let first_line_hash = cursor.and_then(|c| c.first_line_hash);
+                owned.insert(
+                    path,
+                    Tracked {
+                        identity,
+                        offset,
+                        // Deliberately NOT `size`: a hash restored from a
+                        // saved cursor above has not yet been verified
+                        // against this file's *current* content (which may
+                        // already have been rewritten by the time discovery
+                        // ran). Seeding `last_size` at 0 forces `tail_once`'s
+                        // fingerprint gate to run at least once for this
+                        // freshly (re)tracked entry, whatever the size turns
+                        // out to be, rather than trusting a restored hash it
+                        // never actually checked.
+                        last_size: 0,
+                        #[cfg(unix)]
+                        first_line_hash,
+                    },
+                );
+            }
+            // Forget tracked entries whose paths vanished (deleted/rotated away).
+            owned.retain(|p, _| p.exists());
+            Ok(owned)
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("file discovery task panicked: {e}"))??;
+
+        *tracked = owned;
+        Ok(())
+    }
+
+    /// Reads new data from files already known via a prior `discover_once`
+    /// pass: checks each tracked path's current size, re-derives its
+    /// identity to detect rotation, verifies the copy-truncate race guard
+    /// (Unix), and reads any newly appended lines. Never walks the
+    /// filesystem for paths it doesn't already know about — that's
+    /// `discover_once`'s job. Returns events emitted.
+    async fn tail_once(
+        &self,
+        tx: &EventSender,
+        state: &StateManager,
+        metrics: &Metrics,
+        tracked: &mut HashMap<PathBuf, Tracked>,
+        cancel: &CancellationToken,
+    ) -> Result<u64> {
         let id = &self.cfg.id;
         let mut emitted = 0u64;
 
-        for path in self.discover()? {
+        let paths: Vec<PathBuf> = tracked.keys().cloned().collect();
+        for path in paths {
             if cancel.is_cancelled() {
                 break;
             }
@@ -224,50 +407,28 @@ impl FileInput {
             let size = md.len();
             let path_str = path.to_string_lossy().into_owned();
 
-            let entry = tracked.entry(path.clone());
-            let t = match entry {
-                std::collections::hash_map::Entry::Occupied(mut o) => {
-                    if o.get().identity != identity {
-                        // Rotated: a new file replaced the old one at this path.
-                        let offset = state
-                            .get_cursor(id, &identity)
-                            .map(|c| c.offset)
-                            .unwrap_or(0);
-                        *o.get_mut() = Tracked {
-                            identity,
-                            offset,
-                            #[cfg(unix)]
-                            first_line_hash: None,
-                        };
-                    }
-                    o.into_mut()
-                }
-                std::collections::hash_map::Entry::Vacant(v) => {
-                    // Newly discovered path. Resume from saved cursor (same
-                    // identity seen before, e.g. after agent restart), else
-                    // start at 0 — or at EOF on the input's first ever run.
-                    //
-                    // NOTE: do NOT clamp `c.offset` against `size`. If the path
-                    // was deleted and recreated with the same identity (NTFS
-                    // tunneling on Windows, inode reuse on Linux), the new file
-                    // is typically smaller than the saved offset. Clamping
-                    // would hide that fact from the truncation check below and
-                    // silently skip the head of the new file (FILE-007). The
-                    // `size < offset` check a few lines down catches this and
-                    // resets the offset to 0.
-                    let offset = match state.get_cursor(id, &identity) {
-                        Some(c) => c.offset,
-                        None if skip_existing && !self.cfg.read_from_start => size,
-                        None => 0,
-                    };
-                    v.insert(Tracked {
-                        identity,
-                        offset,
-                        #[cfg(unix)]
-                        first_line_hash: None,
-                    })
-                }
+            let Some(t) = tracked.get_mut(&path) else {
+                continue; // vanished mid-loop; the next discovery pass will notice.
             };
+
+            if t.identity != identity {
+                // Rotated: a new file replaced the old one at this path.
+                let cursor = state.get_cursor(id, &identity);
+                let offset = cursor.as_ref().map(|c| c.offset).unwrap_or(0);
+                #[cfg(unix)]
+                let first_line_hash = cursor.and_then(|c| c.first_line_hash);
+                *t = Tracked {
+                    identity,
+                    offset,
+                    // See the matching comment in discover_once: force the
+                    // fingerprint gate below to run at least once for this
+                    // just-rotated entry rather than trusting a same-size
+                    // coincidence or a restored-but-unverified hash.
+                    last_size: 0,
+                    #[cfg(unix)]
+                    first_line_hash,
+                };
+            }
 
             // Copy-truncate rotation or manual truncation.
             if size < t.offset {
@@ -280,25 +441,35 @@ impl FileInput {
             // offset). The first line changes on truncate+rewrite but is stable
             // for normal appends, so a hash mismatch is a reliable rotation
             // signal that `dev:ino` cannot provide (inode survives truncate).
-            // The fingerprint is recomputed every poll (cheap: ≤512 bytes, one
-            // read) so a truncate between the first and second poll is caught
-            // even before offset has had a chance to advance from 0.
+            // The fingerprint costs an open+read+close, so it's only
+            // recomputed when the size has actually moved since the last
+            // poll (or no baseline has been established yet) — nothing could
+            // have changed the identity of a file whose size is unchanged.
             #[cfg(unix)]
             {
-                let prev = t.first_line_hash;
-                if let Some(curr) = head_fingerprint(&path) {
-                    if t.offset > 0 && prev.is_some() && prev != Some(curr) {
-                        tracing::info!(
-                            "file {} first line changed since last poll; restarting from 0",
-                            path.display()
-                        );
-                        t.offset = 0;
+                if size != t.last_size || t.first_line_hash.is_none() {
+                    let prev = t.first_line_hash;
+                    if let Some(curr) = head_fingerprint(&path) {
+                        if t.offset > 0 && prev.is_some() && prev != Some(curr) {
+                            tracing::info!(
+                                "file {} first line changed since last poll; restarting from 0",
+                                path.display()
+                            );
+                            t.offset = 0;
+                        }
+                        t.first_line_hash = Some(curr);
                     }
-                    t.first_line_hash = Some(curr);
                 }
             }
+            t.last_size = size;
+
+            #[cfg(unix)]
+            let hash = t.first_line_hash;
+            #[cfg(not(unix))]
+            let hash = None;
+
             if size == t.offset {
-                state.set_cursor(id, &t.identity, &path_str, t.offset);
+                state.set_cursor(id, &t.identity, &path_str, t.offset, hash);
                 continue;
             }
 
@@ -320,7 +491,7 @@ impl FileInput {
                         }
                     }
                     t.offset = new_offset;
-                    state.set_cursor(id, &t.identity, &path_str, t.offset);
+                    state.set_cursor(id, &t.identity, &path_str, t.offset, hash);
                 }
                 Err(e) => {
                     tracing::warn!("cannot read {}: {e}", path.display());
@@ -328,8 +499,6 @@ impl FileInput {
             }
         }
 
-        // Forget tracked entries whose paths vanished (deleted/rotated away).
-        tracked.retain(|p, _| p.exists());
         Ok(emitted)
     }
 
@@ -375,14 +544,19 @@ impl FileInput {
         Ok((lines, offset + consumed as u64))
     }
 
-    fn discover(&self) -> Result<Vec<PathBuf>> {
+    /// The glob walk itself: the expensive, synchronous half of discovery.
+    /// A free function (rather than a `&self` method) so it can be moved
+    /// wholesale into `spawn_blocking` without capturing `self`.
+    fn discover_paths(patterns: &[String], exclude: &globset::GlobSet) -> Result<Vec<PathBuf>> {
+        #[cfg(test)]
+        DISCOVER_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut out = Vec::new();
-        for pat in &self.cfg.paths {
+        for pat in patterns {
             let normalized = pat.replace('\\', "/");
             for entry in glob::glob(&normalized)? {
                 let Ok(p) = entry else { continue };
                 let p_str = p.to_string_lossy().replace('\\', "/");
-                if self.exclude.is_match(&p_str) {
+                if exclude.is_match(&p_str) {
                     continue;
                 }
                 out.push(p);
@@ -395,12 +569,32 @@ impl FileInput {
 }
 
 #[cfg(test)]
+// `lock_counters()`'s guard is deliberately held across `.await` points to
+// serialize whole test functions against each other (see its doc comment).
+// `#[tokio::test]` here always runs on a current-thread runtime, so this
+// can't deadlock a shared multi-thread reactor the way the lint guards
+// against in production code.
+#[allow(clippy::await_holding_lock)]
 mod tests {
     use super::*;
     use crate::config::ParserConfig;
     use crate::event::Event;
     use std::io::Write;
+    use std::sync::atomic::Ordering;
+    use std::sync::Mutex;
     use tokio::sync::mpsc;
+
+    /// `FINGERPRINT_CALLS`/`DISCOVER_CALLS` are process-wide statics, and
+    /// `cargo test` runs this module's tests concurrently on multiple
+    /// threads by default. Any test that asserts on their exact value must
+    /// hold this lock for its duration so a sibling test's calls (nearly
+    /// every test here exercises `poll_once`, which touches both counters)
+    /// can't leak into the count being asserted on.
+    static COUNTER_LOCK: Mutex<()> = Mutex::new(());
+
+    fn lock_counters() -> std::sync::MutexGuard<'static, ()> {
+        COUNTER_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
 
     fn input_for(dir: &Path) -> FileInput {
         FileInput::new(&FileInputConfig {
@@ -408,6 +602,7 @@ mod tests {
             paths: vec![format!("{}/*.log", dir.display())],
             exclude: vec![format!("{}/skip*.log", dir.display())],
             poll_interval_ms: 100,
+            discovery_interval_ms: 30_000,
             read_from_start: true,
             parser: ParserConfig::default(),
             source_type: None,
@@ -417,6 +612,7 @@ mod tests {
 
     #[test]
     fn head_fingerprint_distinguishes_concurrent_files() {
+        let _guard = lock_counters();
         // FILE-011 regression: files created in the same instant must still be
         // told apart. creation_time would collide; the content head must not.
         let dir = tempfile::tempdir().unwrap();
@@ -435,6 +631,7 @@ mod tests {
 
     #[test]
     fn head_fingerprint_stable_as_file_grows() {
+        let _guard = lock_counters();
         // FILE-005 regression: a file's identity must not change as more lines
         // are appended, so the agent keeps tracking the same file across polls.
         let dir = tempfile::tempdir().unwrap();
@@ -457,6 +654,7 @@ mod tests {
 
     #[tokio::test]
     async fn tails_rotation_and_truncation() {
+        let _guard = lock_counters();
         let dir = tempfile::tempdir().unwrap();
         let state_dir = tempfile::tempdir().unwrap();
         let log = dir.path().join("app.log");
@@ -529,6 +727,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn detects_copy_truncate_race_on_unix() {
+        let _guard = lock_counters();
         // FILE-004 regression: on Unix, `dev:ino` survives truncate, so when a
         // file is truncated AND regrown past the old offset between two polls,
         // the `size < offset` check does not fire and the bytes written into
@@ -579,6 +778,7 @@ mod tests {
 
     #[tokio::test]
     async fn resumes_from_saved_offset() {
+        let _guard = lock_counters();
         let dir = tempfile::tempdir().unwrap();
         let state_dir = tempfile::tempdir().unwrap();
         let log = dir.path().join("app.log");
@@ -621,6 +821,7 @@ mod tests {
 
     #[tokio::test]
     async fn handles_delete_and_recreate_smaller_file() {
+        let _guard = lock_counters();
         // FILE-007 regression: when a watched file is deleted and a new file
         // with the same path is created — and happens to reuse the same
         // identity (NTFS tunneling on Windows, inode reuse on Linux) — the
@@ -667,6 +868,212 @@ mod tests {
         assert!(
             got.contains(&"new short".to_string()),
             "FILE-007: new file head must not be silently skipped; got {got:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fingerprint_not_recomputed_when_size_unchanged() {
+        let _guard = lock_counters();
+        // R-5: head_fingerprint costs an open+read+close. It must only be
+        // paid when a file's size has actually moved since the last poll,
+        // not unconditionally on every poll for every tracked file.
+        let dir = tempfile::tempdir().unwrap();
+        let state_dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("app.log");
+        std::fs::write(&log, "line one\n").unwrap();
+
+        let input = input_for(dir.path());
+        let state = Arc::new(StateManager::open(state_dir.path()).unwrap());
+        let metrics = Arc::new(Metrics::default());
+        let (raw_tx, mut rx) = mpsc::channel(100);
+        let tx = EventSender::with_budget(raw_tx, 16 * 1024 * 1024);
+        let cancel = CancellationToken::new();
+        let mut tracked = HashMap::new();
+
+        input
+            .poll_once(&tx, &state, &metrics, &mut tracked, false, &cancel)
+            .await
+            .unwrap();
+        let _ = collect(&mut rx).await;
+
+        let before = FINGERPRINT_CALLS.load(Ordering::Relaxed);
+        // Nothing about the file changed: size is identical, so the
+        // fingerprint must not be re-read.
+        input
+            .poll_once(&tx, &state, &metrics, &mut tracked, false, &cancel)
+            .await
+            .unwrap();
+        assert_eq!(
+            FINGERPRINT_CALLS.load(Ordering::Relaxed),
+            before,
+            "unchanged size must not re-read the file head"
+        );
+
+        // Now append data: size changes, so the fingerprint SHOULD be
+        // recomputed.
+        {
+            let mut f = std::fs::OpenOptions::new().append(true).open(&log).unwrap();
+            f.write_all(b"line two\n").unwrap();
+        }
+        input
+            .poll_once(&tx, &state, &metrics, &mut tracked, false, &cancel)
+            .await
+            .unwrap();
+        assert!(
+            FINGERPRINT_CALLS.load(Ordering::Relaxed) > before,
+            "a changed size should trigger a re-fingerprint"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn first_line_hash_survives_restart_and_arms_race_detector_immediately() {
+        let _guard = lock_counters();
+        // FILE-004/FILE-007 gap: first_line_hash used to always start at
+        // None after a restart, so the copy-truncate race detector was
+        // inert for the first poll of every agent restart. It must instead
+        // be restored from the persisted cursor so the detector is armed on
+        // the very first poll.
+        let dir = tempfile::tempdir().unwrap();
+        let state_dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("app.log");
+        std::fs::write(&log, "first line\nsecond line\n").unwrap();
+        let metrics = Arc::new(Metrics::default());
+        let cancel = CancellationToken::new();
+
+        {
+            let input = input_for(dir.path());
+            let state = Arc::new(StateManager::open(state_dir.path()).unwrap());
+            let (raw_tx, mut rx) = mpsc::channel(100);
+            let tx = EventSender::with_budget(raw_tx, 16 * 1024 * 1024);
+            let mut tracked = HashMap::new();
+            input
+                .poll_once(&tx, &state, &metrics, &mut tracked, false, &cancel)
+                .await
+                .unwrap();
+            let _ = collect(&mut rx).await;
+            state.flush().unwrap();
+        }
+
+        // "Restart": new StateManager reloaded from disk, new FileInput, and
+        // a fresh (empty) `tracked` map, exactly as happens on agent
+        // restart. Before the state.get_cursor() is ever consulted, do a
+        // single-step truncate + regrow past the old offset (as in
+        // detects_copy_truncate_race_on_unix) — but this time it happens on
+        // the very FIRST poll after the restart.
+        let mut f = std::fs::File::create(&log).unwrap();
+        f.write_all(b"replacement A\nreplacement B\nreplacement C\n")
+            .unwrap();
+        drop(f);
+
+        let input = input_for(dir.path());
+        let state = Arc::new(StateManager::open(state_dir.path()).unwrap());
+        let (raw_tx, mut rx) = mpsc::channel(100);
+        let tx = EventSender::with_budget(raw_tx, 16 * 1024 * 1024);
+        let mut tracked = HashMap::new();
+
+        input
+            .poll_once(&tx, &state, &metrics, &mut tracked, false, &cancel)
+            .await
+            .unwrap();
+
+        let got = collect(&mut rx).await;
+        assert_eq!(
+            got,
+            vec!["replacement A", "replacement B", "replacement C"],
+            "first_line_hash must be restored from persisted state so the copy-truncate \
+             race is caught on the very first poll after a restart; got {got:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn tail_once_never_re_walks_the_filesystem() {
+        let _guard = lock_counters();
+        // R-5: tailing must operate only on whatever discover_once last
+        // found, never re-running the (expensive) glob walk itself. Prove
+        // it by counting glob-walk invocations across several tail_once
+        // calls following a single discover_once call.
+        let dir = tempfile::tempdir().unwrap();
+        let state_dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("app.log");
+        std::fs::write(&log, "a\n").unwrap();
+
+        let input = input_for(dir.path());
+        let state = Arc::new(StateManager::open(state_dir.path()).unwrap());
+        let metrics = Arc::new(Metrics::default());
+        let (raw_tx, mut rx) = mpsc::channel(100);
+        let tx = EventSender::with_budget(raw_tx, 16 * 1024 * 1024);
+        let cancel = CancellationToken::new();
+        let mut tracked = HashMap::new();
+
+        input
+            .discover_once(&state, &mut tracked, false)
+            .await
+            .unwrap();
+        let after_discover = DISCOVER_CALLS.load(Ordering::Relaxed);
+        assert!(after_discover > 0, "discover_once must walk the filesystem");
+        assert!(tracked.contains_key(&log));
+
+        for _ in 0..5 {
+            input
+                .tail_once(&tx, &state, &metrics, &mut tracked, &cancel)
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            DISCOVER_CALLS.load(Ordering::Relaxed),
+            after_discover,
+            "tail_once must never re-run the glob walk"
+        );
+        let _ = collect(&mut rx).await;
+    }
+
+    #[tokio::test]
+    async fn run_discovers_far_less_often_than_it_tails() {
+        let _guard = lock_counters();
+        // R-5: end-to-end check that FileInput::run wires discovery and
+        // tailing to genuinely separate cadences. With poll_interval_ms far
+        // below discovery_interval_ms, only the priming discovery pass
+        // should fire over a window many multiples of the poll interval but
+        // a fraction of the discovery interval.
+        let dir = tempfile::tempdir().unwrap();
+        let state_dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("app.log");
+        std::fs::write(&log, "a\n").unwrap();
+
+        let input = FileInput::new(&FileInputConfig {
+            id: "cadence".into(),
+            paths: vec![format!("{}/*.log", dir.path().display())],
+            exclude: vec![],
+            poll_interval_ms: 15,
+            discovery_interval_ms: 2_000,
+            read_from_start: true,
+            parser: ParserConfig::default(),
+            source_type: None,
+        })
+        .unwrap();
+
+        let state = Arc::new(StateManager::open(state_dir.path()).unwrap());
+        let status = Arc::new(StatusRegistry::default());
+        let metrics = Arc::new(Metrics::default());
+        let (raw_tx, _rx) = mpsc::channel(1000);
+        let tx = EventSender::with_budget(raw_tx, 16 * 1024 * 1024);
+        let cancel = CancellationToken::new();
+
+        let before = DISCOVER_CALLS.load(Ordering::Relaxed);
+        let cancel_for_run = cancel.clone();
+        let handle = tokio::spawn(async move {
+            input.run(tx, state, status, metrics, cancel_for_run).await;
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        cancel.cancel();
+        handle.await.unwrap();
+
+        let calls = DISCOVER_CALLS.load(Ordering::Relaxed) - before;
+        assert_eq!(
+            calls, 1,
+            "with a 2s discovery interval, only the priming pass should run in 150ms; got {calls} calls"
         );
     }
 }

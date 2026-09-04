@@ -99,7 +99,8 @@ inputs:
 | `id` | string | — (บังคับ) | ตัวระบุที่ไม่ซ้ำ |
 | `paths` | list | — (บังคับ) | glob pattern รองรับ `*`, recursive `**` และ Windows path (`C:\Logs\*.log`) |
 | `exclude` | list | `[]` | glob pattern ที่ต้องการข้าม |
-| `poll_interval_ms` | int | `500` | ช่วงเวลา poll การเปลี่ยนแปลง/ค้นหาไฟล์ ขั้นต่ำ `50` ยิ่งต่ำยิ่งสด แต่กิน CPU มากขึ้นเล็กน้อย |
+| `poll_interval_ms` | int | `500` | ช่วงเวลา poll สำหรับอ่านไฟล์ที่ค้นพบแล้ว ขั้นต่ำ `50` ยิ่งต่ำยิ่งสด แต่กิน CPU มากขึ้นเล็กน้อย |
+| `discovery_interval_ms` | int | `30000` | ช่วงเวลาระหว่างการค้นหาไฟล์ (glob walk) เพื่อหาไฟล์ใหม่/ที่ถูกลบ แยกออกจาก `poll_interval_ms` และช้ากว่ามาก เพราะ glob walk เป็นส่วนที่มีค่าใช้จ่ายสูง หากรันทุกรอบ poll จะเกิด I/O โดยไม่จำเป็นบนเครื่องที่มีไฟล์ตรงกับ glob จำนวนมาก ยิ่งต่ำยิ่งพบไฟล์ใหม่/ที่ถูกลบเร็วขึ้น แต่มีภาระ discovery มากขึ้น |
 | `read_from_start` | bool | `false` | ครั้งแรกที่รัน อ่านเนื้อหาเดิมตั้งแต่ต้นไฟล์ ค่า default จะข้ามเนื้อหาเดิมและอ่านเฉพาะบรรทัดใหม่ (ไฟล์ที่ถูกค้นพบ *ภายหลัง* จะอ่านตั้งแต่ต้นเสมอ) |
 | `parser` | object | `mode: raw` | ดู [Parsers](#parsers) |
 | `source_type` | string | `file` | แทนค่า field `source_type` ของ event ที่สร้าง |
@@ -113,6 +114,7 @@ inputs:
         - /app/logs/**/*.log
       exclude: ["**/*.gz"]
       poll_interval_ms: 500
+      discovery_interval_ms: 30000
       read_from_start: false
       parser: { mode: json }
 ```

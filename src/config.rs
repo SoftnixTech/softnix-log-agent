@@ -79,9 +79,16 @@ pub struct FileInputConfig {
     pub paths: Vec<String>,
     #[serde(default)]
     pub exclude: Vec<String>,
-    /// Poll interval for file changes and discovery, in milliseconds.
+    /// Poll interval for tailing already-discovered files, in milliseconds.
     #[serde(default = "default_poll_ms")]
     pub poll_interval_ms: u64,
+    /// Interval between filesystem discovery passes (the glob walk that
+    /// finds new/removed files), in milliseconds. Kept separate from, and
+    /// much slower than, `poll_interval_ms`: the glob walk is the expensive
+    /// part, and re-running it on every tail tick does needless I/O for no
+    /// benefit on hosts with many globbed files.
+    #[serde(default = "default_discovery_ms")]
+    pub discovery_interval_ms: u64,
     /// Read existing file content from the beginning on first start.
     #[serde(default)]
     pub read_from_start: bool,
@@ -94,6 +101,10 @@ pub struct FileInputConfig {
 
 fn default_poll_ms() -> u64 {
     500
+}
+
+fn default_discovery_ms() -> u64 {
+    30_000
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
@@ -896,6 +907,7 @@ outputs:
     fn parses_sample() {
         let (cfg, _w) = parse(SAMPLE).unwrap();
         assert_eq!(cfg.inputs.files.len(), 1);
+        assert_eq!(cfg.inputs.files[0].discovery_interval_ms, 30_000);
         assert_eq!(cfg.inputs.syslog[0].port, 5514);
     }
 

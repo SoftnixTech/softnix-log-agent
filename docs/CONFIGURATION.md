@@ -99,7 +99,8 @@ Tail local files with glob discovery and rotation handling.
 | `id` | string | — (required) | Unique identifier. |
 | `paths` | list | — (required) | Glob patterns. Supports `*`, recursive `**`, and Windows paths (`C:\Logs\*.log`). |
 | `exclude` | list | `[]` | Glob patterns to skip. |
-| `poll_interval_ms` | int | `500` | File-change/discovery poll interval. Minimum `50`. Lower = fresher, slightly more CPU. |
+| `poll_interval_ms` | int | `500` | Poll interval for tailing already-discovered files. Minimum `50`. Lower = fresher, slightly more CPU. |
+| `discovery_interval_ms` | int | `30000` | Interval between filesystem discovery passes (the glob walk that finds new/removed files). Kept separate from, and much slower than, `poll_interval_ms`: the glob walk is the expensive part, so re-running it on every tail tick would do needless I/O on hosts with many globbed files. Lower = new/removed files noticed sooner, more discovery overhead. |
 | `read_from_start` | bool | `false` | On first run, read pre-existing content from the beginning. By default existing content is skipped and only new lines are read. (Files discovered *later* are always read from the start.) |
 | `parser` | object | `mode: raw` | See [Parsers](#parsers). |
 | `source_type` | string | `file` | Overrides the `source_type` field on emitted events. |
@@ -113,6 +114,7 @@ inputs:
         - /app/logs/**/*.log
       exclude: ["**/*.gz"]
       poll_interval_ms: 500
+      discovery_interval_ms: 30000
       read_from_start: false
       parser: { mode: json }
 ```
