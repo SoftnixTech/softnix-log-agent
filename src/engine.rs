@@ -11,7 +11,7 @@ use crate::pipeline::{eval_condition, CompiledCondition, Enricher, Transformer};
 use crate::state::StateManager;
 use anyhow::{Context, Result};
 use std::collections::HashMap;
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -29,6 +29,13 @@ type RouterEntry = (
 );
 
 const CHANNEL_CAPACITY: usize = 8192;
+/// Bounds the input→pipeline channel in bytes, not just message count: 8192
+/// messages at up to a 64 KB syslog line each is ~512 MB of reachable RSS if
+/// the pipeline stalls even briefly while a burst arrives, against an
+/// advertised ~12 MB footprint. `EventSender` gates admission with a
+/// KB-granularity semaphore sized to this many bytes; `CHANNEL_CAPACITY`
+/// remains as a secondary cap on raw message count.
+const CHANNEL_BYTES: usize = 64 * 1024 * 1024;
 /// Capacity of each per-destination router channel. This exists to absorb
 /// transient bursts and, in particular, the brief lock contention between a
 /// router's `push`/`push_blocking` and the output worker's `ack`/
@@ -41,6 +48,163 @@ const CHANNEL_CAPACITY: usize = 8192;
 /// contended, still sheds beyond this — which is intentional, since that is
 /// what makes this task's cross-destination isolation guarantee hold.
 const ROUTER_CAPACITY: usize = 4096;
+
+/// The input channel's sender, wrapped with a byte-budget gate so the
+/// channel is bounded by actual memory rather than just message count (see
+/// `CHANNEL_BYTES`). Permits are counted in KB (`Semaphore::MAX_PERMITS` is
+/// large but KB granularity keeps the numbers small and the rounding
+/// conservative).
+///
+/// A permit is acquired before an event is admitted to the channel and is
+/// held — not released back to the semaphore — until `run_pipeline` actually
+/// dequeues that event (see `ChannelBudget::release`), not merely once it has
+/// been handed to the channel buffer. Releasing on admission would only
+/// bound the number of concurrent in-flight `send` calls, not the events
+/// already sitting in the channel waiting for the pipeline to catch up,
+/// which is exactly the burst-stall scenario this type exists to bound.
+#[derive(Clone)]
+pub struct EventSender {
+    tx: mpsc::Sender<Event>,
+    budget: Arc<tokio::sync::Semaphore>,
+    /// KB admitted by `blocking_send` while the budget was exhausted (it
+    /// fell back to the channel's own backpressure instead of acquiring a
+    /// permit — see `blocking_send`). `ChannelBudget::release` pays this
+    /// down before crediting the semaphore, so a burst of fallback sends can
+    /// never permanently inflate the budget beyond `CHANNEL_BYTES`.
+    unaccounted_kb: Arc<AtomicU64>,
+    metrics: Option<Arc<Metrics>>,
+}
+
+impl EventSender {
+    pub fn with_budget(tx: mpsc::Sender<Event>, bytes: usize) -> Self {
+        EventSender {
+            tx,
+            budget: Arc::new(tokio::sync::Semaphore::new(bytes / 1024)),
+            unaccounted_kb: Arc::new(AtomicU64::new(0)),
+            metrics: None,
+        }
+    }
+
+    /// Attach the metrics registry so `send`/`blocking_send` can keep
+    /// `agent_channel_bytes` current. Separate from `with_budget` so the
+    /// constructor stays usable in tests that don't care about metrics.
+    pub fn with_metrics(mut self, metrics: Arc<Metrics>) -> Self {
+        self.metrics = Some(metrics);
+        self
+    }
+
+    /// KB, rounded up, at least 1 — so a tiny event never costs zero
+    /// permits.
+    fn permits_for(ev: &Event) -> u32 {
+        ev.message.len().div_ceil(1024).max(1) as u32
+    }
+
+    /// A handle `run_pipeline` uses to release budget as it drains events.
+    pub(crate) fn channel_budget(&self) -> ChannelBudget {
+        ChannelBudget {
+            budget: self.budget.clone(),
+            unaccounted_kb: self.unaccounted_kb.clone(),
+        }
+    }
+
+    // `SendError<Event>` is exactly what the wrapped `mpsc::Sender::send`
+    // already returns; the point of that error is handing the un-sent event
+    // back to the caller, so boxing it here would just relocate the cost
+    // rather than remove it.
+    #[allow(clippy::result_large_err)]
+    pub async fn send(&self, ev: Event) -> Result<(), mpsc::error::SendError<Event>> {
+        let n = Self::permits_for(&ev);
+        let permit = match Arc::clone(&self.budget).acquire_many_owned(n).await {
+            Ok(p) => p,
+            Err(_) => return Err(mpsc::error::SendError(ev)),
+        };
+        let len = ev.message.len() as u64;
+        match self.tx.send(ev).await {
+            Ok(()) => {
+                // Deferred release — see the type doc comment above.
+                permit.forget();
+                if let Some(m) = &self.metrics {
+                    m.channel_bytes.fetch_add(len, Ordering::Relaxed);
+                }
+                Ok(())
+            }
+            Err(e) => Err(e), // never entered the channel; `permit` drops here, returning the budget.
+        }
+    }
+
+    /// For the `spawn_blocking` eventlog path, which cannot await the async
+    /// semaphore. Acquires a permit without blocking; if the budget is
+    /// exhausted it falls back to the channel's own (blocking) backpressure
+    /// rather than busy-waiting on the semaphore from a sync context.
+    #[allow(clippy::result_large_err)] // see `send`'s comment above.
+    pub fn blocking_send(&self, ev: Event) -> Result<(), mpsc::error::SendError<Event>> {
+        let n = Self::permits_for(&ev);
+        let permit = Arc::clone(&self.budget).try_acquire_many_owned(n).ok();
+        let len = ev.message.len() as u64;
+        match self.tx.blocking_send(ev) {
+            Ok(()) => {
+                match permit {
+                    Some(p) => p.forget(), // deferred release, same as `send`.
+                    None => {
+                        // Admitted without a reservation: record the
+                        // shortfall so `ChannelBudget::release` pays it down
+                        // instead of crediting the semaphore for bytes that
+                        // were never actually debited from it.
+                        self.unaccounted_kb.fetch_add(n as u64, Ordering::Relaxed);
+                    }
+                }
+                if let Some(m) = &self.metrics {
+                    m.channel_bytes.fetch_add(len, Ordering::Relaxed);
+                }
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
+    }
+}
+
+/// Handle the pipeline uses to release `EventSender` budget as it dequeues
+/// events. Kept separate from `EventSender` itself because `run_pipeline`
+/// only ever receives the raw `mpsc::Receiver<Event>` — the channel item
+/// type never changes — so this travels alongside it as its own parameter.
+#[derive(Clone)]
+pub(crate) struct ChannelBudget {
+    budget: Arc<tokio::sync::Semaphore>,
+    unaccounted_kb: Arc<AtomicU64>,
+}
+
+impl ChannelBudget {
+    fn release(&self, ev: &Event, metrics: &Metrics) {
+        let n = EventSender::permits_for(ev) as u64;
+        // Pay down any shortfall recorded by a `blocking_send` fallback
+        // first; only credit the semaphore with whatever's left. This keeps
+        // the semaphore's total capacity from permanently drifting above
+        // `CHANNEL_BYTES` when the eventlog input's blocking path admitted
+        // an event without a reservation.
+        let mut remaining = n;
+        loop {
+            let owed = self.unaccounted_kb.load(Ordering::Relaxed);
+            if owed == 0 {
+                break;
+            }
+            let pay = owed.min(remaining);
+            if self
+                .unaccounted_kb
+                .compare_exchange(owed, owed - pay, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+            {
+                remaining -= pay;
+                break;
+            }
+        }
+        if remaining > 0 {
+            self.budget.add_permits(remaining as usize);
+        }
+        metrics
+            .channel_bytes
+            .fetch_sub(ev.message.len() as u64, Ordering::Relaxed);
+    }
+}
 
 /// Everything the web UI needs to observe a running engine.
 pub struct EngineShared {
@@ -158,11 +322,14 @@ impl Engine {
         // Pipeline task: transform, enrich, fan out to the per-destination
         // routers. It no longer awaits any push itself, so a stuck destination
         // cannot stall delivery to its siblings.
-        let (tx, rx) = mpsc::channel::<Event>(CHANNEL_CAPACITY);
+        let (raw_tx, rx) = mpsc::channel::<Event>(CHANNEL_CAPACITY);
+        let tx = EventSender::with_budget(raw_tx, CHANNEL_BYTES).with_metrics(metrics.clone());
+        let channel_budget = tx.channel_budget();
         let transformer = Transformer::compile(&cfg.pipeline)?;
         let enricher = Enricher::new(&cfg.pipeline.enrich);
         tasks.push(tokio::spawn(run_pipeline(
             rx,
+            channel_budget,
             transformer,
             enricher,
             routers,
@@ -316,8 +483,10 @@ async fn run_router(
 }
 
 /// Transform → normalize → enrich → fan out to the per-destination routers.
+#[allow(clippy::too_many_arguments)]
 async fn run_pipeline(
     mut rx: mpsc::Receiver<Event>,
+    budget: ChannelBudget,
     transformer: Transformer,
     enricher: Enricher,
     routers: Vec<RouterEntry>,
@@ -328,7 +497,13 @@ async fn run_pipeline(
     loop {
         let ev = tokio::select! {
             ev = rx.recv() => match ev {
-                Some(ev) => ev,
+                Some(ev) => {
+                    // Release the channel-budget permit(s) this event was
+                    // admitted under now that the pipeline — not just the
+                    // channel buffer — actually has it.
+                    budget.release(&ev, &metrics);
+                    ev
+                }
                 None => return,
             },
             _ = cancel.cancelled() => {
@@ -353,6 +528,7 @@ async fn run_pipeline(
                 // the destination's disk queue rather than being shed on a
                 // single non-blocking attempt.
                 while let Ok(ev) = rx.try_recv() {
+                    budget.release(&ev, &metrics);
                     route_event(ev, &transformer, &enricher, &routers, &status, &metrics, true)
                         .await;
                 }
@@ -482,6 +658,149 @@ mod tests {
             retry: RetryConfig::default(),
             full_policy: None,
         }
+    }
+
+    // --- EventSender: channel bounded by bytes, not just message count ---
+
+    /// R-3 regression guard: with a small byte budget and events sized past
+    /// it, a third send must not complete until the budget frees up — proof
+    /// the channel is actually gated in bytes, not just the (much larger)
+    /// message-count capacity of the underlying `mpsc` channel.
+    #[tokio::test]
+    async fn sender_blocks_once_the_byte_budget_is_exhausted() {
+        let (tx, _rx) = mpsc::channel::<Event>(8192);
+        // 64 KB budget, 32 KB events => the third send must not complete.
+        let sender = EventSender::with_budget(tx, 64 * 1024);
+        let body = "x".repeat(32 * 1024);
+        sender.send(Event::new("s", "t", &body)).await.unwrap();
+        sender.send(Event::new("s", "t", &body)).await.unwrap();
+        let blocked = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            sender.send(Event::new("s", "t", &body)),
+        )
+        .await;
+        assert!(
+            blocked.is_err(),
+            "third send should have been held by the budget"
+        );
+    }
+
+    /// The budget must be held until the pipeline actually dequeues the
+    /// event, not just until it's been handed to the channel buffer —
+    /// otherwise `send` releasing on its own completion would only bound
+    /// concurrent in-flight sends, not events sitting in the channel.
+    /// Proven here by draining exactly one event via `ChannelBudget::release`
+    /// (what `run_pipeline` does) and confirming a blocked send then
+    /// unblocks.
+    #[tokio::test]
+    async fn budget_only_frees_once_the_pipeline_drains_the_event() {
+        let (tx, mut rx) = mpsc::channel::<Event>(8192);
+        let sender = EventSender::with_budget(tx, 64 * 1024);
+        let body = "x".repeat(32 * 1024);
+        sender.send(Event::new("s", "t", &body)).await.unwrap();
+        sender.send(Event::new("s", "t", &body)).await.unwrap();
+        // Budget now fully committed (2 x 32 KB == 64 KB); nothing has been
+        // dequeued yet, so a third send must still block.
+        let still_blocked = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            sender.send(Event::new("s", "t", &body)),
+        )
+        .await;
+        assert!(still_blocked.is_err());
+
+        // Drain exactly one event as `run_pipeline` would.
+        let metrics = Metrics::default();
+        let budget = sender.channel_budget();
+        let drained = rx.recv().await.unwrap();
+        budget.release(&drained, &metrics);
+
+        // The freed 32 KB must now let a same-sized send through promptly.
+        let unblocked = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            sender.send(Event::new("s", "t", &body)),
+        )
+        .await;
+        assert!(
+            unblocked.is_ok() && unblocked.unwrap().is_ok(),
+            "send should unblock once the pipeline has drained an event"
+        );
+    }
+
+    /// `blocking_send` (the eventlog `spawn_blocking` path) cannot await the
+    /// async semaphore, so when the budget is exhausted it falls back to the
+    /// channel's own backpressure instead of reserving a permit. That
+    /// shortfall must be paid down by the next `ChannelBudget::release`
+    /// rather than the semaphore being credited for bytes it never actually
+    /// held — otherwise repeated fallbacks would permanently inflate the
+    /// budget beyond its configured size.
+    #[tokio::test]
+    async fn blocking_send_fallback_does_not_inflate_the_budget_on_release() {
+        let (tx, mut rx) = mpsc::channel::<Event>(8192);
+        let sender = EventSender::with_budget(tx, 8 * 1024); // 8 KB budget => 8 permits
+        let body = "x".repeat(8 * 1024);
+
+        // Exhaust the budget via the normal async path.
+        sender.send(Event::new("s", "t", &body)).await.unwrap();
+        assert_eq!(sender.budget.available_permits(), 0);
+
+        // No permit available; blocking_send must still admit the event via
+        // the channel's own backpressure rather than stalling. Run it on a
+        // real blocking thread (as the eventlog `spawn_blocking` context
+        // does) — calling `blocking_send` directly on an async runtime
+        // worker thread panics.
+        let blocking_sender = sender.clone();
+        let ev = Event::new("s", "t", &body);
+        #[allow(clippy::result_large_err)] // see `EventSender::send`'s comment.
+        tokio::task::spawn_blocking(move || blocking_sender.blocking_send(ev))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            sender.unaccounted_kb.load(Ordering::Relaxed),
+            8,
+            "the fallback send must record its shortfall"
+        );
+
+        let metrics = Metrics::default();
+        let budget = sender.channel_budget();
+
+        // Draining the first (properly reserved) event pays down the
+        // recorded shortfall instead of crediting the semaphore.
+        let e1 = rx.recv().await.unwrap();
+        budget.release(&e1, &metrics);
+        assert_eq!(
+            sender.budget.available_permits(),
+            0,
+            "the shortfall must be paid off first, not credited to the semaphore"
+        );
+        assert_eq!(sender.unaccounted_kb.load(Ordering::Relaxed), 0);
+
+        // Draining the second event now credits the semaphore normally.
+        let e2 = rx.recv().await.unwrap();
+        budget.release(&e2, &metrics);
+        assert_eq!(
+            sender.budget.available_permits(),
+            8,
+            "must return to exactly the configured budget, not more"
+        );
+    }
+
+    /// `agent_channel_bytes` must track live channel occupancy: it rises as
+    /// `EventSender::send` admits an event and falls back once
+    /// `ChannelBudget::release` (the pipeline's dequeue path) drains it.
+    #[tokio::test]
+    async fn channel_bytes_gauge_tracks_admitted_and_drained_events() {
+        let (tx, mut rx) = mpsc::channel::<Event>(8192);
+        let metrics = Arc::new(Metrics::default());
+        let sender = EventSender::with_budget(tx, 1024 * 1024).with_metrics(metrics.clone());
+        let body = "x".repeat(2048);
+        sender.send(Event::new("s", "t", &body)).await.unwrap();
+        assert_eq!(metrics.channel_bytes.load(Ordering::Relaxed), 2048);
+
+        let budget = sender.channel_budget();
+        let ev = rx.recv().await.unwrap();
+        budget.release(&ev, &metrics);
+        assert_eq!(metrics.channel_bytes.load(Ordering::Relaxed), 0);
     }
 
     /// Regression guard for the fix-round-2 drain fix: `run_pipeline`'s

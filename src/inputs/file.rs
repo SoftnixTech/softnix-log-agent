@@ -8,7 +8,7 @@
 //! recreation are detected; truncation resets the offset.
 
 use crate::config::FileInputConfig;
-use crate::event::Event;
+use crate::engine::EventSender;
 use crate::metrics::{InputStatus, Metrics, StatusRegistry};
 use crate::pipeline::Parser;
 use crate::state::StateManager;
@@ -18,7 +18,6 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 /// Max bytes consumed per file per poll cycle, to keep one busy file from
@@ -128,7 +127,7 @@ impl FileInput {
 
     pub fn spawn(
         self,
-        tx: mpsc::Sender<Event>,
+        tx: EventSender,
         state: Arc<StateManager>,
         status: Arc<StatusRegistry>,
         metrics: Arc<Metrics>,
@@ -149,7 +148,7 @@ impl FileInput {
 
     async fn run(
         self,
-        tx: mpsc::Sender<Event>,
+        tx: EventSender,
         state: Arc<StateManager>,
         status: Arc<StatusRegistry>,
         metrics: Arc<Metrics>,
@@ -203,7 +202,7 @@ impl FileInput {
     /// One discovery + read pass. Returns events emitted.
     async fn poll_once(
         &self,
-        tx: &mpsc::Sender<Event>,
+        tx: &EventSender,
         state: &StateManager,
         metrics: &Metrics,
         tracked: &mut HashMap<PathBuf, Tracked>,
@@ -399,7 +398,9 @@ impl FileInput {
 mod tests {
     use super::*;
     use crate::config::ParserConfig;
+    use crate::event::Event;
     use std::io::Write;
+    use tokio::sync::mpsc;
 
     fn input_for(dir: &Path) -> FileInput {
         FileInput::new(&FileInputConfig {
@@ -466,7 +467,8 @@ mod tests {
         let input = input_for(dir.path());
         let state = Arc::new(StateManager::open(state_dir.path()).unwrap());
         let metrics = Arc::new(Metrics::default());
-        let (tx, mut rx) = mpsc::channel(1000);
+        let (raw_tx, mut rx) = mpsc::channel(1000);
+        let tx = EventSender::with_budget(raw_tx, 16 * 1024 * 1024);
         let cancel = CancellationToken::new();
         let mut tracked = HashMap::new();
 
@@ -541,7 +543,8 @@ mod tests {
         let input = input_for(dir.path());
         let state = Arc::new(StateManager::open(state_dir.path()).unwrap());
         let metrics = Arc::new(Metrics::default());
-        let (tx, mut rx) = mpsc::channel(100);
+        let (raw_tx, mut rx) = mpsc::channel(100);
+        let tx = EventSender::with_budget(raw_tx, 16 * 1024 * 1024);
         let cancel = CancellationToken::new();
         let mut tracked = HashMap::new();
 
@@ -586,7 +589,8 @@ mod tests {
         {
             let input = input_for(dir.path());
             let state = Arc::new(StateManager::open(state_dir.path()).unwrap());
-            let (tx, mut rx) = mpsc::channel(100);
+            let (raw_tx, mut rx) = mpsc::channel(100);
+            let tx = EventSender::with_budget(raw_tx, 16 * 1024 * 1024);
             let mut tracked = HashMap::new();
             input
                 .poll_once(&tx, &state, &metrics, &mut tracked, false, &cancel)
@@ -605,7 +609,8 @@ mod tests {
             .unwrap();
         let input = input_for(dir.path());
         let state = Arc::new(StateManager::open(state_dir.path()).unwrap());
-        let (tx, mut rx) = mpsc::channel(100);
+        let (raw_tx, mut rx) = mpsc::channel(100);
+        let tx = EventSender::with_budget(raw_tx, 16 * 1024 * 1024);
         let mut tracked = HashMap::new();
         input
             .poll_once(&tx, &state, &metrics, &mut tracked, false, &cancel)
@@ -632,7 +637,8 @@ mod tests {
         let state = Arc::new(StateManager::open(state_dir.path()).unwrap());
         let metrics = Arc::new(Metrics::default());
         let cancel = CancellationToken::new();
-        let (tx, mut rx) = mpsc::channel(100);
+        let (raw_tx, mut rx) = mpsc::channel(100);
+        let tx = EventSender::with_budget(raw_tx, 16 * 1024 * 1024);
         let mut tracked = HashMap::new();
 
         input

@@ -10,6 +10,7 @@
 //! blocking (`WaitForSingleObject`) so it lives on the blocking thread pool.
 
 use crate::config::EventLogInputConfig;
+use crate::engine::EventSender;
 use crate::event::Event;
 use crate::metrics::{InputStatus, Metrics, StatusRegistry};
 use crate::state::StateManager;
@@ -18,7 +19,6 @@ use serde_json::Value;
 use std::ffi::c_void;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use windows::core::PCWSTR;
@@ -65,7 +65,7 @@ impl EventLogInput {
     /// when every channel has stopped (on cancellation or fatal error).
     pub fn spawn(
         self,
-        tx: mpsc::Sender<Event>,
+        tx: EventSender,
         state: Arc<StateManager>,
         status: Arc<StatusRegistry>,
         metrics: Arc<Metrics>,
@@ -131,7 +131,7 @@ fn run_channel(
     cfg: &EventLogInputConfig,
     channel: &str,
     source_type: &str,
-    tx: &mpsc::Sender<Event>,
+    tx: &EventSender,
     state: &StateManager,
     status: &StatusRegistry,
     metrics: &Metrics,
@@ -314,7 +314,7 @@ unsafe fn subscribe_and_drain(
     cfg: &EventLogInputConfig,
     channel: &str,
     source_type: &str,
-    tx: &mpsc::Sender<Event>,
+    tx: &EventSender,
     state: &StateManager,
     status: &StatusRegistry,
     metrics: &Metrics,
@@ -423,7 +423,7 @@ unsafe fn drain_loop(
     cfg: &EventLogInputConfig,
     channel: &str,
     source_type: &str,
-    tx: &mpsc::Sender<Event>,
+    tx: &EventSender,
     state: &StateManager,
     status: &StatusRegistry,
     metrics: &Metrics,

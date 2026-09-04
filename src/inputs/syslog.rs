@@ -2,6 +2,7 @@
 //! parsing and newline framing for stream transports.
 
 use crate::config::{SyslogInputConfig, SyslogProtocol};
+use crate::engine::EventSender;
 use crate::event::Event;
 use crate::metrics::{InputStatus, Metrics, StatusRegistry};
 use crate::pipeline::parse_syslog_into;
@@ -11,7 +12,6 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::io::AsyncRead;
 use tokio::net::{TcpListener, UdpSocket};
-use tokio::sync::mpsc;
 use tokio_stream::StreamExt;
 use tokio_util::codec::{FramedRead, LinesCodec};
 use tokio_util::sync::CancellationToken;
@@ -38,7 +38,7 @@ impl SyslogInput {
     /// errors (port in use, bad certs) fail engine startup.
     pub async fn spawn(
         self,
-        tx: mpsc::Sender<Event>,
+        tx: EventSender,
         status: Arc<StatusRegistry>,
         metrics: Arc<Metrics>,
         cancel: CancellationToken,
@@ -93,7 +93,7 @@ impl SyslogInput {
     async fn run_udp(
         self,
         sock: UdpSocket,
-        tx: mpsc::Sender<Event>,
+        tx: EventSender,
         status: Arc<StatusRegistry>,
         metrics: Arc<Metrics>,
         cancel: CancellationToken,
@@ -135,7 +135,7 @@ impl SyslogInput {
         self,
         listener: TcpListener,
         acceptor: Option<tokio_rustls::TlsAcceptor>,
-        tx: mpsc::Sender<Event>,
+        tx: EventSender,
         status: Arc<StatusRegistry>,
         metrics: Arc<Metrics>,
         cancel: CancellationToken,
@@ -190,7 +190,7 @@ impl SyslogInput {
         &self,
         stream: S,
         peer: SocketAddr,
-        tx: mpsc::Sender<Event>,
+        tx: EventSender,
         status: &StatusRegistry,
         metrics: &Metrics,
         cancel: CancellationToken,
@@ -245,6 +245,7 @@ impl SyslogInput {
 mod tests {
     use super::*;
     use crate::config::SyslogFormat;
+    use tokio::sync::mpsc;
 
     fn test_cfg(proto: SyslogProtocol, port: u16) -> SyslogInputConfig {
         SyslogInputConfig {
@@ -273,7 +274,8 @@ mod tests {
         let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let addr = sock.local_addr().unwrap();
         let input = SyslogInput::new(&cfg);
-        let (tx, mut rx) = mpsc::channel(16);
+        let (raw_tx, mut rx) = mpsc::channel(16);
+        let tx = EventSender::with_budget(raw_tx, 16 * 1024 * 1024);
         let status = Arc::new(StatusRegistry::default());
         status.set_input(InputStatus {
             id: "test".into(),
@@ -304,7 +306,8 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let input = SyslogInput::new(&test_cfg(SyslogProtocol::Tcp, 0));
-        let (tx, mut rx) = mpsc::channel(16);
+        let (raw_tx, mut rx) = mpsc::channel(16);
+        let tx = EventSender::with_budget(raw_tx, 16 * 1024 * 1024);
         let status = Arc::new(StatusRegistry::default());
         status.set_input(InputStatus {
             id: "test".into(),

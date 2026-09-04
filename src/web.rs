@@ -340,6 +340,7 @@ async fn metrics_text(State(state): S) -> Response {
         m.events_dropped
     ));
     out.push_str(&format!("agent_errors_total {}\n", m.errors));
+    out.push_str(&format!("agent_channel_bytes {}\n", m.channel_bytes));
     for (id, q) in &eng.queues {
         out.push_str(&format!(
             "agent_queue_events{{destination=\"{id}\"}} {}\n",
