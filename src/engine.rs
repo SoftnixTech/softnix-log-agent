@@ -34,14 +34,44 @@ pub struct Engine {
 
 impl Engine {
     pub async fn start(cfg: Config) -> Result<Engine> {
+        let cancel = CancellationToken::new();
+        let mut tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+        match Self::build(cfg, &cancel, &mut tasks).await {
+            Ok(shared) => Ok(Engine {
+                shared,
+                cancel,
+                tasks,
+            }),
+            Err(e) => {
+                // A partial start must not leave listeners holding ports or
+                // output workers holding a single-writer queue directory.
+                tracing::error!(
+                    "engine start failed, tearing down {} task(s): {e:#}",
+                    tasks.len()
+                );
+                cancel.cancel();
+                for t in &tasks {
+                    t.abort();
+                }
+                for t in tasks {
+                    let _ = t.await;
+                }
+                Err(e)
+            }
+        }
+    }
+
+    async fn build(
+        cfg: Config,
+        cancel: &CancellationToken,
+        tasks: &mut Vec<tokio::task::JoinHandle<()>>,
+    ) -> Result<Arc<EngineShared>> {
         let data_dir = &cfg.agent.data_dir;
         std::fs::create_dir_all(data_dir)
             .with_context(|| format!("cannot create data dir {}", data_dir.display()))?;
         let state = Arc::new(StateManager::open(data_dir)?);
         let metrics = Arc::new(Metrics::default());
         let status = Arc::new(StatusRegistry::default());
-        let cancel = CancellationToken::new();
-        let mut tasks = Vec::new();
 
         // Per-destination persistent queues.
         let queue_dir = cfg
@@ -151,17 +181,13 @@ impl Engine {
             cfg.outputs.len()
         );
 
-        Ok(Engine {
-            shared: Arc::new(EngineShared {
-                config: cfg,
-                metrics,
-                status,
-                queues,
-                state,
-            }),
-            cancel,
-            tasks,
-        })
+        Ok(Arc::new(EngineShared {
+            config: cfg,
+            metrics,
+            status,
+            queues,
+            state,
+        }))
     }
 
     /// Graceful stop: cancel all tasks, wait briefly, persist state.

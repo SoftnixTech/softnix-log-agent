@@ -320,3 +320,65 @@ outputs:
     );
     engine.stop().await;
 }
+
+/// A partial `Engine::start` failure must not leak any already-spawned task:
+/// the successfully-bound listener from an earlier input must be torn down
+/// when a later input fails to bind, so ports are free for the next attempt.
+#[tokio::test]
+async fn failed_start_releases_bound_ports() {
+    use softnix_log_agent::config::Config;
+    use softnix_log_agent::engine::Engine;
+
+    let dir = tempfile::tempdir().unwrap();
+    // Bind a port first so the agent's second listener is guaranteed to fail.
+    let squatter = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let taken = squatter.local_addr().unwrap().port();
+    let free = {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let p = l.local_addr().unwrap().port();
+        drop(l);
+        p
+    };
+
+    // Input 1 binds `free` successfully; input 2 then fails on `taken`.
+    let yaml = format!(
+        r#"
+agent:
+  data_dir: {data}
+inputs:
+  syslog:
+    - id: ok
+      protocol: tcp
+      bind: 127.0.0.1
+      port: {free}
+    - id: doomed
+      protocol: tcp
+      bind: 127.0.0.1
+      port: {taken}
+outputs:
+  - id: out
+    type: stdout
+web:
+  enabled: false
+"#,
+        data = dir.path().display(),
+        free = free,
+        taken = taken,
+    );
+    let (cfg, _warnings): (Config, Vec<String>) =
+        softnix_log_agent::config::parse(&yaml).expect("config must parse");
+
+    assert!(
+        Engine::start(cfg).await.is_err(),
+        "start must fail on the taken port"
+    );
+
+    // The successfully-bound listener from input 1 must have been torn down.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert!(
+        tokio::net::TcpListener::bind(("127.0.0.1", free))
+            .await
+            .is_ok(),
+        "port {free} is still held by a leaked listener task"
+    );
+}
