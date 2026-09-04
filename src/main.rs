@@ -213,7 +213,7 @@ async fn run_agent(
         config_path: config_path.clone(),
         control: control_tx,
         uptime: metrics::Uptime::default(),
-        auth_token: cfg.web.auth_token.clone(),
+        auth_token: web::resolve_token(&cfg.web, &cfg.agent.data_dir)?,
     });
 
     // Web server lives outside the engine so it survives reloads.

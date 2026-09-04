@@ -720,9 +720,17 @@ pub fn validate(cfg: &Config) -> Result<Vec<String>> {
                 format!("web.bind must be an IP address (got {:?})", cfg.web.bind)
             })?;
         if !ip.is_loopback() {
+            if cfg.web.auth_token.is_none() {
+                bail!(
+                    "web.bind is {} (not loopback) but web.auth_token is not set — \
+                     refusing to expose an unauthenticated config API. Set web.auth_token \
+                     or bind to 127.0.0.1.",
+                    cfg.web.bind
+                );
+            }
             warnings.push(format!(
                 "SECURITY WARNING: web GUI is bound to {} and reachable from the network; \
-                 restrict access with a firewall and configure web.auth_token",
+                 restrict access with a firewall",
                 cfg.web.bind
             ));
         }
@@ -865,7 +873,21 @@ inputs:
     }
 
     #[test]
-    fn warns_on_public_bind() {
+    fn warns_on_public_bind_with_token_set() {
+        let s = r#"
+web:
+  bind: 0.0.0.0
+  auth_token: some-secret-token
+outputs:
+  - id: console
+    type: stdout
+"#;
+        let (_c, w) = parse(s).unwrap();
+        assert!(w.iter().any(|x| x.contains("SECURITY WARNING")));
+    }
+
+    #[test]
+    fn errors_on_public_bind_without_token() {
         let s = r#"
 web:
   bind: 0.0.0.0
@@ -873,7 +895,7 @@ outputs:
   - id: console
     type: stdout
 "#;
-        let (_c, w) = parse(s).unwrap();
-        assert!(w.iter().any(|x| x.contains("SECURITY WARNING")));
+        let err = parse(s).unwrap_err();
+        assert!(format!("{err:#}").contains("auth_token"));
     }
 }

@@ -65,7 +65,36 @@
 let page="overview", timer=null, cfgDirty=false;
 const $=s=>document.querySelector(s);
 const esc=s=>String(s??"").replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
-async function api(p,opt){const r=await fetch(p,opt);const ct=r.headers.get("content-type")||"";const body=ct.includes("json")?await r.json():await r.text();return{ok:r.ok,status:r.status,body}}
+// The token is read once from the URL fragment (#token=...) or a prompt, and
+// kept in sessionStorage so a reload does not ask again. It is never placed in
+// the query string, where it would land in access logs and Referer headers.
+function token(){
+  let t=sessionStorage.getItem('snx_token');
+  if(!t && location.hash.startsWith('#token=')){
+    t=decodeURIComponent(location.hash.slice(7));
+    sessionStorage.setItem('snx_token',t);
+    history.replaceState(null,'',location.pathname);
+  }
+  if(!t){
+    t=prompt('Agent API token (see the web-token file in the data directory):')||'';
+    if(t)sessionStorage.setItem('snx_token',t);
+  }
+  return t;
+}
+function authHeaders(extra){
+  return Object.assign({'authorization':'Bearer '+token()},extra||{});
+}
+async function api(p,opt,retried){
+  opt=opt||{};
+  const r=await fetch(p,Object.assign({},opt,{headers:authHeaders(opt.headers)}));
+  if(r.status===401 && !retried){
+    sessionStorage.removeItem('snx_token');
+    return api(p,opt,true);
+  }
+  const ct=r.headers.get("content-type")||"";
+  const body=ct.includes("json")?await r.json():await r.text();
+  return{ok:r.ok,status:r.status,body}
+}
 function fmtDur(s){if(s==null)return"-";const d=Math.floor(s/86400),h=Math.floor(s%86400/3600),m=Math.floor(s%3600/60);return(d?d+"d ":"")+(h?h+"h ":"")+m+"m "+Math.floor(s%60)+"s"}
 function fmtBytes(b){if(b==null)return"-";const u=["B","KB","MB","GB"];let i=0;while(b>=1024&&i<3){b/=1024;i++}return b.toFixed(i?1:0)+" "+u[i]}
 function card(k,v,cls){return`<div class="card"><div class="k">${esc(k)}</div><div class="val ${cls||""}">${v}</div></div>`}

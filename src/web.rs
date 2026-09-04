@@ -6,8 +6,10 @@ use crate::engine::EngineShared;
 use crate::event::AGENT_VERSION;
 use crate::logbuf::LogBuffer;
 use crate::metrics::Uptime;
-use axum::extract::{Query, State};
-use axum::http::{HeaderMap, StatusCode};
+use anyhow::Context;
+use axum::extract::{Query, Request, State};
+use axum::http::StatusCode;
+use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -35,7 +37,7 @@ pub struct AppState {
     pub config_path: PathBuf,
     pub control: mpsc::Sender<ControlMsg>,
     pub uptime: Uptime,
-    pub auth_token: Option<String>,
+    pub auth_token: String,
 }
 
 type S = State<Arc<AppState>>;
@@ -46,9 +48,26 @@ pub async fn serve(
     cancel: CancellationToken,
 ) -> anyhow::Result<()> {
     let addr = format!("{}:{}", web_cfg.bind, web_cfg.port);
-    let app = Router::new()
-        .route("/", get(ui))
+    let app = router(state);
+
+    let listener = tokio::net::TcpListener::bind(&addr).await?;
+    tracing::info!("web GUI listening on http://{addr}");
+    axum::serve(listener, app)
+        .with_graceful_shutdown(async move { cancel.cancelled().await })
+        .await?;
+    Ok(())
+}
+
+/// Build the router. Split out of `serve` so tests can drive it directly.
+pub fn router(state: Arc<AppState>) -> Router {
+    // /healthz is deliberately outside the auth layer: it is the liveness probe
+    // for systemd, Kubernetes and the customer's monitoring, and carries no data.
+    let public = Router::new()
         .route("/healthz", get(healthz))
+        .with_state(state.clone());
+
+    let guarded = Router::new()
+        .route("/", get(ui))
         .route("/metrics", get(metrics_text))
         .route("/api/status", get(api_status))
         .route("/api/inputs", get(api_inputs))
@@ -61,30 +80,78 @@ pub async fn serve(
         .route("/api/config/save", post(api_config_save))
         .route("/api/config/reload", post(api_config_reload))
         .route("/api/config/rollback", post(api_config_rollback))
+        .layer(middleware::from_fn_with_state(state.clone(), auth_layer))
         .with_state(state);
 
-    let listener = tokio::net::TcpListener::bind(&addr).await?;
-    tracing::info!("web GUI listening on http://{addr}");
-    axum::serve(listener, app)
-        .with_graceful_shutdown(async move { cancel.cancelled().await })
-        .await?;
-    Ok(())
+    public.merge(guarded)
 }
 
-fn check_auth(state: &AppState, headers: &HeaderMap) -> Result<(), Box<Response>> {
-    if let Some(token) = &state.auth_token {
-        let supplied = headers
-            .get("authorization")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.strip_prefix("Bearer "))
-            .or_else(|| headers.get("x-auth-token").and_then(|v| v.to_str().ok()));
-        if supplied != Some(token.as_str()) {
-            return Err(Box::new(
-                (StatusCode::UNAUTHORIZED, "unauthorized").into_response(),
-            ));
+async fn auth_layer(State(state): S, req: Request, next: Next) -> Response {
+    let supplied = req
+        .headers()
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .or_else(|| {
+            req.headers()
+                .get("x-auth-token")
+                .and_then(|v| v.to_str().ok())
+        })
+        .unwrap_or("");
+    if !constant_time_eq(supplied.as_bytes(), state.auth_token.as_bytes()) {
+        return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
+    }
+    next.run(req).await
+}
+
+/// Length-independent, short-circuit-free comparison (audit L-2).
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+/// 32 bytes of OS entropy, hex-encoded.
+pub fn generate_token() -> String {
+    use rand::RngCore;
+    let mut bytes = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// The configured token, or a persistent one under the data dir.
+pub fn resolve_token(cfg: &WebConfig, data_dir: &std::path::Path) -> anyhow::Result<String> {
+    if let Some(t) = &cfg.auth_token {
+        return Ok(t.clone());
+    }
+    let path = data_dir.join("web-token");
+    if let Ok(existing) = std::fs::read_to_string(&path) {
+        let t = existing.trim().to_string();
+        if !t.is_empty() {
+            return Ok(t);
         }
     }
-    Ok(())
+    let token = generate_token();
+    std::fs::create_dir_all(data_dir)
+        .with_context(|| format!("cannot create data dir {}", data_dir.display()))?;
+    crate::fsutil::write_atomic(&path, token.as_bytes())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    tracing::warn!(
+        "web.auth_token was not configured; generated one and stored it at {} \
+         (read it with: cat {})",
+        path.display(),
+        path.display()
+    );
+    Ok(token)
 }
 
 async fn ui() -> Html<&'static str> {
@@ -252,10 +319,7 @@ async fn api_about(State(state): S) -> Response {
     .into_response()
 }
 
-async fn api_config_get(State(state): S, headers: HeaderMap) -> Response {
-    if let Err(r) = check_auth(&state, &headers) {
-        return *r;
-    }
+async fn api_config_get(State(state): S) -> Response {
     match std::fs::read_to_string(&state.config_path) {
         Ok(text) => Json(json!({"path": state.config_path.display().to_string(), "content": text}))
             .into_response(),
@@ -268,28 +332,14 @@ struct ConfigBody {
     content: String,
 }
 
-async fn api_config_validate(
-    State(state): S,
-    headers: HeaderMap,
-    Json(body): Json<ConfigBody>,
-) -> Response {
-    if let Err(r) = check_auth(&state, &headers) {
-        return *r;
-    }
+async fn api_config_validate(Json(body): Json<ConfigBody>) -> Response {
     match config::parse(&body.content) {
         Ok((_cfg, warnings)) => Json(json!({"valid": true, "warnings": warnings})).into_response(),
         Err(e) => Json(json!({"valid": false, "error": format!("{e:#}")})).into_response(),
     }
 }
 
-async fn api_config_save(
-    State(state): S,
-    headers: HeaderMap,
-    Json(body): Json<ConfigBody>,
-) -> Response {
-    if let Err(r) = check_auth(&state, &headers) {
-        return *r;
-    }
+async fn api_config_save(State(state): S, Json(body): Json<ConfigBody>) -> Response {
     // Always validate before persisting.
     let warnings = match config::parse(&body.content) {
         Ok((_cfg, w)) => w,
@@ -323,10 +373,7 @@ async fn api_config_save(
         .into_response()
 }
 
-async fn api_config_reload(State(state): S, headers: HeaderMap) -> Response {
-    if let Err(r) = check_auth(&state, &headers) {
-        return *r;
-    }
+async fn api_config_reload(State(state): S) -> Response {
     let (tx, rx) = oneshot::channel();
     if state
         .control
@@ -347,10 +394,7 @@ async fn api_config_reload(State(state): S, headers: HeaderMap) -> Response {
     }
 }
 
-async fn api_config_rollback(State(state): S, headers: HeaderMap) -> Response {
-    if let Err(r) = check_auth(&state, &headers) {
-        return *r;
-    }
+async fn api_config_rollback(State(state): S) -> Response {
     let (tx, rx) = oneshot::channel();
     if state
         .control
@@ -372,5 +416,76 @@ async fn api_config_rollback(State(state): S, headers: HeaderMap) -> Response {
             "rollback did not complete",
         )
             .into_response(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt;
+
+    fn test_state(token: &str) -> Arc<AppState> {
+        let (control, _rx) = mpsc::channel(1);
+        Arc::new(AppState {
+            engine: RwLock::new(None),
+            logs: LogBuffer::default(),
+            config_path: PathBuf::from("/nonexistent/agent.yaml"),
+            control,
+            uptime: Uptime::default(),
+            auth_token: token.to_string(),
+        })
+    }
+
+    #[tokio::test]
+    async fn healthz_is_the_only_unauthenticated_route() {
+        let app = router(test_state("secret-token"));
+        let guarded = [
+            "/metrics",
+            "/api/status",
+            "/api/inputs",
+            "/api/outputs",
+            "/api/buffer",
+            "/api/logs",
+            "/api/about",
+            "/api/config",
+        ];
+        for path in guarded {
+            let res = app
+                .clone()
+                .oneshot(Request::get(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(res.status(), StatusCode::UNAUTHORIZED, "{path} was open");
+        }
+        let res = app
+            .oneshot(Request::get("/healthz").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_ne!(res.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn a_valid_bearer_token_is_accepted() {
+        let app = router(test_state("secret-token"));
+        let res = app
+            .oneshot(
+                Request::get("/api/about")
+                    .header("authorization", "Bearer secret-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn generated_tokens_are_long_and_unique() {
+        let a = generate_token();
+        let b = generate_token();
+        assert_eq!(a.len(), 64);
+        assert_ne!(a, b);
     }
 }
