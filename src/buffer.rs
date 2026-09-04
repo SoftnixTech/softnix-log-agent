@@ -243,13 +243,17 @@ impl DiskQueue {
             let start = if seg == pos.seg { pos.off } else { 0 };
             let path = seg_path(&inner.dir, seg);
             let mut f = File::open(&path)?;
+            // Bound the length check on the file's actual size, not the
+            // configured segment size — a legitimate record can exceed
+            // `segment_size_mb` (see `read_record`'s doc comment).
+            let file_len = f.metadata()?.len();
             f.seek(SeekFrom::Start(start))?;
             let mut off = start;
             loop {
                 if out.len() >= max {
                     break;
                 }
-                match read_record(&mut f, self.seg_bytes)? {
+                match read_record(&mut f, file_len)? {
                     RecordRead::Ok { payload, rec_len } => {
                         off += rec_len;
                         match serde_json::from_slice::<Event>(&payload) {
@@ -351,8 +355,9 @@ impl DiskQueue {
                 0
             };
             let mut f = File::open(seg_path(&inner.dir, seg)).ok()?;
+            let file_len = f.metadata().ok()?.len();
             f.seek(SeekFrom::Start(start)).ok()?;
-            if let Ok(RecordRead::Ok { payload, .. }) = read_record(&mut f, self.seg_bytes) {
+            if let Ok(RecordRead::Ok { payload, .. }) = read_record(&mut f, file_len) {
                 if let Ok(ev) = serde_json::from_slice::<Event>(&payload) {
                     return Some((chrono::Utc::now() - ev.received_at).num_seconds());
                 }
@@ -484,7 +489,14 @@ enum RecordRead {
 /// Read one record. A CRC mismatch is reported as `Corrupt` with the number of
 /// bytes to step over, so the reader can make progress instead of parking on it
 /// forever (which pins a core at 100% via the empty-batch loop in outputs.rs).
-fn read_record(f: &mut File, seg_bytes: u64) -> Result<RecordRead> {
+///
+/// `max_believable_len` must be a safe upper bound on a real record's length —
+/// i.e. the actual size of the file being read, not the configured segment
+/// size. A single record legitimately written by `push` can exceed
+/// `segment_size_mb` (the rollover check only runs *after* the write), so
+/// using the configured size here would misclassify a valid oversized record
+/// as `Eof` and permanently stall the reader at that offset.
+fn read_record(f: &mut File, max_believable_len: u64) -> Result<RecordRead> {
     let mut header = [0u8; 8];
     match f.read_exact(&mut header) {
         Ok(()) => {}
@@ -495,7 +507,7 @@ fn read_record(f: &mut File, seg_bytes: u64) -> Result<RecordRead> {
     let crc = u32::from_le_bytes(header[4..8].try_into().unwrap());
     // A length header that cannot be real means the framing is lost; there is
     // no safe skip distance, so give up on the rest of this segment.
-    if len == 0 || len > seg_bytes {
+    if len == 0 || len > max_believable_len {
         return Ok(RecordRead::Eof);
     }
     let mut payload = vec![0u8; len as usize];
@@ -673,6 +685,37 @@ mod tests {
         // The critical property: peek advanced past the corrupt record, so a
         // second call cannot return an empty batch forever.
         q.ack(batch.len() as u64).unwrap();
+        assert!(q.peek_batch(10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn peek_batch_returns_a_record_larger_than_the_configured_segment_size() {
+        // segment_size_mb: 1 (see `cfg()` above), but push() only checks for
+        // rollover *after* writing a record in full, so a single legitimate
+        // record can exceed the configured segment size. Before the fix,
+        // read_record compared the length header against `self.seg_bytes`
+        // (the configured 1 MiB) instead of the file's actual size, so this
+        // record was misclassified as Eof and `peek_batch` returned nothing
+        // for it - permanently, since the peek offset never advanced past it.
+        let dir = tempfile::tempdir().unwrap();
+        let q = DiskQueue::open(dir.path(), "d1", &cfg(16, FullPolicy::Block)).unwrap();
+        let huge = "z".repeat(2 * 1024 * 1024); // record body > 1 MiB segment_size_mb
+        assert!(matches!(
+            q.push(&Event::new("t", "raw", &huge)).unwrap(),
+            PushOutcome::Stored { .. }
+        ));
+        assert_eq!(q.len(), 1);
+
+        let batch = q.peek_batch(10).unwrap();
+        assert_eq!(
+            batch.len(),
+            1,
+            "a legitimate oversized record must not be treated as Eof"
+        );
+        assert_eq!(batch[0].message, huge);
+
+        // The offset must have advanced past the record, not stayed pinned.
+        q.ack(1).unwrap();
         assert!(q.peek_batch(10).unwrap().is_empty());
     }
 
