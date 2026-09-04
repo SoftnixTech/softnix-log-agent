@@ -66,11 +66,13 @@ web:
 |---|---|---|---|
 | `data_dir` | path | `data` | โฟลเดอร์หลักเก็บ state (offset ไฟล์, bookmark ของ Event Log) และคิวบนดิสก์ การติดตั้งแบบ service จะตั้งเป็น path เต็ม (`/var/lib/softnix-log-agent`, `C:\ProgramData\Softnix\LogAgent`) |
 | `log_level` | string | `info` | ระดับ log ของตัว agent เอง: `trace`, `debug`, `info`, `warn`, `error` |
+| `state_retention_hours` | integer | `24` | ระยะเวลาที่ cursor ของไฟล์จะถูกเก็บไว้โดยไม่ถูกแตะต้อง (เช่น ไฟล์ที่ถูก rotate ทิ้งไปแล้ว) ก่อนจะถูกลบออกจาก `state.json` การลบ (pruning) จะทำงานทุกครั้งที่มีการ flush state ตามรอบ (ทุก 5 วินาที) ไม่ใช่ตามรอบรายชั่วโมงแยกต่างหากอีกต่อไป |
 
 ```yaml
 agent:
   data_dir: /var/lib/softnix-log-agent
   log_level: info
+  state_retention_hours: 24
 ```
 
 ---

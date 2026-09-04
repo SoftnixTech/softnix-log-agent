@@ -292,6 +292,7 @@ impl Engine {
         std::fs::create_dir_all(data_dir)
             .with_context(|| format!("cannot create data dir {}", data_dir.display()))?;
         let state = Arc::new(StateManager::open(data_dir)?);
+        state.set_retention_secs(cfg.agent.state_retention_hours as i64 * 3600);
         let metrics = Arc::new(Metrics::default());
         let status = Arc::new(StatusRegistry::default());
 
@@ -414,16 +415,11 @@ impl Engine {
             let state = state.clone();
             let cancel = cancel.child_token();
             tasks.push(tokio::spawn(async move {
-                let mut prune_tick = 0u32;
                 loop {
                     tokio::select! {
                         _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
                             if let Err(e) = state.flush() {
                                 tracing::warn!("state flush failed: {e}");
-                            }
-                            prune_tick += 1;
-                            if prune_tick % 720 == 0 {
-                                state.prune(7 * 24 * 3600);
                             }
                         }
                         _ = cancel.cancelled() => return,

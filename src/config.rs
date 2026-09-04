@@ -32,6 +32,10 @@ pub struct AgentConfig {
     /// Agent self-log level: trace|debug|info|warn|error
     #[serde(default = "default_log_level")]
     pub log_level: String,
+    /// How long a file cursor may go untouched before it is pruned from
+    /// state.json (rotated-away files). Default 24h.
+    #[serde(default = "default_state_retention_hours")]
+    pub state_retention_hours: u64,
 }
 
 impl Default for AgentConfig {
@@ -39,6 +43,7 @@ impl Default for AgentConfig {
         AgentConfig {
             data_dir: default_data_dir(),
             log_level: default_log_level(),
+            state_retention_hours: default_state_retention_hours(),
         }
     }
 }
@@ -48,6 +53,9 @@ fn default_data_dir() -> PathBuf {
 }
 fn default_log_level() -> String {
     "info".to_string()
+}
+fn default_state_retention_hours() -> u64 {
+    24
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]

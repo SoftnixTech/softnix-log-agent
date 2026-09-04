@@ -5,8 +5,12 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::Mutex;
+
+fn now_secs() -> i64 {
+    chrono::Utc::now().timestamp()
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct StateFile {
@@ -34,6 +38,7 @@ pub struct StateManager {
     path: PathBuf,
     state: Mutex<StateFile>,
     dirty: AtomicBool,
+    retention_secs: AtomicI64,
 }
 
 impl StateManager {
@@ -52,11 +57,21 @@ impl StateManager {
             path,
             state: Mutex::new(state),
             dirty: AtomicBool::new(false),
+            retention_secs: AtomicI64::new(24 * 3600),
         })
     }
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    pub fn is_dirty(&self) -> bool {
+        self.dirty.load(Ordering::Relaxed)
+    }
+
+    /// Override the cursor-retention window (default 24h, set at `open`).
+    pub fn set_retention_secs(&self, secs: i64) {
+        self.retention_secs.store(secs, Ordering::Relaxed);
     }
 
     pub fn get_cursor(&self, input_id: &str, identity: &str) -> Option<FileCursor> {
@@ -66,15 +81,34 @@ impl StateManager {
 
     pub fn set_cursor(&self, input_id: &str, identity: &str, path: &str, offset: u64) {
         let key = format!("{input_id}|{identity}");
+        let now = now_secs();
         let mut st = self.state.lock().unwrap();
-        st.files.insert(
-            key,
-            FileCursor {
-                path: path.to_string(),
-                offset,
-                touched: chrono::Utc::now().timestamp(),
-            },
-        );
+        if let Some(existing) = st.files.get_mut(&key) {
+            if existing.offset == offset {
+                // The tailer calls this on every poll for every idle file. Only
+                // refresh `touched` (and dirty the file) once a minute, or a
+                // host with a few hundred idle files rewrites the whole state
+                // file every 5 seconds forever.
+                if now.saturating_sub(existing.touched) < 60 {
+                    return;
+                }
+                existing.touched = now;
+                self.dirty.store(true, Ordering::Relaxed);
+                return;
+            }
+            existing.offset = offset;
+            existing.path = path.to_string();
+            existing.touched = now;
+        } else {
+            st.files.insert(
+                key,
+                FileCursor {
+                    offset,
+                    path: path.to_string(),
+                    touched: now,
+                },
+            );
+        }
         self.dirty.store(true, Ordering::Relaxed);
     }
 
@@ -117,14 +151,17 @@ impl StateManager {
         }
     }
 
-    /// Persist if dirty. Atomic write (tmp file + rename).
+    /// Persist if dirty. Atomic write (tmp file + rename), compact JSON, and
+    /// prunes cursors older than the configured retention window on every call.
     pub fn flush(&self) -> Result<()> {
         if !self.dirty.swap(false, Ordering::Relaxed) {
             return Ok(());
         }
+        let cutoff = now_secs().saturating_sub(self.retention_secs.load(Ordering::Relaxed));
         let bytes = {
-            let st = self.state.lock().unwrap();
-            serde_json::to_vec_pretty(&*st)?
+            let mut st = self.state.lock().unwrap();
+            st.files.retain(|_, c| c.touched >= cutoff);
+            serde_json::to_vec(&*st)?
         };
         crate::fsutil::write_atomic(&self.path, &bytes)
             .with_context(|| format!("cannot write state file {}", self.path.display()))?;
@@ -150,5 +187,31 @@ mod tests {
         assert_eq!(c.offset, 1234);
         assert!(sm.is_known_input("in1"));
         assert!(!sm.is_known_input("in2"));
+    }
+
+    #[test]
+    fn repeating_the_same_offset_does_not_dirty_the_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let st = StateManager::open(dir.path()).unwrap();
+        st.set_cursor("in1", "ident", "/var/log/a.log", 100);
+        st.flush().unwrap();
+        assert!(!st.is_dirty());
+        st.set_cursor("in1", "ident", "/var/log/a.log", 100);
+        assert!(
+            !st.is_dirty(),
+            "an unchanged offset must not force a rewrite"
+        );
+        st.set_cursor("in1", "ident", "/var/log/a.log", 200);
+        assert!(st.is_dirty(), "a real advance must still be persisted");
+    }
+
+    #[test]
+    fn state_is_written_compactly() {
+        let dir = tempfile::tempdir().unwrap();
+        let st = StateManager::open(dir.path()).unwrap();
+        st.set_cursor("in1", "ident", "/var/log/a.log", 100);
+        st.flush().unwrap();
+        let text = std::fs::read_to_string(dir.path().join("state.json")).unwrap();
+        assert!(!text.contains("\n  "), "state must not be pretty-printed");
     }
 }

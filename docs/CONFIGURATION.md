@@ -66,11 +66,13 @@ Process-wide settings.
 |---|---|---|---|
 | `data_dir` | path | `data` | Base directory for state (file offsets, Event Log bookmarks) and the persistent queue. Service installs set an absolute path (`/var/lib/softnix-log-agent`, `C:\ProgramData\Softnix\LogAgent`). |
 | `log_level` | string | `info` | Agent's own log verbosity: `trace`, `debug`, `info`, `warn`, `error`. |
+| `state_retention_hours` | integer | `24` | How long a file cursor may go untouched (e.g. a rotated-away file) before it is pruned from `state.json`. Pruning runs on every periodic state flush (every 5s), not on a separate hourly timer. |
 
 ```yaml
 agent:
   data_dir: /var/lib/softnix-log-agent
   log_level: info
+  state_retention_hours: 24
 ```
 
 ---
