@@ -1268,6 +1268,38 @@ and any cross-site request, as defence in depth behind the bearer token."
 **Interfaces:**
 - Consumes: nothing.
 - Produces: `pub fn crate::config::parse(text: &str) -> Result<(Config, Vec<String>)>` — unchanged signature, but any `Err` it returns has every env-expanded value replaced with `***`. Redaction happens inside `parse`, so every caller (`web.rs`, `main.rs`, `validate_cmd`) is protected without changes.
+- `expand_env`'s signature changes from `pub fn expand_env(raw: &str) -> Result<String>` to `pub fn expand_env(raw: &str) -> Result<(String, Vec<String>)>` — **stays `pub`, stays fallible**. The existing `${VAR:-default}` regex-based parsing and the "undefined required variable" hard error are unrelated to this finding (H-3 is only about not echoing *values* back in error messages) and must not be removed. Two existing tests call `expand_env` directly and both need a one-line update for the new return shape — see Step 3.
+
+**Ground truth, read from the actual file before writing this task**, since a prior version of this task invented a different signature that would not have compiled: the real `expand_env` is
+```rust
+pub fn expand_env(raw: &str) -> Result<String> {
+    let re = regex::Regex::new(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}").unwrap();
+    let mut missing = Vec::new();
+    let out = re
+        .replace_all(raw, |caps: &regex::Captures| {
+            let var = &caps[1];
+            match std::env::var(var) {
+                Ok(v) => v,
+                Err(_) => match caps.get(2) {
+                    Some(d) => d.as_str().to_string(),
+                    None => {
+                        missing.push(var.to_string());
+                        String::new()
+                    }
+                },
+            }
+        })
+        .into_owned();
+    if !missing.is_empty() {
+        bail!(
+            "undefined environment variable(s) referenced in config: {}",
+            missing.join(", ")
+        );
+    }
+    Ok(out)
+}
+```
+and it has two existing callers to account for: `src/config.rs` line ~518, `let expanded = expand_env(raw)?;` inside `parse`, and two existing tests — `env_expansion` (`let s = expand_env(...).unwrap(); assert!(s.contains(...)); ...; assert!(expand_env(...).is_err());`) and a newer one added by a prior task, `loads_shipped_example_env_expansion_with_no_env_vars_set` (`expand_env(&raw).unwrap_or_else(|e| panic!(...));`, return value otherwise unused). Both must still compile against the new `Result<(String, Vec<String>)>` shape.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -1292,41 +1324,48 @@ and any cross-site request, as defence in depth behind the bearer token."
 Run: `cargo test --lib config::tests::parse_errors_never_echo_expanded_env_values`
 Expected: FAIL — `error leaked the env value: agent.log_level must be one of ... (got "hunter2-super-secret")`.
 
-- [ ] **Step 3: Make `expand_env` report what it substituted**
+- [ ] **Step 3: Make `expand_env` report what it substituted, keeping everything it already does**
 
-Change `expand_env` to collect every value it inserted:
+Add a `secrets: Vec<String>` collected alongside the existing substitution loop — this is additive to the real function above, not a rewrite of its parsing logic:
 
 ```rust
-/// Expand `${VAR}` references. Returns the expanded text plus every value that
-/// was substituted, so error messages can be scrubbed of them — a validation
-/// error that echoes an expanded value turns /api/config/validate into an
-/// oracle for reading the root process's environment.
-fn expand_env(text: &str) -> (String, Vec<String>) {
+/// Expand `${VAR}` and `${VAR:-default}` references. Returns the expanded text
+/// plus every value that came from a *real environment variable* (not a literal
+/// `:-default`, which isn't a secret pulled from the environment), so error
+/// messages can be scrubbed of them — a validation error that echoes an
+/// expanded value turns /api/config/validate into an oracle for reading the
+/// root process's environment.
+pub fn expand_env(raw: &str) -> Result<(String, Vec<String>)> {
+    let re = regex::Regex::new(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}").unwrap();
+    let mut missing = Vec::new();
     let mut secrets = Vec::new();
-    let mut out = String::with_capacity(text.len());
-    let mut rest = text;
-    while let Some(start) = rest.find("${") {
-        out.push_str(&rest[..start]);
-        let after = &rest[start + 2..];
-        match after.find('}') {
-            Some(end) => {
-                let name = &after[..end];
-                let value = std::env::var(name).unwrap_or_default();
-                if !value.is_empty() {
-                    secrets.push(value.clone());
+    let out = re
+        .replace_all(raw, |caps: &regex::Captures| {
+            let var = &caps[1];
+            match std::env::var(var) {
+                Ok(v) => {
+                    if !v.is_empty() {
+                        secrets.push(v.clone());
+                    }
+                    v
                 }
-                out.push_str(&value);
-                rest = &after[end + 1..];
+                Err(_) => match caps.get(2) {
+                    Some(d) => d.as_str().to_string(),
+                    None => {
+                        missing.push(var.to_string());
+                        String::new()
+                    }
+                },
             }
-            None => {
-                out.push_str(&rest[start..]);
-                rest = "";
-                break;
-            }
-        }
+        })
+        .into_owned();
+    if !missing.is_empty() {
+        bail!(
+            "undefined environment variable(s) referenced in config: {}",
+            missing.join(", ")
+        );
     }
-    out.push_str(rest);
-    (out, secrets)
+    Ok((out, secrets))
 }
 
 /// Replace every substituted env value in an error message with `***`.
@@ -1341,23 +1380,37 @@ fn redact(msg: String, secrets: &[String]) -> String {
 }
 ```
 
+Update the two existing tests for the new return shape (both are simple one-line changes, not a rewrite of what they assert):
+- `env_expansion`: `let s = expand_env(...).unwrap();` → `let (s, _secrets) = expand_env(...).unwrap();` (the rest of the test — `assert!(s.contains("6601"))`, `assert!(s.contains("fallback"))`, `assert!(expand_env(...).is_err())` — is unchanged, since `.is_err()` still works on `Result<(String, Vec<String>)>`).
+- `loads_shipped_example_env_expansion_with_no_env_vars_set`: `expand_env(&raw).unwrap_or_else(|e| panic!(...));` needs no change at all — the return value is already discarded, and `.unwrap_or_else` on the error variant works identically regardless of the `Ok` payload's shape.
+
 - [ ] **Step 4: Redact inside `parse`**
 
-Wrap the body of `parse` so every error path is scrubbed:
+Wrap the body of `parse` so every error path is scrubbed. Extract the existing post-expansion body (YAML deserialize + `validate`) into a new private `parse_expanded`, and have `parse` call the corrected `expand_env` and redact any error it returns:
 
 ```rust
-pub fn parse(text: &str) -> Result<(Config, Vec<String>)> {
-    let (expanded, secrets) = expand_env(text);
+pub fn parse(raw: &str) -> Result<(Config, Vec<String>)> {
+    let (expanded, secrets) = expand_env(raw)?;
     parse_expanded(&expanded).map_err(|e| anyhow::anyhow!(redact(format!("{e:#}"), &secrets)))
+}
+
+fn parse_expanded(expanded: &str) -> Result<(Config, Vec<String>)> {
+    let cfg: Config = serde_yaml::from_str(expanded).map_err(|e| {
+        anyhow::anyhow!(
+            "YAML parse error: {e}\nHint: check field names and indentation; run `softnix-log-agent validate` for details"
+        )
+    })?;
+    let warnings = validate(&cfg)?;
+    Ok((cfg, warnings))
 }
 ```
 
-where `parse_expanded` is the existing body from the point after expansion (deserialize + `validate`). Keep `validate`'s messages as they are — they are useful, and redaction now happens above them.
+`parse_expanded` is exactly the tail of the current `parse` (everything after the `expand_env` call) — moved, not rewritten. `load`'s existing body (`parse(&raw)...`) needs no change, since `parse`'s public signature is unchanged.
 
 - [ ] **Step 5: Run the tests**
 
 Run: `cargo test --lib config`
-Expected: PASS, including existing config tests.
+Expected: PASS, including existing config tests (`env_expansion`, `loads_shipped_example_env_expansion_with_no_env_vars_set`, and every other test in the module).
 
 - [ ] **Step 6: Commit**
 
