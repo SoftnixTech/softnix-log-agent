@@ -349,6 +349,14 @@ impl DiskQueue {
         inner.bytes + avg >= self.max_bytes
     }
 
+    /// The full-queue policy this queue was configured with. Lets callers
+    /// (e.g. `/healthz`) distinguish a `block` queue that is genuinely
+    /// stalled from a `drop_oldest`/`drop_newest` queue sitting at its cap as
+    /// normal, correct operation.
+    pub fn policy(&self) -> FullPolicy {
+        self.policy
+    }
+
     pub fn dropped(&self) -> u64 {
         self.dropped.load(Ordering::Relaxed)
     }

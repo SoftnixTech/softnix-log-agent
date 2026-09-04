@@ -376,6 +376,14 @@ outputs:
     type: syslog
     protocol: udp
     address: 127.0.0.1:{sink_port}
+    # drop_oldest so the healthy destination's own 1 MiB queue (it shares
+    # `buffer.max_size_mb` with "stuck" - there is no per-output size
+    # override) never itself blocks under the same flood of filler events;
+    # otherwise the test would conflate "healthy self-throttling on its own
+    # queue" with the isolation property actually under test. UDP delivery is
+    # near-instant, so in practice this destination is never really behind -
+    # this only guards the test's own filler flood.
+    full_policy: drop_oldest
 web:
   enabled: false
 "#,
@@ -388,8 +396,46 @@ web:
     let engine = softnix_log_agent::engine::Engine::start(cfg).await.unwrap();
 
     let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    for i in 0..200 {
-        let line = format!("<14>Jun 10 10:00:00 h1 app: event {i}");
+
+    // Phase 1: flood "stuck" past the point where it can possibly still be
+    // absorbing events unimpeded, so its router genuinely parks in
+    // `push_blocking`. This has to overflow *three* buffers, not just the 1
+    // MiB disk queue: the kernel TCP send/receive buffers between the output
+    // worker and the never-reading peer (macOS/Linux both auto-tune these up
+    // to several MiB - observed up to 4 MiB each way on this host, i.e. ~8
+    // MiB of data the OS will silently absorb before a `write` actually
+    // blocks), and the per-destination router channel (`ROUTER_CAPACITY` =
+    // 256 in `src/engine.rs`) sitting in front of the disk queue. Only once
+    // all three are full does the router's `push_blocking` genuinely park
+    // and the channel in front of it back up - which is the only state in
+    // which `tx.send`/`tx.try_send` on that channel is actually exercised at
+    // capacity. A serialized Event carries both `message` and `raw_message`
+    // (roughly doubling the effective size), so a ~8 KiB body comes out to
+    // roughly 16 KiB on the wire; sending well over 1000 of them clears the
+    // ~8 MiB of kernel + disk-queue headroom with margin. Too little data
+    // here means "stuck" never actually parks, its router never blocks, and
+    // the bug this test exists to catch never triggers - which is exactly
+    // what silently happened with an earlier, too-small version of this
+    // test.
+    let padding = "x".repeat(8192);
+    for i in 0..1200 {
+        let line = format!("<14>Jun 10 10:00:00 h1 app: filler {i} {padding}");
+        client
+            .send_to(line.as_bytes(), ("127.0.0.1", in_port))
+            .await
+            .unwrap();
+    }
+
+    // Phase 2: with "stuck" now genuinely backed up, send events that only
+    // the healthy destination should keep receiving. Under the pre-fix
+    // blocking `tx.send`, the fan-out loop in `route_event` stalls forever on
+    // the full "stuck" channel and none of these ever reach the healthy
+    // sink - this is exactly the C-3 bug re-appearing one layer up. Under the
+    // fix (`try_send`), "stuck" sheds the marker events it can't accept and
+    // "healthy" keeps flowing untouched.
+    const MARKERS: usize = 50;
+    for i in 0..MARKERS {
+        let line = format!("<14>Jun 10 10:00:00 h1 app: MARKER {i}");
         client
             .send_to(line.as_bytes(), ("127.0.0.1", in_port))
             .await
@@ -397,24 +443,25 @@ web:
     }
 
     let mut buf = vec![0u8; 65535];
-    let mut received = 0;
+    let mut markers_received = 0;
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
-    while tokio::time::Instant::now() < deadline && received < 50 {
+    while tokio::time::Instant::now() < deadline && markers_received < MARKERS {
         if let Ok(Ok((n, _))) = tokio::time::timeout(
             std::time::Duration::from_millis(500),
             sink.recv_from(&mut buf),
         )
         .await
         {
-            if n > 0 {
-                received += 1;
+            if n > 0 && buf[..n].windows(6).any(|w| w == b"MARKER") {
+                markers_received += 1;
             }
         }
     }
     engine.stop().await;
     assert!(
-        received >= 50,
-        "healthy destination only got {received} events"
+        markers_received >= MARKERS / 2,
+        "healthy destination only got {markers_received}/{MARKERS} marker events sent \
+         after the stuck destination backed up"
     );
 }
 

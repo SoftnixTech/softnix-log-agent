@@ -1,7 +1,7 @@
 //! Minimal web GUI + JSON API. Single embedded HTML page, no frontend
 //! framework, no build step — appliance-style.
 
-use crate::config::{self, WebConfig};
+use crate::config::{self, FullPolicy, WebConfig};
 use crate::engine::EngineShared;
 use crate::event::AGENT_VERSION;
 use crate::logbuf::LogBuffer;
@@ -297,7 +297,11 @@ async fn healthz(State(state): S) -> Response {
     let full: Vec<&String> = eng
         .queues
         .iter()
-        .filter(|(_, q)| q.is_full())
+        // A full `drop_oldest`/`drop_newest` queue is normal, correct
+        // operation — it is designed to sit at its cap and shed load rather
+        // than stall. Only a full `block` queue means the pipeline is
+        // genuinely stalled, so only that policy counts as degraded here.
+        .filter(|(_, q)| q.is_full() && q.policy() == FullPolicy::Block)
         .map(|(id, _)| id)
         .collect();
     if full.is_empty() {
@@ -351,7 +355,10 @@ async fn metrics_text(State(state): S) -> Response {
         ));
         out.push_str(&format!(
             "agent_queue_full{{output=\"{id}\"}} {}\n",
-            u8::from(q.is_full())
+            // Same policy-aware gating as /healthz: a full drop_* queue is
+            // shedding load as configured, not stalled, so it does not trip
+            // this signal.
+            u8::from(q.is_full() && q.policy() == FullPolicy::Block)
         ));
     }
     for o in eng.status.outputs_snapshot() {

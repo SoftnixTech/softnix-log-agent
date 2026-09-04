@@ -18,8 +18,8 @@ To expose it beyond localhost set `web.bind: 0.0.0.0` **and** `web.auth_token` �
 
 ## Monitoring
 
-- `GET /healthz` — 200 (`{"status":"ok"}`) when the engine is running and every destination queue has room; 503 when the engine is not running, or when any destination queue is full (`{"status":"degraded","queues_full":[...]}`) — see [Backpressure and the full-queue policy](#backpressure-and-the-full-queue-policy) below. Wire into your existing checks.
-- `GET /metrics` — Prometheus-style text: `agent_events_received_total`, `agent_events_sent_total`, `agent_events_failed_total`, `agent_events_dropped_total`, `agent_errors_total`, `agent_queue_events{destination=…}`, `agent_queue_bytes{…}`, `agent_queue_dropped_total{…}`, `agent_queue_full{output=…}` (1 when that destination's queue is full, 0 otherwise), `agent_output_healthy{…}`, `agent_uptime_seconds`.
+- `GET /healthz` — 200 (`{"status":"ok"}`) when the engine is running and no `block`-policy destination queue is full; 503 when the engine is not running, or when a `block`-policy destination queue is full (`{"status":"degraded","queues_full":[...]}`) — see [Backpressure and the full-queue policy](#backpressure-and-the-full-queue-policy) below. A full `drop_oldest`/`drop_newest` queue does **not** trigger this — it is shedding load exactly as configured, not stalled. Wire into your existing checks, but see the liveness-probe note below.
+- `GET /metrics` — Prometheus-style text: `agent_events_received_total`, `agent_events_sent_total`, `agent_events_failed_total`, `agent_events_dropped_total`, `agent_errors_total`, `agent_queue_events{destination=…}`, `agent_queue_bytes{…}`, `agent_queue_dropped_total{…}`, `agent_queue_full{output=…}` (1 when that destination's queue is full **and** its policy is `block`, 0 otherwise — same policy-aware gating as `/healthz`), `agent_output_healthy{…}`, `agent_uptime_seconds`.
 - `GET /api/status|inputs|outputs|buffer|logs|about` — JSON equivalents used by the GUI.
 
 Alert suggestions: `agent_output_healthy == 0` for >5 min; `agent_queue_bytes` approaching `buffer.max_size_mb`; `agent_queue_full == 1` for any destination (collection may be stalled for that destination — see below); `agent_events_dropped_total` increasing; `agent_uptime_seconds` resets (crash loop).
@@ -28,9 +28,15 @@ Alert suggestions: `agent_output_healthy == 0` for >5 min; `agent_queue_bytes` a
 
 `buffer.full_policy: block` is the shipped **default**, and it is correct for
 compliance collection: the agent never silently discards a log. Each
-destination has its own on-disk queue and its own routing task, so a slow or
-unreachable destination only ever backs up *its own* queue — it does not
-stall delivery to any other, healthy destination.
+destination has its own on-disk queue and its own routing task, fed by its
+own bounded in-memory channel, so a slow or unreachable destination only ever
+backs up *its own* queue — it does not stall delivery to any other, healthy
+destination. The fan-out from the pipeline to each destination's channel uses
+a non-blocking send: if a specific destination's channel is full, that one
+event is dropped for that destination only (counted in
+`agent_events_dropped_total`) and the pipeline immediately moves on to the
+next destination and the next event. No destination's state can block
+another destination's channel, the pipeline, or any input.
 
 The tradeoff of `block` is that when a destination's queue genuinely fills
 (the destination has been down, or too slow, for long enough to exhaust
@@ -40,9 +46,16 @@ until the destination recovers or the operator intervenes. This is the
 intended meaning of "never drop a log," but it must not go unnoticed:
 
 - `GET /healthz` returns `503` with `{"status":"degraded","queues_full":[...]}`
-  naming every full queue.
+  naming every full `block`-policy queue.
 - `GET /metrics` exposes `agent_queue_full{output="<id>"} 1` for the same
   destinations.
+
+Under sustained backpressure, `block` still means "never drop while there's
+room" — but room is now bounded by the destination's ~256-event in-memory
+channel *plus* its on-disk queue capacity, not infinite blocking. Once both
+are full, new events for that destination are shed (and counted) rather than
+stalling the agent, while the destination's queue itself continues obeying
+`block` semantics for everything already accepted into it.
 
 If a particular destination is noisy or non-critical and you would rather
 shed load than stall, override the policy for that output alone:
@@ -57,6 +70,20 @@ outputs:
 
 Leave `full_policy` unset on outputs where loss is unacceptable — they keep
 inheriting `buffer.full_policy` (`block` by default).
+
+### `/healthz` is readiness-shaped, not pure liveness
+
+Because `/healthz` now returns `503` specifically when a `block`-policy
+destination's queue is stuck full, it is telling you "a destination is
+stuck," not "the agent is broken." If it is wired to a restart trigger
+(systemd `Restart=`, a Kubernetes liveness probe), a stuck destination will
+cause the agent to be restarted repeatedly — and a restart does not fix a
+stuck downstream target, it just adds redelivery churn on top of an already
+degraded destination. Prefer wiring `/healthz` to an alert or to a
+**readiness** probe (taking the instance out of rotation, not restarting it)
+rather than a liveness/restart trigger. If you need a pure liveness signal
+(agent process is alive at all, independent of destination health), use
+`agent_uptime_seconds` from `/metrics` instead.
 
 ## Sizing & tuning
 

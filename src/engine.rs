@@ -337,13 +337,28 @@ async fn route_event(
                 continue;
             }
         }
-        // Under `block` this awaits, which is the documented behaviour: a
-        // destination that cannot keep up applies backpressure rather than
-        // dropping. Only this destination's router channel is affected, so a
-        // stuck destination cannot stall its siblings. /healthz reports the
-        // condition via `DiskQueue::is_full`.
-        if tx.send(Arc::clone(&ev)).await.is_err() {
-            metrics.record_error(format!("router {} closed", out.id));
+        // A blocking send here would defeat the whole point of per-destination
+        // routers: if THIS destination's channel is full because its router is
+        // genuinely parked on a full, block-policy disk queue, blocking on the
+        // send would stall every other destination and eventually every input
+        // too — the exact bug this fan-out exists to prevent. try_send instead:
+        // when the channel is full, the event is dropped for this destination
+        // only, counted, and every other destination keeps flowing untouched.
+        // Losing this one event does not violate `block`'s "never drop" promise
+        // at the persistent-queue layer — a full channel here means the disk
+        // queue behind it is already full and would have blocked this exact
+        // event anyway; the only difference is that OTHER destinations no
+        // longer pay for it.
+        match tx.try_send(Arc::clone(&ev)) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                metrics
+                    .events_dropped
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                metrics.record_error(format!("router {} closed", out.id));
+            }
         }
     }
 }
