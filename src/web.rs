@@ -62,12 +62,19 @@ pub async fn serve(
 pub fn router(state: Arc<AppState>) -> Router {
     // /healthz is deliberately outside the auth layer: it is the liveness probe
     // for systemd, Kubernetes and the customer's monitoring, and carries no data.
+    //
+    // / is also public: it serves UI_HTML, a compile-time constant with no
+    // server-side interpolation of config, secrets or runtime state. It must be
+    // reachable without a token because a browser's plain navigation to
+    // /#token=<t> never sends the fragment to the server — the embedded JS that
+    // reads the fragment and retries with it can't run if the shell itself 401s.
+    // Every route that actually reads or mutates state stays guarded below.
     let public = Router::new()
+        .route("/", get(ui))
         .route("/healthz", get(healthz))
         .with_state(state.clone());
 
     let guarded = Router::new()
-        .route("/", get(ui))
         .route("/metrics", get(metrics_text))
         .route("/api/status", get(api_status))
         .route("/api/inputs", get(api_inputs))
@@ -439,7 +446,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn healthz_is_the_only_unauthenticated_route() {
+    async fn only_root_and_healthz_are_unauthenticated() {
         let app = router(test_state("secret-token"));
         let guarded = [
             "/metrics",
@@ -459,11 +466,42 @@ mod tests {
                 .unwrap();
             assert_eq!(res.status(), StatusCode::UNAUTHORIZED, "{path} was open");
         }
-        let res = app
-            .oneshot(Request::get("/healthz").body(Body::empty()).unwrap())
+        for path in ["/", "/healthz"] {
+            let res = app
+                .clone()
+                .oneshot(Request::get(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_ne!(
+                res.status(),
+                StatusCode::UNAUTHORIZED,
+                "{path} should be public"
+            );
+        }
+    }
+
+    /// The GUI shell (`/`) must load with no Authorization header at all — a
+    /// cold browser tab navigating to `/#token=<t>` sends no header, since URL
+    /// fragments never reach the server — while every other route, including
+    /// `/api/about`, stays guarded. This pins the split to exactly
+    /// `{/, /healthz}` public vs. everything else, not an accidental
+    /// full bypass.
+    #[tokio::test]
+    async fn root_is_public_but_api_about_is_not() {
+        let app = router(test_state("secret-token"));
+
+        let root_res = app
+            .clone()
+            .oneshot(Request::get("/").body(Body::empty()).unwrap())
             .await
             .unwrap();
-        assert_ne!(res.status(), StatusCode::UNAUTHORIZED);
+        assert_ne!(root_res.status(), StatusCode::UNAUTHORIZED);
+
+        let about_res = app
+            .oneshot(Request::get("/api/about").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(about_res.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
