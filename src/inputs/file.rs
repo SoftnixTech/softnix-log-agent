@@ -425,7 +425,11 @@ mod tests {
             std::fs::write(&p, format!("from file {i}\n")).unwrap();
             hashes.insert(head_fingerprint(&p).unwrap());
         }
-        assert_eq!(hashes.len(), 50, "every distinct log file must hash uniquely");
+        assert_eq!(
+            hashes.len(),
+            50,
+            "every distinct log file must hash uniquely"
+        );
     }
 
     #[test]
@@ -551,7 +555,8 @@ mod tests {
         // Single-step truncate + regrow past the old offset (23 bytes). The new
         // first line differs from the stored fingerprint, forcing a reset to 0.
         let mut f = std::fs::File::create(&log).unwrap();
-        f.write_all(b"replacement A\nreplacement B\nreplacement C\n").unwrap();
+        f.write_all(b"replacement A\nreplacement B\nreplacement C\n")
+            .unwrap();
         drop(f);
 
         input

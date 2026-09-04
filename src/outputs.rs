@@ -40,7 +40,10 @@ impl OutputWorker {
     pub fn new(cfg: &OutputConfig, queue: Arc<DiskQueue>) -> Result<Self> {
         let tls_config = if cfg.kind == OutputKind::Syslog && cfg.protocol == SyslogProtocol::Tls {
             let opts = cfg.tls.clone().unwrap_or_default();
-            Some(tls::client_config(&opts).with_context(|| format!("output {}: TLS setup", cfg.id))?)
+            Some(
+                tls::client_config(&opts)
+                    .with_context(|| format!("output {}: TLS setup", cfg.id))?,
+            )
         } else {
             None
         };
@@ -74,7 +77,12 @@ impl OutputWorker {
         tokio::spawn(async move { self.run(status, metrics, cancel).await })
     }
 
-    async fn run(self, status: Arc<StatusRegistry>, metrics: Arc<Metrics>, cancel: CancellationToken) {
+    async fn run(
+        self,
+        status: Arc<StatusRegistry>,
+        metrics: Arc<Metrics>,
+        cancel: CancellationToken,
+    ) {
         let id = self.cfg.id.clone();
         let mut sink = Sink::Disconnected;
         let mut backoff = self.cfg.retry.initial_backoff_ms;
@@ -267,13 +275,11 @@ impl OutputWorker {
                             .map_err(|_| anyhow!("invalid TLS server name {host:?}"))?;
                         let connector =
                             tokio_rustls::TlsConnector::from(self.tls_config.clone().unwrap());
-                        let tls_stream = tokio::time::timeout(
-                            timeout,
-                            connector.connect(server_name, stream),
-                        )
-                        .await
-                        .map_err(|_| anyhow!("TLS handshake timeout with {addr}"))?
-                        .with_context(|| format!("TLS handshake with {addr} failed"))?;
+                        let tls_stream =
+                            tokio::time::timeout(timeout, connector.connect(server_name, stream))
+                                .await
+                                .map_err(|_| anyhow!("TLS handshake timeout with {addr}"))?
+                                .with_context(|| format!("TLS handshake with {addr} failed"))?;
                         Ok(Sink::Tls(Box::new(tls_stream)))
                     }
                 }
@@ -406,8 +412,10 @@ mod tests {
         // PIPE-001 regression: enrichment fields must reach the rfc5424 wire,
         // not just json. They belong in the STRUCTURED-DATA element.
         let mut ev = Event::new("s", "syslog", "enrich test line");
-        ev.fields
-            .insert("environment".into(), serde_json::Value::String("production".into()));
+        ev.fields.insert(
+            "environment".into(),
+            serde_json::Value::String("production".into()),
+        );
         let line = format_event(&ev, OutputFormat::Rfc5424);
         assert!(
             line.contains("[softnix@32473 environment=\"production\"]"),
@@ -423,11 +431,15 @@ mod tests {
     #[test]
     fn rfc5424_escapes_and_skips_raw_structured_data() {
         let mut ev = Event::new("s", "syslog", "msg");
-        ev.fields
-            .insert("note".into(), serde_json::Value::String(r#"a"b]c\d"#.into()));
+        ev.fields.insert(
+            "note".into(),
+            serde_json::Value::String(r#"a"b]c\d"#.into()),
+        );
         // structured_data holds raw parsed SD text and must not be re-wrapped.
-        ev.fields
-            .insert("structured_data".into(), serde_json::Value::String("[orig x=1]".into()));
+        ev.fields.insert(
+            "structured_data".into(),
+            serde_json::Value::String("[orig x=1]".into()),
+        );
         let line = format_event(&ev, OutputFormat::Rfc5424);
         assert!(line.contains(r#"note="a\"b\]c\\d""#), "{line}");
         assert!(!line.contains("structured_data="), "{line}");

@@ -81,7 +81,12 @@ impl Engine {
         for s in &cfg.inputs.syslog {
             let input = SyslogInput::new(s);
             let handle = input
-                .spawn(tx.clone(), status.clone(), metrics.clone(), cancel.child_token())
+                .spawn(
+                    tx.clone(),
+                    status.clone(),
+                    metrics.clone(),
+                    cancel.child_token(),
+                )
                 .await?;
             tasks.push(handle);
         }
@@ -245,7 +250,9 @@ async fn route_event(
                 continue;
             }
         }
-        let Some(q) = queues.get(&out.id) else { continue };
+        let Some(q) = queues.get(&out.id) else {
+            continue;
+        };
         let result = match block_cancel {
             Some(cancel) => q.push_blocking(&ev, cancel).await.map(|stored| {
                 if stored {

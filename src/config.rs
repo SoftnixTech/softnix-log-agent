@@ -619,7 +619,10 @@ pub fn validate(cfg: &Config) -> Result<Vec<String>> {
             );
         }
         if e.query.trim().is_empty() {
-            bail!("inputs.eventlog[{}]: `query` must not be empty (use \"*\")", e.id);
+            bail!(
+                "inputs.eventlog[{}]: `query` must not be empty (use \"*\")",
+                e.id
+            );
         }
         if !cfg!(windows) {
             warnings.push(format!(
@@ -647,10 +650,16 @@ pub fn validate(cfg: &Config) -> Result<Vec<String>> {
         match o.kind {
             OutputKind::Syslog => {
                 let addr = o.address.as_deref().ok_or_else(|| {
-                    anyhow::anyhow!("outputs[{}]: syslog output requires `address: host:port`", o.id)
+                    anyhow::anyhow!(
+                        "outputs[{}]: syslog output requires `address: host:port`",
+                        o.id
+                    )
                 })?;
                 if !addr.contains(':') {
-                    bail!("outputs[{}]: `address` must be host:port (got {addr:?})", o.id);
+                    bail!(
+                        "outputs[{}]: `address` must be host:port (got {addr:?})",
+                        o.id
+                    );
                 }
                 if o.protocol == SyslogProtocol::Tls {
                     if let Some(tls) = &o.tls {
@@ -706,11 +715,10 @@ pub fn validate(cfg: &Config) -> Result<Vec<String>> {
     }
 
     if cfg.web.enabled {
-        let ip: IpAddr = cfg
-            .web
-            .bind
-            .parse()
-            .with_context(|| format!("web.bind must be an IP address (got {:?})", cfg.web.bind))?;
+        let ip: IpAddr =
+            cfg.web.bind.parse().with_context(|| {
+                format!("web.bind must be an IP address (got {:?})", cfg.web.bind)
+            })?;
         if !ip.is_loopback() {
             warnings.push(format!(
                 "SECURITY WARNING: web GUI is bound to {} and reachable from the network; \
@@ -722,7 +730,9 @@ pub fn validate(cfg: &Config) -> Result<Vec<String>> {
 
     match cfg.agent.log_level.as_str() {
         "trace" | "debug" | "info" | "warn" | "error" => {}
-        other => bail!("agent.log_level must be one of trace|debug|info|warn|error (got {other:?})"),
+        other => {
+            bail!("agent.log_level must be one of trace|debug|info|warn|error (got {other:?})")
+        }
     }
 
     Ok(warnings)

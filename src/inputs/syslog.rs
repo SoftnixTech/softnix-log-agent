@@ -218,7 +218,11 @@ impl SyslogInput {
     }
 
     fn make_event(&self, line: &str, peer: &SocketAddr) -> Event {
-        let mut ev = Event::new(&format!("{}:{}", self.cfg.id, peer.ip()), &self.source_type, line);
+        let mut ev = Event::new(
+            &format!("{}:{}", self.cfg.id, peer.ip()),
+            &self.source_type,
+            line,
+        );
         parse_syslog_into(&mut ev, line, self.cfg.format);
         if ev.hostname.is_none() {
             ev.hostname = Some(peer.ip().to_string());
@@ -257,7 +261,10 @@ mod tests {
         let input = SyslogInput::new(&cfg);
         let (tx, mut rx) = mpsc::channel(16);
         let status = Arc::new(StatusRegistry::default());
-        status.set_input(InputStatus { id: "test".into(), ..Default::default() });
+        status.set_input(InputStatus {
+            id: "test".into(),
+            ..Default::default()
+        });
         let metrics = Arc::new(Metrics::default());
         let cancel = CancellationToken::new();
         tokio::spawn(input.run_udp(sock, tx, status, metrics, cancel.clone()));
@@ -285,7 +292,10 @@ mod tests {
         let input = SyslogInput::new(&test_cfg(SyslogProtocol::Tcp, 0));
         let (tx, mut rx) = mpsc::channel(16);
         let status = Arc::new(StatusRegistry::default());
-        status.set_input(InputStatus { id: "test".into(), ..Default::default() });
+        status.set_input(InputStatus {
+            id: "test".into(),
+            ..Default::default()
+        });
         let metrics = Arc::new(Metrics::default());
         let cancel = CancellationToken::new();
         tokio::spawn(input.run_tcp(listener, None, tx, status, metrics, cancel.clone()));

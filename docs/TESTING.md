@@ -51,3 +51,18 @@ ps -o rss,pcpu -p $(pgrep -f softnix-log-agent)
 ## CI recommendation
 
 `cargo test` on `ubuntu-latest` and `windows-latest`, plus `cargo build --release --target x86_64-unknown-linux-musl`. Tests use ephemeral ports and tempdirs only — safe for parallel CI.
+
+## Checking the Windows-only code from macOS or Linux
+
+`src/inputs/eventlog.rs` is behind `#[cfg(windows)]`, so a normal
+`cargo check` never compiles it. Before pushing a change that touches it:
+
+```bash
+cargo install cargo-zigbuild        # once; also needs zig on PATH
+cargo zigbuild --release --target x86_64-pc-windows-gnu
+```
+
+This builds the entire crate for Windows in roughly 35 s and reports the same
+type errors the CI Windows job would. It is a pre-flight, not a replacement:
+`-gnu` is not `-msvc`, and the 8 eventlog unit tests only run in CI's
+`test-windows` job.

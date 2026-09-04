@@ -21,8 +21,12 @@ const UI_HTML: &str = include_str!("ui.html");
 
 /// Commands the web UI sends to the main control loop.
 pub enum ControlMsg {
-    Reload { resp: oneshot::Sender<Result<(), String>> },
-    Rollback { resp: oneshot::Sender<Result<(), String>> },
+    Reload {
+        resp: oneshot::Sender<Result<(), String>>,
+    },
+    Rollback {
+        resp: oneshot::Sender<Result<(), String>>,
+    },
 }
 
 pub struct AppState {
@@ -67,7 +71,7 @@ pub async fn serve(
     Ok(())
 }
 
-fn check_auth(state: &AppState, headers: &HeaderMap) -> Result<(), Response> {
+fn check_auth(state: &AppState, headers: &HeaderMap) -> Result<(), Box<Response>> {
     if let Some(token) = &state.auth_token {
         let supplied = headers
             .get("authorization")
@@ -75,7 +79,9 @@ fn check_auth(state: &AppState, headers: &HeaderMap) -> Result<(), Response> {
             .and_then(|v| v.strip_prefix("Bearer "))
             .or_else(|| headers.get("x-auth-token").and_then(|v| v.to_str().ok()));
         if supplied != Some(token.as_str()) {
-            return Err((StatusCode::UNAUTHORIZED, "unauthorized").into_response());
+            return Err(Box::new(
+                (StatusCode::UNAUTHORIZED, "unauthorized").into_response(),
+            ));
         }
     }
     Ok(())
@@ -104,16 +110,34 @@ async fn metrics_text(State(state): S) -> Response {
     };
     let m = eng.metrics.snapshot();
     let mut out = String::new();
-    out.push_str(&format!("agent_uptime_seconds {}\n", state.uptime.seconds()));
-    out.push_str(&format!("agent_events_received_total {}\n", m.events_received));
+    out.push_str(&format!(
+        "agent_uptime_seconds {}\n",
+        state.uptime.seconds()
+    ));
+    out.push_str(&format!(
+        "agent_events_received_total {}\n",
+        m.events_received
+    ));
     out.push_str(&format!("agent_events_sent_total {}\n", m.events_sent));
     out.push_str(&format!("agent_events_failed_total {}\n", m.events_failed));
-    out.push_str(&format!("agent_events_dropped_total {}\n", m.events_dropped));
+    out.push_str(&format!(
+        "agent_events_dropped_total {}\n",
+        m.events_dropped
+    ));
     out.push_str(&format!("agent_errors_total {}\n", m.errors));
     for (id, q) in &eng.queues {
-        out.push_str(&format!("agent_queue_events{{destination=\"{id}\"}} {}\n", q.len()));
-        out.push_str(&format!("agent_queue_bytes{{destination=\"{id}\"}} {}\n", q.bytes()));
-        out.push_str(&format!("agent_queue_dropped_total{{destination=\"{id}\"}} {}\n", q.dropped()));
+        out.push_str(&format!(
+            "agent_queue_events{{destination=\"{id}\"}} {}\n",
+            q.len()
+        ));
+        out.push_str(&format!(
+            "agent_queue_bytes{{destination=\"{id}\"}} {}\n",
+            q.bytes()
+        ));
+        out.push_str(&format!(
+            "agent_queue_dropped_total{{destination=\"{id}\"}} {}\n",
+            q.dropped()
+        ));
     }
     for o in eng.status.outputs_snapshot() {
         out.push_str(&format!(
@@ -230,7 +254,7 @@ async fn api_about(State(state): S) -> Response {
 
 async fn api_config_get(State(state): S, headers: HeaderMap) -> Response {
     if let Err(r) = check_auth(&state, &headers) {
-        return r;
+        return *r;
     }
     match std::fs::read_to_string(&state.config_path) {
         Ok(text) => Json(json!({"path": state.config_path.display().to_string(), "content": text}))
@@ -250,7 +274,7 @@ async fn api_config_validate(
     Json(body): Json<ConfigBody>,
 ) -> Response {
     if let Err(r) = check_auth(&state, &headers) {
-        return r;
+        return *r;
     }
     match config::parse(&body.content) {
         Ok((_cfg, warnings)) => Json(json!({"valid": true, "warnings": warnings})).into_response(),
@@ -264,7 +288,7 @@ async fn api_config_save(
     Json(body): Json<ConfigBody>,
 ) -> Response {
     if let Err(r) = check_auth(&state, &headers) {
-        return r;
+        return *r;
     }
     // Always validate before persisting.
     let warnings = match config::parse(&body.content) {
@@ -301,10 +325,15 @@ async fn api_config_save(
 
 async fn api_config_reload(State(state): S, headers: HeaderMap) -> Response {
     if let Err(r) = check_auth(&state, &headers) {
-        return r;
+        return *r;
     }
     let (tx, rx) = oneshot::channel();
-    if state.control.send(ControlMsg::Reload { resp: tx }).await.is_err() {
+    if state
+        .control
+        .send(ControlMsg::Reload { resp: tx })
+        .await
+        .is_err()
+    {
         return (StatusCode::INTERNAL_SERVER_ERROR, "control channel closed").into_response();
     }
     match rx.await {
@@ -320,7 +349,7 @@ async fn api_config_reload(State(state): S, headers: HeaderMap) -> Response {
 
 async fn api_config_rollback(State(state): S, headers: HeaderMap) -> Response {
     if let Err(r) = check_auth(&state, &headers) {
-        return r;
+        return *r;
     }
     let (tx, rx) = oneshot::channel();
     if state
@@ -338,6 +367,10 @@ async fn api_config_rollback(State(state): S, headers: HeaderMap) -> Response {
             Json(json!({"rolled_back": false, "error": e})),
         )
             .into_response(),
-        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "rollback did not complete").into_response(),
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "rollback did not complete",
+        )
+            .into_response(),
     }
 }

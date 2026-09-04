@@ -35,7 +35,9 @@ async fn file_to_tcp_syslog_end_to_end() {
         let received = received.clone();
         tokio::spawn(async move {
             loop {
-                let Ok((mut sock, _)) = listener.accept().await else { return };
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
                 let received = received.clone();
                 tokio::spawn(async move {
                     let mut buf = [0u8; 4096];
@@ -159,7 +161,7 @@ outputs:
     let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     client
         .send_to(
-            format!("<14>Jun 10 10:00:00 h1 app: outage event").as_bytes(),
+            "<14>Jun 10 10:00:00 h1 app: outage event".as_bytes(),
             ("127.0.0.1", in_port),
         )
         .await
@@ -167,7 +169,11 @@ outputs:
 
     let queues = engine.shared.queues.clone();
     assert!(
-        wait_for(move || queues.get("fwd").map(|q| q.len() >= 1).unwrap_or(false), 5).await,
+        wait_for(
+            move || queues.get("fwd").map(|q| !q.is_empty()).unwrap_or(false),
+            5
+        )
+        .await,
         "event was not queued during outage"
     );
     engine.stop().await; // simulated restart with data on disk
@@ -178,7 +184,9 @@ outputs:
     {
         let received = received.clone();
         tokio::spawn(async move {
-            let Ok((mut sock, _)) = listener.accept().await else { return };
+            let Ok((mut sock, _)) = listener.accept().await else {
+                return;
+            };
             let mut buf = [0u8; 4096];
             while let Ok(n) = sock.read(&mut buf).await {
                 if n == 0 {
@@ -208,7 +216,10 @@ outputs:
     };
     assert!(got, "queued event was not delivered after restart");
     let text = received.lock().await.clone();
-    assert!(text.starts_with("<14>1 "), "expected RFC5424 framing: {text}");
+    assert!(
+        text.starts_with("<14>1 "),
+        "expected RFC5424 framing: {text}"
+    );
     engine.stop().await;
 }
 
@@ -226,7 +237,9 @@ async fn conditional_routing_to_multiple_destinations() {
         let d = data.clone();
         tokio::spawn(async move {
             loop {
-                let Ok((mut sock, _)) = listener.accept().await else { return };
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
                 let d = d.clone();
                 tokio::spawn(async move {
                     let mut buf = [0u8; 4096];

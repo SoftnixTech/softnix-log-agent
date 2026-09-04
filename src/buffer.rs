@@ -50,7 +50,9 @@ pub enum PushOutcome {
     /// make room under the `drop_oldest` full policy (0 otherwise). Callers
     /// must count these toward the global dropped metric, otherwise oldest-drop
     /// evictions are invisible on the Overview page.
-    Stored { evicted: u64 },
+    Stored {
+        evicted: u64,
+    },
     Dropped,
     Full,
 }
@@ -292,6 +294,10 @@ impl DiskQueue {
         self.inner.lock().unwrap().count
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     pub fn bytes(&self) -> u64 {
         self.inner.lock().unwrap().bytes
     }
@@ -333,10 +339,12 @@ impl DiskQueue {
         loop {
             {
                 let inner = self.inner.lock().unwrap();
-                let has = inner.peek != Cursor {
-                    seg: inner.write_seg,
-                    off: inner.write_off,
-                } && inner.count > 0;
+                let has = inner.peek
+                    != Cursor {
+                        seg: inner.write_seg,
+                        off: inner.write_off,
+                    }
+                    && inner.count > 0;
                 if has {
                     return;
                 }
@@ -385,7 +393,9 @@ fn drop_oldest_segment(inner: &mut Inner, _seg_bytes: u64) -> Result<u64> {
     let dropped = if start == u64::MAX {
         0
     } else {
-        scan_segment(&path, start, None).map(|(_, n)| n).unwrap_or(0)
+        scan_segment(&path, start, None)
+            .map(|(_, n)| n)
+            .unwrap_or(0)
     };
     if let Ok(md) = std::fs::metadata(&path) {
         inner.bytes = inner.bytes.saturating_sub(md.len());
@@ -405,11 +415,7 @@ fn drop_oldest_segment(inner: &mut Inner, _seg_bytes: u64) -> Result<u64> {
 }
 
 /// Walk records from `start`; returns (offset after last valid record, count).
-fn scan_segment(
-    path: &std::path::Path,
-    start: u64,
-    max: Option<u64>,
-) -> Result<(u64, u64)> {
+fn scan_segment(path: &std::path::Path, start: u64, max: Option<u64>) -> Result<(u64, u64)> {
     let mut f = File::open(path)?;
     f.seek(SeekFrom::Start(start))?;
     let mut off = start;
@@ -479,7 +485,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let q = DiskQueue::open(dir.path(), "d1", &cfg(16, FullPolicy::Block)).unwrap();
         for i in 0..10 {
-            assert!(matches!(q.push(&ev(i)).unwrap(), PushOutcome::Stored { .. }));
+            assert!(matches!(
+                q.push(&ev(i)).unwrap(),
+                PushOutcome::Stored { .. }
+            ));
         }
         assert_eq!(q.len(), 10);
         let batch = q.peek_batch(4).unwrap();

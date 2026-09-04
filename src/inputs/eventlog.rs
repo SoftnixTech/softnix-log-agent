@@ -556,11 +556,19 @@ unsafe fn format_message(event: EVT_HANDLE, provider: &str) -> Option<String> {
         return None;
     }
     let pw = wide(provider);
-    let meta = EvtOpenPublisherMetadata(null_handle(), PCWSTR(pw.as_ptr()), PCWSTR::null(), 0, 0)
-        .ok()?;
+    let meta =
+        EvtOpenPublisherMetadata(null_handle(), PCWSTR(pw.as_ptr()), PCWSTR::null(), 0, 0).ok()?;
     let mut used = 0u32;
     // Probe length (in characters).
-    let _ = EvtFormatMessage(meta, event, 0, None, EvtFormatMessageEvent.0, None, &mut used);
+    let _ = EvtFormatMessage(
+        meta,
+        event,
+        0,
+        None,
+        EvtFormatMessageEvent.0,
+        None,
+        &mut used,
+    );
     let result = if used > 0 {
         let mut buf = vec![0u16; used as usize];
         match EvtFormatMessage(
@@ -614,12 +622,7 @@ fn level_to_severity(level: u8) -> u8 {
 }
 
 /// Parse the rendered System/EventData XML and assemble an [`Event`].
-unsafe fn build_event(
-    xml: &str,
-    event: EVT_HANDLE,
-    channel: &str,
-    source_type: &str,
-) -> Event {
+unsafe fn build_event(xml: &str, event: EVT_HANDLE, channel: &str, source_type: &str) -> Event {
     let p = parse_event_xml(xml);
 
     // Message: prefer the formatted publisher message, then EventData, then a
@@ -632,7 +635,13 @@ unsafe fn build_event(
                 Some(
                     p.data
                         .iter()
-                        .map(|(k, v)| if k.is_empty() { v.clone() } else { format!("{k}={v}") })
+                        .map(|(k, v)| {
+                            if k.is_empty() {
+                                v.clone()
+                            } else {
+                                format!("{k}={v}")
+                            }
+                        })
                         .collect::<Vec<_>>()
                         .join(" "),
                 )
@@ -641,7 +650,11 @@ unsafe fn build_event(
         .unwrap_or_else(|| {
             format!(
                 "{} event {} on {}",
-                if p.provider.is_empty() { "Windows" } else { &p.provider },
+                if p.provider.is_empty() {
+                    "Windows"
+                } else {
+                    &p.provider
+                },
                 p.event_id.unwrap_or(0),
                 channel
             )
@@ -674,7 +687,8 @@ unsafe fn build_event(
         ev.fields.insert("event_id".into(), Value::from(id));
     }
     if let Some(rid) = &p.record_id {
-        ev.fields.insert("record_id".into(), Value::from(rid.clone()));
+        ev.fields
+            .insert("record_id".into(), Value::from(rid.clone()));
     }
     if let Some(k) = &p.keywords {
         ev.fields.insert("keywords".into(), Value::from(k.clone()));
@@ -682,7 +696,8 @@ unsafe fn build_event(
     ev.fields.insert("channel".into(), Value::from(channel));
     for (k, v) in &p.data {
         if !k.is_empty() {
-            ev.fields.insert(format!("data_{k}"), Value::from(v.clone()));
+            ev.fields
+                .insert(format!("data_{k}"), Value::from(v.clone()));
         }
     }
     ev
@@ -803,7 +818,10 @@ mod tests {
         assert_eq!(p.computer.as_deref(), Some("WIN-HOST"));
         assert_eq!(p.record_id.as_deref(), Some("91234"));
         assert_eq!(p.process_id.as_deref(), Some("720"));
-        assert_eq!(p.time_created.as_deref(), Some("2026-06-19T09:52:35.713000000Z"));
+        assert_eq!(
+            p.time_created.as_deref(),
+            Some("2026-06-19T09:52:35.713000000Z")
+        );
         assert_eq!(
             p.data,
             vec![

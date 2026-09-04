@@ -168,7 +168,11 @@ pub fn parse_timestamp(s: &str, format: Option<&str>) -> Option<DateTime<Utc>> {
     if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
         return Some(dt.with_timezone(&Utc));
     }
-    for fmt in ["%Y-%m-%d %H:%M:%S%.f", "%Y-%m-%dT%H:%M:%S%.f", "%d/%b/%Y:%H:%M:%S %z"] {
+    for fmt in [
+        "%Y-%m-%d %H:%M:%S%.f",
+        "%Y-%m-%dT%H:%M:%S%.f",
+        "%d/%b/%Y:%H:%M:%S %z",
+    ] {
         if let Ok(dt) = DateTime::parse_from_str(s, fmt) {
             return Some(dt.with_timezone(&Utc));
         }
@@ -571,12 +575,19 @@ fn convert_value(v: &Value, to: &str) -> Option<Value> {
         "string" => value_to_string(v).map(Value::String),
         "int" => match v {
             Value::Number(n) => n.as_i64().map(|x| Value::Number(x.into())),
-            Value::String(s) => s.trim().parse::<i64>().ok().map(|x| Value::Number(x.into())),
+            Value::String(s) => s
+                .trim()
+                .parse::<i64>()
+                .ok()
+                .map(|x| Value::Number(x.into())),
             Value::Bool(b) => Some(Value::Number(i64::from(*b).into())),
             _ => None,
         },
         "float" => match v {
-            Value::Number(n) => n.as_f64().and_then(serde_json::Number::from_f64).map(Value::Number),
+            Value::Number(n) => n
+                .as_f64()
+                .and_then(serde_json::Number::from_f64)
+                .map(Value::Number),
             Value::String(s) => s
                 .trim()
                 .parse::<f64>()
@@ -620,16 +631,26 @@ impl Enricher {
     pub fn new(cfg: &EnrichConfig) -> Self {
         Enricher {
             hostname: if cfg.hostname {
-                hostname::get().ok().map(|h| h.to_string_lossy().into_owned())
+                hostname::get()
+                    .ok()
+                    .map(|h| h.to_string_lossy().into_owned())
             } else {
                 None
             },
             os: if cfg.os_info {
-                Some(format!("{} {}", std::env::consts::OS, std::env::consts::ARCH))
+                Some(format!(
+                    "{} {}",
+                    std::env::consts::OS,
+                    std::env::consts::ARCH
+                ))
             } else {
                 None
             },
-            local_ip: if cfg.local_ip { detect_local_ip() } else { None },
+            local_ip: if cfg.local_ip {
+                detect_local_ip()
+            } else {
+                None
+            },
             environment: cfg.environment.clone(),
             site: cfg.site.clone(),
             tenant: cfg.tenant.clone(),
@@ -802,7 +823,10 @@ transforms:
         // the secret can't leak through outputs that emit every field (json).
         let raw = ev.raw_message.as_deref().unwrap();
         assert!(raw.contains("[CARD]"), "raw_message not masked: {raw}");
-        assert!(!raw.contains("4111111111111111"), "secret leaked in raw_message: {raw}");
+        assert!(
+            !raw.contains("4111111111111111"),
+            "secret leaked in raw_message: {raw}"
+        );
 
         let mut debug_ev = raw_parser().parse("noise", "f", "file");
         debug_ev.severity = Some(7);

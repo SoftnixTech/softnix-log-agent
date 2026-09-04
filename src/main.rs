@@ -1,11 +1,11 @@
 //! Softnix Log Agent — lightweight, reliable, cross-platform log collector.
 
 use anyhow::{Context, Result};
-use softnix_log_agent::{config, engine, event, logbuf, metrics, service, web};
 use clap::{Parser, Subcommand};
 use engine::Engine;
 use logbuf::{LogBuffer, LogBufferLayer};
-use std::path::PathBuf;
+use softnix_log_agent::{config, engine, event, logbuf, metrics, service, web};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -80,7 +80,7 @@ fn main() -> Result<()> {
     }
 }
 
-fn validate_cmd(path: &PathBuf) -> Result<()> {
+fn validate_cmd(path: &Path) -> Result<()> {
     match config::load(path) {
         Ok((_cfg, warnings)) => {
             println!("OK: {} is valid", path.display());
@@ -175,7 +175,10 @@ fn run_as_windows_service(config: PathBuf) -> Result<()> {
 }
 
 /// Core agent: logging, web server, engine lifecycle, reload/rollback loop.
-async fn run_agent(config_path: PathBuf, external_shutdown: Option<CancellationToken>) -> Result<()> {
+async fn run_agent(
+    config_path: PathBuf,
+    external_shutdown: Option<CancellationToken>,
+) -> Result<()> {
     rustls::crypto::ring::default_provider()
         .install_default()
         .ok();
@@ -233,11 +236,9 @@ async fn run_agent(config_path: PathBuf, external_shutdown: Option<CancellationT
 
     // Control loop: shutdown signals, SIGHUP, and web-triggered reloads.
     #[cfg(unix)]
-    let mut sighup =
-        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())?;
+    let mut sighup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())?;
     #[cfg(unix)]
-    let mut sigterm =
-        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
 
     loop {
         #[cfg(unix)]
@@ -362,7 +363,10 @@ async fn try_reload(
                 .await
                 .context("FATAL: could not restart previous configuration")?;
             *app_state.engine.write().await = Some(old_engine.shared.clone());
-            Ok((old_engine, Err(format!("{e:#} (previous configuration restored)"))))
+            Ok((
+                old_engine,
+                Err(format!("{e:#} (previous configuration restored)")),
+            ))
         }
     }
 }
