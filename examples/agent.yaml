@@ -137,4 +137,4 @@ web:
   enabled: true
   bind: 127.0.0.1                  # localhost-only by default
   port: 8080
-  # auth_token: ${WEB_TOKEN}       # set when exposing beyond localhost — use the required form, not ${VAR:-}, for secrets
+  # auth_token: replace-with-a-long-random-secret   # required when exposing beyond localhost; see docs/CONFIGURATION.md for sourcing it from an env var

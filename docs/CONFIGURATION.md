@@ -448,7 +448,7 @@ web:
   enabled: true
   bind: 127.0.0.1
   port: 8080
-  # auth_token: ${WEB_TOKEN}
+  # auth_token: replace-with-a-long-random-secret
 ```
 
 ---

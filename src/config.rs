@@ -917,4 +917,34 @@ outputs:
         let err = parse(s).unwrap_err();
         assert!(format!("{err:#}").contains("auth_token"));
     }
+
+    /// Regression for the shipped `examples/agent.yaml`: `expand_env` runs
+    /// over the raw file text before YAML parsing and is not comment-aware,
+    /// so a `${VAR}` reference left inside a `#`-prefixed comment still fails
+    /// the whole file to expand when `VAR` is unset. `parses_sample` above
+    /// only exercises an inline string constant, so it never caught this —
+    /// load the actual example file here, with the env vars it might
+    /// reference guaranteed unset, and run only `expand_env` on it.
+    ///
+    /// This deliberately does NOT call `parse()`/`load()`, since those also
+    /// run `validate()`'s file-existence checks (e.g. the TLS certificate
+    /// paths referenced by the shipped example), which is an unrelated,
+    /// separate, pre-existing concern this test is not about.
+    #[test]
+    fn loads_shipped_example_env_expansion_with_no_env_vars_set() {
+        // Defensive: env vars are process-global and test execution order
+        // isn't guaranteed, so another test in this binary could otherwise
+        // have left one of these set.
+        std::env::remove_var("WEB_TOKEN");
+
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/agent.yaml");
+        let raw = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()));
+        expand_env(&raw).unwrap_or_else(|e| {
+            panic!(
+                "examples/agent.yaml's auth_token placeholder must not reference an \
+                 undefined env var (a new user hasn't configured any yet); got error: {e:#}"
+            )
+        });
+    }
 }
