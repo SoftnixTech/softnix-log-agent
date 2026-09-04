@@ -192,6 +192,7 @@ pub fn resolve_token(cfg: &WebConfig, data_dir: &std::path::Path) -> anyhow::Res
 fn write_token_file(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::fs::PermissionsExt;
 
     let tmp = path.with_extension(match path.extension() {
         Some(ext) => format!("{}.tmp", ext.to_string_lossy()),
@@ -204,6 +205,13 @@ fn write_token_file(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()>
             .truncate(true)
             .mode(0o600)
             .open(&tmp)?;
+        // `.mode(0o600)` above only applies when the open call actually
+        // creates the file. If a `.tmp` file survives a prior crash,
+        // `.create(true).truncate(true)` reopens and truncates THAT file,
+        // inheriting whatever (possibly wider) permissions it already had.
+        // Re-assert 0600 unconditionally so the guarantee holds regardless
+        // of whether this open created the file or reused a stale one.
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
         f.write_all(bytes)?;
         f.sync_all()?;
     }
@@ -728,6 +736,35 @@ mod tests {
             perms.mode() & 0o777,
             0o600,
             "audit I-1: reused file re-chmod'd"
+        );
+    }
+
+    // Round-2 fix (N1): a `web-token.tmp` left behind by a prior crashed run
+    // must not carry its (potentially wider) permissions forward through
+    // `write_token_file`'s truncate-and-reuse path. `.mode(0o600)` on
+    // `OpenOptions` only applies when the open call *creates* the file, so a
+    // pre-existing stale tmp file opened with `.create(true).truncate(true)`
+    // would otherwise keep its old mode across the rename onto `web-token`.
+    #[cfg(unix)]
+    #[test]
+    fn resolve_token_fixes_permissions_on_a_stale_tmp_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let tmp_path = dir.path().join("web-token.tmp");
+        std::fs::write(&tmp_path, b"leftover-from-a-crashed-run").unwrap();
+        std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let cfg = WebConfig::default();
+        resolve_token(&cfg, dir.path()).unwrap();
+
+        let perms = std::fs::metadata(dir.path().join("web-token"))
+            .unwrap()
+            .permissions();
+        assert_eq!(
+            perms.mode() & 0o777,
+            0o600,
+            "a stale, wrongly-permissioned .tmp file must not survive the rename"
         );
     }
 }
