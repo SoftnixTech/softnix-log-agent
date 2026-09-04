@@ -7,7 +7,7 @@ use crate::event::Event;
 use crate::inputs::{file::FileInput, syslog::SyslogInput};
 use crate::metrics::{Metrics, StatusRegistry};
 use crate::outputs::OutputWorker;
-use crate::pipeline::{eval_condition, Enricher, Transformer};
+use crate::pipeline::{eval_condition, CompiledCondition, Enricher, Transformer};
 use crate::state::StateManager;
 use anyhow::{Context, Result};
 use std::collections::HashMap;
@@ -16,10 +16,17 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-/// A fan-out target: an output's config, the sender into its router task,
-/// and the per-destination "router channel full" shed counter (also held in
+/// A fan-out target: an output's config, its pre-compiled `when:` condition
+/// (compiled once at engine start rather than re-parsing/re-compiling any
+/// `matches` regex on every event), the sender into its router task, and the
+/// per-destination "router channel full" shed counter (also held in
 /// `EngineShared::router_shed` for `/metrics`).
-type RouterEntry = (OutputConfig, mpsc::Sender<Arc<Event>>, Arc<AtomicU64>);
+type RouterEntry = (
+    OutputConfig,
+    Option<CompiledCondition>,
+    mpsc::Sender<Arc<Event>>,
+    Arc<AtomicU64>,
+);
 
 const CHANNEL_CAPACITY: usize = 8192;
 /// Capacity of each per-destination router channel. This exists to absorb
@@ -139,7 +146,13 @@ impl Engine {
                 metrics.clone(),
                 cancel.child_token(),
             )));
-            routers.push((out.clone(), rtx, shed));
+            let when = out
+                .when
+                .as_ref()
+                .map(CompiledCondition::compile)
+                .transpose()
+                .with_context(|| format!("invalid `when` condition on output {}", out.id))?;
+            routers.push((out.clone(), when, rtx, shed));
         }
 
         // Pipeline task: transform, enrich, fan out to the per-destination
@@ -387,14 +400,14 @@ async fn route_event(
     enricher.apply(&mut ev);
 
     let ev = Arc::new(ev);
-    for (out, tx, shed) in routers {
+    for (out, when, tx, shed) in routers {
         // Standby outputs only receive traffic while their primary is down.
         if let Some(primary) = &out.failover_for {
             if status.output_healthy(primary) {
                 continue;
             }
         }
-        if let Some(cond) = &out.when {
+        if let Some(cond) = when {
             if !eval_condition(cond, &ev) {
                 continue;
             }
@@ -515,7 +528,7 @@ mod tests {
         let shed = Arc::new(AtomicU64::new(0));
         // `rtx` is moved in here (not cloned) so dropping `routers` below is
         // what closes the channel and lets the consumer's `recv()` loop end.
-        let routers = vec![(out, rtx, shed.clone())];
+        let routers = vec![(out, None, rtx, shed.clone())];
         let transformer = Transformer::compile(&PipelineConfig::default()).unwrap();
         let enricher = Enricher::new(&EnrichConfig::default());
 
@@ -568,7 +581,7 @@ mod tests {
         let metrics = Metrics::default();
         let status = StatusRegistry::default();
         let shed = Arc::new(AtomicU64::new(0));
-        let routers = vec![(out, rtx, shed.clone())];
+        let routers = vec![(out, None, rtx, shed.clone())];
         let transformer = Transformer::compile(&PipelineConfig::default()).unwrap();
         let enricher = Enricher::new(&EnrichConfig::default());
 

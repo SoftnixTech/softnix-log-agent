@@ -4,7 +4,7 @@ use crate::config::{
     Condition, EnrichConfig, ParserConfig, ParserMode, PipelineConfig, SyslogFormat, TransformStep,
 };
 use crate::event::{severity_from_name, value_to_string, Event};
-use anyhow::Result;
+use anyhow::{Context, Result};
 use chrono::{DateTime, Datelike, NaiveDateTime, TimeZone, Utc};
 use regex::Regex;
 use serde_json::Value;
@@ -360,7 +360,40 @@ fn parse_rfc3164(ev: &mut Event, line: &str) -> bool {
 // Conditions
 // ---------------------------------------------------------------------------
 
-pub fn eval_condition(cond: &Condition, ev: &Event) -> bool {
+/// A `Condition` with its regex compiled once, instead of on every
+/// evaluation (which is what made `matches` the one hot-path regex in this
+/// file that wasn't pre-compiled — at even moderate event rates with a
+/// `when: {op: matches}` condition, this alone falsified the "<1% CPU" claim).
+pub struct CompiledCondition {
+    field: String,
+    op: String,
+    value: Option<serde_json::Value>,
+    regex: Option<Regex>,
+}
+
+impl CompiledCondition {
+    pub fn compile(c: &Condition) -> Result<Self> {
+        let regex = if c.op == "matches" {
+            match &c.value {
+                Some(Value::String(pat)) => Some(
+                    Regex::new(pat)
+                        .with_context(|| format!("invalid regex in condition on {}", c.field))?,
+                ),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        Ok(CompiledCondition {
+            field: c.field.clone(),
+            op: c.op.clone(),
+            value: c.value.clone(),
+            regex,
+        })
+    }
+}
+
+pub fn eval_condition(cond: &CompiledCondition, ev: &Event) -> bool {
     let field_val = ev.get_field(&cond.field);
     match cond.op.as_str() {
         "exists" => field_val.is_some(),
@@ -383,13 +416,11 @@ pub fn eval_condition(cond: &Condition, ev: &Event) -> bool {
             }
             _ => false,
         },
-        "matches" => match (&field_val, &cond.value) {
-            (Some(a), Some(Value::String(pat))) => {
-                let Some(a) = value_to_string(a) else {
-                    return false;
-                };
-                Regex::new(pat).map(|re| re.is_match(&a)).unwrap_or(false)
-            }
+        "matches" => match (&field_val, &cond.regex) {
+            (Some(a), Some(re)) => match value_to_string(a) {
+                Some(a) => re.is_match(&a),
+                None => false,
+            },
             _ => false,
         },
         "gt" | "lt" => {
@@ -440,34 +471,41 @@ enum CompiledStep {
     AddField {
         field: String,
         value: Value,
-        when: Option<Condition>,
+        when: Option<CompiledCondition>,
     },
     RemoveField {
         field: String,
-        when: Option<Condition>,
+        when: Option<CompiledCondition>,
     },
     RenameField {
         from: String,
         to: String,
-        when: Option<Condition>,
+        when: Option<CompiledCondition>,
     },
     Convert {
         field: String,
         to: String,
-        when: Option<Condition>,
+        when: Option<CompiledCondition>,
     },
     Mask {
         field: String,
         re: Regex,
         replacement: String,
-        when: Option<Condition>,
+        when: Option<CompiledCondition>,
     },
     Drop {
-        when: Condition,
+        when: CompiledCondition,
     },
     Keep {
-        when: Condition,
+        when: CompiledCondition,
     },
+}
+
+/// Compile an optional `when:` condition, propagating an invalid regex as a
+/// startup error instead of silently accepting a condition that would never
+/// match at runtime.
+fn compile_when(when: Option<Condition>) -> Result<Option<CompiledCondition>> {
+    when.as_ref().map(CompiledCondition::compile).transpose()
 }
 
 impl Transformer {
@@ -475,18 +513,25 @@ impl Transformer {
         let mut steps = Vec::new();
         for t in &cfg.transforms {
             steps.push(match t.clone() {
-                TransformStep::AddField { field, value, when } => {
-                    CompiledStep::AddField { field, value, when }
-                }
-                TransformStep::RemoveField { field, when } => {
-                    CompiledStep::RemoveField { field, when }
-                }
-                TransformStep::RenameField { from, to, when } => {
-                    CompiledStep::RenameField { from, to, when }
-                }
-                TransformStep::Convert { field, to, when } => {
-                    CompiledStep::Convert { field, to, when }
-                }
+                TransformStep::AddField { field, value, when } => CompiledStep::AddField {
+                    field,
+                    value,
+                    when: compile_when(when)?,
+                },
+                TransformStep::RemoveField { field, when } => CompiledStep::RemoveField {
+                    field,
+                    when: compile_when(when)?,
+                },
+                TransformStep::RenameField { from, to, when } => CompiledStep::RenameField {
+                    from,
+                    to,
+                    when: compile_when(when)?,
+                },
+                TransformStep::Convert { field, to, when } => CompiledStep::Convert {
+                    field,
+                    to,
+                    when: compile_when(when)?,
+                },
                 TransformStep::Mask {
                     field,
                     pattern,
@@ -496,10 +541,14 @@ impl Transformer {
                     field,
                     re: Regex::new(&pattern)?,
                     replacement,
-                    when,
+                    when: compile_when(when)?,
                 },
-                TransformStep::Drop { when } => CompiledStep::Drop { when },
-                TransformStep::Keep { when } => CompiledStep::Keep { when },
+                TransformStep::Drop { when } => CompiledStep::Drop {
+                    when: CompiledCondition::compile(&when)?,
+                },
+                TransformStep::Keep { when } => CompiledStep::Keep {
+                    when: CompiledCondition::compile(&when)?,
+                },
             });
         }
         Ok(Transformer { steps })
@@ -910,6 +959,32 @@ transforms:
             convert_value(&Value::String("yes".into()), "bool"),
             Some(Value::Bool(true))
         );
+    }
+
+    #[test]
+    fn compiled_condition_matches_like_the_interpreted_one() {
+        let cond = Condition {
+            field: "message".to_string(),
+            op: "matches".to_string(),
+            value: Some(serde_json::Value::String(r"error \d+".to_string())),
+        };
+        let compiled = CompiledCondition::compile(&cond).unwrap();
+        let mut hit = Event::new("s", "test", "error 42 occurred");
+        hit.message = "error 42 occurred".to_string();
+        let mut miss = Event::new("s", "test", "all good");
+        miss.message = "all good".to_string();
+        assert!(eval_condition(&compiled, &hit));
+        assert!(!eval_condition(&compiled, &miss));
+    }
+
+    #[test]
+    fn an_invalid_regex_is_rejected_at_compile_time_not_per_event() {
+        let cond = Condition {
+            field: "message".to_string(),
+            op: "matches".to_string(),
+            value: Some(serde_json::Value::String("(unclosed".to_string())),
+        };
+        assert!(CompiledCondition::compile(&cond).is_err());
     }
 
     #[test]
