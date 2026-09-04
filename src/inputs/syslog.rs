@@ -259,6 +259,13 @@ mod tests {
         }
     }
 
+    fn test_cfg_keep_raw(proto: SyslogProtocol, port: u16) -> SyslogInputConfig {
+        SyslogInputConfig {
+            keep_raw_message: true,
+            ..test_cfg(proto, port)
+        }
+    }
+
     #[tokio::test]
     async fn udp_receives_rfc3164() {
         let cfg = test_cfg(SyslogProtocol::Udp, 0);
@@ -325,5 +332,32 @@ mod tests {
             .unwrap();
         assert_eq!(e2.message, "raw second line");
         cancel.cancel();
+    }
+
+    #[test]
+    fn make_event_preserves_raw_message_when_enabled() {
+        let cfg = test_cfg_keep_raw(SyslogProtocol::Udp, 0);
+        let input = SyslogInput::new(&cfg);
+        let peer: SocketAddr = "127.0.0.1:514".parse().unwrap();
+        let line = "<13>Jun 10 12:00:00 host1 app[7]: hello udp";
+
+        let ev = input.make_event(line, &peer);
+
+        assert_eq!(ev.message, "hello udp");
+        assert_eq!(ev.raw_message.as_deref(), Some(line));
+        assert_ne!(ev.raw_message.as_deref(), Some(ev.message.as_str()));
+    }
+
+    #[test]
+    fn make_event_omits_raw_message_by_default() {
+        let cfg = test_cfg(SyslogProtocol::Udp, 0);
+        let input = SyslogInput::new(&cfg);
+        let peer: SocketAddr = "127.0.0.1:514".parse().unwrap();
+        let line = "<13>Jun 10 12:00:00 host1 app[7]: hello udp";
+
+        let ev = input.make_event(line, &peer);
+
+        assert_eq!(ev.message, "hello udp");
+        assert!(ev.raw_message.is_none());
     }
 }
