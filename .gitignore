@@ -4,3 +4,4 @@
 /dist
 /target-linux
 .DS_Store
+/.worktrees
