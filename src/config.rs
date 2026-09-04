@@ -451,6 +451,9 @@ pub struct OutputConfig {
     pub failover_for: Option<String>,
     #[serde(default)]
     pub retry: RetryConfig,
+    /// Overrides buffer.full_policy for this destination only.
+    #[serde(default)]
+    pub full_policy: Option<FullPolicy>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

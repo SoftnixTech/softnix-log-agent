@@ -371,6 +371,7 @@ list ของปลายทาง แต่ละ event จะถูก route 
 | `when` | condition | — | route เฉพาะ event ที่ตรงมาที่นี่ |
 | `failover_for` | string | — | รับ traffic เฉพาะตอน output ที่ระบุไม่ healthy |
 | `retry` | object | ดูด้านล่าง | การปรับจูนการส่ง/retry |
+| `full_policy` | enum | — (ใช้ค่า `buffer.full_policy` ถ้าไม่ระบุ) | override `buffer.full_policy` เฉพาะปลายทางนี้ — ดูหัวข้อ [`buffer`](#buffer) ด้านบน |
 
 **ตัวเลือก `tls` (ฝั่ง client):**
 

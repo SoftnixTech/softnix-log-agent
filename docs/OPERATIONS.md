@@ -18,11 +18,45 @@ To expose it beyond localhost set `web.bind: 0.0.0.0` **and** `web.auth_token` �
 
 ## Monitoring
 
-- `GET /healthz` — 200 when the engine is running, 503 otherwise. Wire into your existing checks.
-- `GET /metrics` — Prometheus-style text: `agent_events_received_total`, `agent_events_sent_total`, `agent_events_failed_total`, `agent_events_dropped_total`, `agent_errors_total`, `agent_queue_events{destination=…}`, `agent_queue_bytes{…}`, `agent_queue_dropped_total{…}`, `agent_output_healthy{…}`, `agent_uptime_seconds`.
+- `GET /healthz` — 200 (`{"status":"ok"}`) when the engine is running and every destination queue has room; 503 when the engine is not running, or when any destination queue is full (`{"status":"degraded","queues_full":[...]}`) — see [Backpressure and the full-queue policy](#backpressure-and-the-full-queue-policy) below. Wire into your existing checks.
+- `GET /metrics` — Prometheus-style text: `agent_events_received_total`, `agent_events_sent_total`, `agent_events_failed_total`, `agent_events_dropped_total`, `agent_errors_total`, `agent_queue_events{destination=…}`, `agent_queue_bytes{…}`, `agent_queue_dropped_total{…}`, `agent_queue_full{output=…}` (1 when that destination's queue is full, 0 otherwise), `agent_output_healthy{…}`, `agent_uptime_seconds`.
 - `GET /api/status|inputs|outputs|buffer|logs|about` — JSON equivalents used by the GUI.
 
-Alert suggestions: `agent_output_healthy == 0` for >5 min; `agent_queue_bytes` approaching `buffer.max_size_mb`; `agent_events_dropped_total` increasing; `agent_uptime_seconds` resets (crash loop).
+Alert suggestions: `agent_output_healthy == 0` for >5 min; `agent_queue_bytes` approaching `buffer.max_size_mb`; `agent_queue_full == 1` for any destination (collection may be stalled for that destination — see below); `agent_events_dropped_total` increasing; `agent_uptime_seconds` resets (crash loop).
+
+## Backpressure and the full-queue policy
+
+`buffer.full_policy: block` is the shipped **default**, and it is correct for
+compliance collection: the agent never silently discards a log. Each
+destination has its own on-disk queue and its own routing task, so a slow or
+unreachable destination only ever backs up *its own* queue — it does not
+stall delivery to any other, healthy destination.
+
+The tradeoff of `block` is that when a destination's queue genuinely fills
+(the destination has been down, or too slow, for long enough to exhaust
+`buffer.max_size_mb`), that destination's router correctly stops accepting
+new events and waits for space — collection for that destination stalls
+until the destination recovers or the operator intervenes. This is the
+intended meaning of "never drop a log," but it must not go unnoticed:
+
+- `GET /healthz` returns `503` with `{"status":"degraded","queues_full":[...]}`
+  naming every full queue.
+- `GET /metrics` exposes `agent_queue_full{output="<id>"} 1` for the same
+  destinations.
+
+If a particular destination is noisy or non-critical and you would rather
+shed load than stall, override the policy for that output alone:
+
+```yaml
+outputs:
+  - id: noisy-siem
+    type: syslog
+    address: siem.example.com:514
+    full_policy: drop_oldest   # or drop_newest
+```
+
+Leave `full_policy` unset on outputs where loss is unacceptable — they keep
+inheriting `buffer.full_policy` (`block` by default).
 
 ## Sizing & tuning
 

@@ -321,6 +321,103 @@ outputs:
     engine.stop().await;
 }
 
+/// C-3 regression guard: a destination whose queue backs up must not stall
+/// delivery to a healthy sibling destination. Before the per-destination
+/// router split, a single pipeline task routed to every destination
+/// sequentially, so a stuck destination stalled the healthy one too - and
+/// eventually every input.
+#[tokio::test]
+async fn a_backed_up_destination_does_not_stop_its_peers() {
+    // Destination A has a 1 MB queue and a TCP peer that accepts but never
+    // reads, so its queue fills and stays full. Destination B is a UDP peer we
+    // read from. B must keep receiving.
+    let dir = tempfile::tempdir().unwrap();
+
+    let stuck = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let stuck_port = stuck.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        // Accept and hold, never read.
+        let mut held = Vec::new();
+        while let Ok((s, _)) = stuck.accept().await {
+            held.push(s);
+        }
+    });
+
+    let sink = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let sink_port = sink.local_addr().unwrap().port();
+
+    let in_port = {
+        let l = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let p = l.local_addr().unwrap().port();
+        drop(l);
+        p
+    };
+
+    let yaml = format!(
+        r#"
+agent:
+  data_dir: {data}
+buffer:
+  max_size_mb: 1
+  segment_size_mb: 1
+inputs:
+  syslog:
+    - id: in
+      protocol: udp
+      bind: 127.0.0.1
+      port: {in_port}
+outputs:
+  - id: stuck
+    type: syslog
+    protocol: tcp
+    address: 127.0.0.1:{stuck_port}
+    full_policy: block
+  - id: healthy
+    type: syslog
+    protocol: udp
+    address: 127.0.0.1:{sink_port}
+web:
+  enabled: false
+"#,
+        data = dir.path().display(),
+        in_port = in_port,
+        stuck_port = stuck_port,
+        sink_port = sink_port,
+    );
+    let (cfg, _w) = softnix_log_agent::config::parse(&yaml).unwrap();
+    let engine = softnix_log_agent::engine::Engine::start(cfg).await.unwrap();
+
+    let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    for i in 0..200 {
+        let line = format!("<14>Jun 10 10:00:00 h1 app: event {i}");
+        client
+            .send_to(line.as_bytes(), ("127.0.0.1", in_port))
+            .await
+            .unwrap();
+    }
+
+    let mut buf = vec![0u8; 65535];
+    let mut received = 0;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    while tokio::time::Instant::now() < deadline && received < 50 {
+        if let Ok(Ok((n, _))) = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            sink.recv_from(&mut buf),
+        )
+        .await
+        {
+            if n > 0 {
+                received += 1;
+            }
+        }
+    }
+    engine.stop().await;
+    assert!(
+        received >= 50,
+        "healthy destination only got {received} events"
+    );
+}
+
 /// A partial `Engine::start` failure must not leak any already-spawned task:
 /// the successfully-bound listener from an earlier input must be torn down
 /// when a later input fails to bind, so ports are free for the next attempt.

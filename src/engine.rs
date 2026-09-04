@@ -2,7 +2,7 @@
 //! The engine is fully restartable, which is how config reload works.
 
 use crate::buffer::{DiskQueue, PushOutcome};
-use crate::config::{Config, FullPolicy};
+use crate::config::{Config, FullPolicy, OutputConfig};
 use crate::event::Event;
 use crate::inputs::{file::FileInput, syslog::SyslogInput};
 use crate::metrics::{Metrics, StatusRegistry};
@@ -16,6 +16,11 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 const CHANNEL_CAPACITY: usize = 8192;
+/// Capacity of each per-destination router channel. Small on purpose: it is
+/// only meant to absorb transient bursts between the pipeline and a router,
+/// not to let one slow destination buffer memory unboundedly on top of its
+/// own on-disk queue.
+const ROUTER_CAPACITY: usize = 256;
 
 /// Everything the web UI needs to observe a running engine.
 pub struct EngineShared {
@@ -81,7 +86,11 @@ impl Engine {
             .unwrap_or_else(|| data_dir.join("queue"));
         let mut queues: HashMap<String, Arc<DiskQueue>> = HashMap::new();
         for out in &cfg.outputs {
-            let q = DiskQueue::open(&queue_dir, &out.id, &cfg.buffer)
+            let mut bcfg = cfg.buffer.clone();
+            if let Some(p) = out.full_policy {
+                bcfg.full_policy = p;
+            }
+            let q = DiskQueue::open(&queue_dir, &out.id, &bcfg)
                 .with_context(|| format!("cannot open queue for output {}", out.id))?;
             queues.insert(out.id.clone(), q);
         }
@@ -92,7 +101,29 @@ impl Engine {
             tasks.push(worker.spawn(status.clone(), metrics.clone(), cancel.child_token()));
         }
 
-        // Pipeline task.
+        // One router task per destination, each fed by its own small bounded
+        // channel. A destination whose queue is full (or whose disk writes are
+        // otherwise slow) can only ever stall its own channel, never the
+        // pipeline or any other destination.
+        let mut routers: Vec<(OutputConfig, mpsc::Sender<Arc<Event>>)> = Vec::new();
+        for out in &cfg.outputs {
+            let (rtx, rrx) = mpsc::channel::<Arc<Event>>(ROUTER_CAPACITY);
+            let policy = out.full_policy.unwrap_or(cfg.buffer.full_policy);
+            let block = policy == FullPolicy::Block;
+            tasks.push(tokio::spawn(run_router(
+                rrx,
+                out.clone(),
+                queues[&out.id].clone(),
+                block,
+                metrics.clone(),
+                cancel.child_token(),
+            )));
+            routers.push((out.clone(), rtx));
+        }
+
+        // Pipeline task: transform, enrich, fan out to the per-destination
+        // routers. It no longer awaits any push itself, so a stuck destination
+        // cannot stall delivery to its siblings.
         let (tx, rx) = mpsc::channel::<Event>(CHANNEL_CAPACITY);
         let transformer = Transformer::compile(&cfg.pipeline)?;
         let enricher = Enricher::new(&cfg.pipeline.enrich);
@@ -100,8 +131,7 @@ impl Engine {
             rx,
             transformer,
             enricher,
-            cfg.clone(),
-            queues.clone(),
+            routers,
             status.clone(),
             metrics.clone(),
             cancel.child_token(),
@@ -204,90 +234,28 @@ impl Engine {
     }
 }
 
-/// Transform → normalize → enrich → route into destination queues.
-#[allow(clippy::too_many_arguments)]
-async fn run_pipeline(
-    mut rx: mpsc::Receiver<Event>,
-    transformer: Transformer,
-    enricher: Enricher,
-    cfg: Config,
-    queues: HashMap<String, Arc<DiskQueue>>,
-    status: Arc<StatusRegistry>,
+/// One routing task per destination. The pipeline hands it an already
+/// transformed+enriched event; this task owns the blocking push so a full or
+/// slow queue cannot stall any other destination.
+async fn run_router(
+    mut rx: mpsc::Receiver<Arc<Event>>,
+    out: OutputConfig,
+    queue: Arc<DiskQueue>,
+    block: bool,
     metrics: Arc<Metrics>,
     cancel: CancellationToken,
 ) {
-    let block = cfg.buffer.full_policy == FullPolicy::Block;
-    loop {
-        let ev = tokio::select! {
-            ev = rx.recv() => match ev {
-                Some(ev) => ev,
-                None => return,
-            },
-            _ = cancel.cancelled() => {
-                // Drain whatever is already in the channel before exiting.
-                while let Ok(ev) = rx.try_recv() {
-                    route_event(ev, &transformer, &enricher, &cfg, &queues, &status, &metrics, None).await;
-                }
-                return;
-            }
-        };
-        route_event(
-            ev,
-            &transformer,
-            &enricher,
-            &cfg,
-            &queues,
-            &status,
-            &metrics,
-            if block { Some(&cancel) } else { None },
-        )
-        .await;
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn route_event(
-    mut ev: Event,
-    transformer: &Transformer,
-    enricher: &Enricher,
-    cfg: &Config,
-    queues: &HashMap<String, Arc<DiskQueue>>,
-    status: &StatusRegistry,
-    metrics: &Metrics,
-    block_cancel: Option<&CancellationToken>,
-) {
-    if !transformer.apply(&mut ev) {
-        metrics
-            .events_dropped
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        return;
-    }
-    enricher.apply(&mut ev);
-
-    for out in &cfg.outputs {
-        // Standby outputs only receive traffic while their primary is down.
-        if let Some(primary) = &out.failover_for {
-            if status.output_healthy(primary) {
-                continue;
-            }
-        }
-        if let Some(cond) = &out.when {
-            if !eval_condition(cond, &ev) {
-                continue;
-            }
-        }
-        let Some(q) = queues.get(&out.id) else {
-            continue;
-        };
-        let result = match block_cancel {
-            Some(cancel) => q.push_blocking(&ev, cancel).await.map(|stored| {
+    while let Some(ev) = rx.recv().await {
+        let result = if block {
+            queue.push_blocking(&ev, &cancel).await.map(|stored| {
                 if stored {
                     PushOutcome::Stored { evicted: 0 }
                 } else {
                     PushOutcome::Dropped
                 }
-            }),
-            None => q.push(&ev),
+            })
+        } else {
+            queue.push(&ev)
         };
         match result {
             // Under drop_oldest, storing a new event may evict older ones to
@@ -308,6 +276,74 @@ async fn route_event(
             Err(e) => {
                 metrics.record_error(format!("queue {} write: {e}", out.id));
             }
+        }
+    }
+}
+
+/// Transform → normalize → enrich → fan out to the per-destination routers.
+async fn run_pipeline(
+    mut rx: mpsc::Receiver<Event>,
+    transformer: Transformer,
+    enricher: Enricher,
+    routers: Vec<(OutputConfig, mpsc::Sender<Arc<Event>>)>,
+    status: Arc<StatusRegistry>,
+    metrics: Arc<Metrics>,
+    cancel: CancellationToken,
+) {
+    loop {
+        let ev = tokio::select! {
+            ev = rx.recv() => match ev {
+                Some(ev) => ev,
+                None => return,
+            },
+            _ = cancel.cancelled() => {
+                // Drain whatever is already in the channel before exiting.
+                while let Ok(ev) = rx.try_recv() {
+                    route_event(ev, &transformer, &enricher, &routers, &status, &metrics).await;
+                }
+                return;
+            }
+        };
+        route_event(ev, &transformer, &enricher, &routers, &status, &metrics).await;
+    }
+}
+
+async fn route_event(
+    mut ev: Event,
+    transformer: &Transformer,
+    enricher: &Enricher,
+    routers: &[(OutputConfig, mpsc::Sender<Arc<Event>>)],
+    status: &StatusRegistry,
+    metrics: &Metrics,
+) {
+    if !transformer.apply(&mut ev) {
+        metrics
+            .events_dropped
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return;
+    }
+    enricher.apply(&mut ev);
+
+    let ev = Arc::new(ev);
+    for (out, tx) in routers {
+        // Standby outputs only receive traffic while their primary is down.
+        if let Some(primary) = &out.failover_for {
+            if status.output_healthy(primary) {
+                continue;
+            }
+        }
+        if let Some(cond) = &out.when {
+            if !eval_condition(cond, &ev) {
+                continue;
+            }
+        }
+        // Under `block` this awaits, which is the documented behaviour: a
+        // destination that cannot keep up applies backpressure rather than
+        // dropping. Only this destination's router channel is affected, so a
+        // stuck destination cannot stall its siblings. /healthz reports the
+        // condition via `DiskQueue::is_full`.
+        if tx.send(Arc::clone(&ev)).await.is_err() {
+            metrics.record_error(format!("router {} closed", out.id));
         }
     }
 }

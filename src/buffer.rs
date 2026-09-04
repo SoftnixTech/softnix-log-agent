@@ -331,6 +331,24 @@ impl DiskQueue {
         self.max_bytes
     }
 
+    /// True when the next average-sized push would exceed the size cap. Used by
+    /// /healthz so a blocked queue is visible instead of silently wedging the
+    /// agent.
+    ///
+    /// `push` stops *before* writing a record that would cross the cap, so
+    /// `bytes` alone rarely reaches `max_bytes` exactly — a queue can sit a few
+    /// hundred bytes under the cap yet still be permanently rejecting every
+    /// push (under `block`, stalling the router). Comparing against the
+    /// average size of the records currently held catches that state.
+    pub fn is_full(&self) -> bool {
+        let inner = self.inner.lock().unwrap();
+        if inner.count == 0 {
+            return false;
+        }
+        let avg = inner.bytes / inner.count;
+        inner.bytes + avg >= self.max_bytes
+    }
+
     pub fn dropped(&self) -> u64 {
         self.dropped.load(Ordering::Relaxed)
     }
@@ -717,6 +735,27 @@ mod tests {
         // The offset must have advanced past the record, not stayed pinned.
         q.ack(1).unwrap();
         assert!(q.peek_batch(10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn is_full_reports_the_block_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = BufferConfig {
+            max_size_mb: 1,
+            ..BufferConfig::default()
+        };
+        let q = DiskQueue::open(dir.path(), "dest", &cfg).unwrap();
+        assert!(!q.is_full());
+        let big = "x".repeat(4096);
+        for _ in 0..400 {
+            if let Ok(PushOutcome::Full) = q.push(&Event::new("s", "test", &big)) {
+                break;
+            }
+        }
+        assert!(
+            q.is_full(),
+            "queue should report full after hitting the cap"
+        );
     }
 
     #[test]

@@ -372,6 +372,7 @@ condition matches (or all outputs, if no `when`), subject to failover.
 | `when` | condition | — | Only route matching events here. |
 | `failover_for` | string | — | Receive traffic only while the named output is unhealthy. |
 | `retry` | object | see below | Send/retry tuning. |
+| `full_policy` | enum | — (falls back to `buffer.full_policy`) | Overrides the global `buffer.full_policy` for this destination only — see [`buffer`](#buffer) above. |
 
 **`tls` (client) options:**
 

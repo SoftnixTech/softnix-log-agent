@@ -287,13 +287,30 @@ async fn ui() -> Html<&'static str> {
 
 async fn healthz(State(state): S) -> Response {
     let engine = state.engine.read().await;
-    match engine.as_ref() {
-        Some(_) => (StatusCode::OK, Json(json!({"status": "ok"}))).into_response(),
-        None => (
+    let Some(eng) = engine.as_ref() else {
+        return (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(json!({"status": "engine not running"})),
         )
-            .into_response(),
+            .into_response();
+    };
+    let full: Vec<&String> = eng
+        .queues
+        .iter()
+        .filter(|(_, q)| q.is_full())
+        .map(|(id, _)| id)
+        .collect();
+    if full.is_empty() {
+        (StatusCode::OK, Json(json!({"status": "ok"}))).into_response()
+    } else {
+        // A full queue under `block` means the pipeline is stalled and the host
+        // is no longer collecting. Returning 200 here is what let this go
+        // unnoticed for hours in the field.
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"status": "degraded", "queues_full": full})),
+        )
+            .into_response()
     }
 }
 
@@ -331,6 +348,10 @@ async fn metrics_text(State(state): S) -> Response {
         out.push_str(&format!(
             "agent_queue_dropped_total{{destination=\"{id}\"}} {}\n",
             q.dropped()
+        ));
+        out.push_str(&format!(
+            "agent_queue_full{{output=\"{id}\"}} {}\n",
+            u8::from(q.is_full())
         ));
     }
     for o in eng.status.outputs_snapshot() {
