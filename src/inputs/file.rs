@@ -26,6 +26,27 @@ const READ_BUDGET: u64 = 4 * 1024 * 1024;
 /// Lines longer than this are emitted even without a trailing newline.
 const MAX_LINE: usize = 1024 * 1024;
 
+/// Max tracked files processed by a single `spawn_blocking` call inside
+/// `tail_once` (see `tail_paths_blocking`). Fix round 2: an earlier version
+/// handed the *entire* tracked set to one `spawn_blocking` call, so the
+/// intermediate `Vec<TailReadResult>` it staged in memory before any event
+/// reached the pipeline scaled with the number of tracked files rather than
+/// with any per-file cap -- with hundreds of tracked files each carrying a
+/// backlog (an ordinary "agent was down for a while" scenario), that staging
+/// buffer could balloon far past the `CHANNEL_BYTES` budget the pipeline
+/// itself is bounded by, since it sits upstream of that semaphore entirely.
+/// Batching bounds worst-case staging to `TAIL_BATCH_SIZE * READ_BUDGET`
+/// (~64 MiB at this value -- an unusual coincidence in practice, since
+/// `READ_BUDGET` is a safety cap rather than a typical read size) and, just
+/// as importantly, restores the original per-file interleaving between
+/// reading and sending: each batch's results are parsed, sent, and
+/// persisted before the next batch's `spawn_blocking` call starts, so a
+/// backed-up `EventSender` (its byte budget exhausted) blocks the send for
+/// the current batch before any further blocking reads are issued --
+/// exactly the backpressure coupling the original one-file-at-a-time loop
+/// had, which the all-at-once version had accidentally removed.
+const TAIL_BATCH_SIZE: usize = 16;
+
 /// Upper bound on bytes scanned to fingerprint a file's first line. Caps the
 /// cost for a pathologically long first line. Used on Windows for file identity
 /// and on Unix for copy-truncate race detection.
@@ -95,8 +116,8 @@ fn head_fingerprint(path: &Path) -> Option<u32> {
 }
 
 /// Counts calls to `head_fingerprint`, so tests can assert the gate in
-/// `tail_once` actually skips the open+read when a file's size hasn't
-/// changed since the last poll.
+/// `tail_once` actually skips the open+read when a file's size or mtime
+/// hasn't changed since the last poll.
 #[cfg(test)]
 static FINGERPRINT_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -104,6 +125,13 @@ static FINGERPRINT_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::Atom
 /// tailing never re-triggers discovery.
 #[cfg(test)]
 static DISCOVER_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Counts calls to `tail_paths_blocking` -- i.e. `spawn_blocking` dispatches
+/// within a single `tail_once` call -- so tests can assert `tail_once`
+/// actually splits a large tracked set into `TAIL_BATCH_SIZE`-sized chunks
+/// rather than processing everything in one call.
+#[cfg(test)]
+static TAIL_BATCH_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 struct Tracked {
     identity: String,
@@ -418,6 +446,15 @@ impl FileInput {
     /// walk, so it never blocks whichever tokio worker thread this task
     /// happens to be scheduled on. Only parsing (CPU-bound) and sending
     /// (genuinely async, cancellation-aware) run on the async task itself.
+    ///
+    /// Fix round 2: `tracked`'s paths are processed in `TAIL_BATCH_SIZE`
+    /// chunks, each via its own `spawn_blocking` call, rather than handing
+    /// the whole set to one call — see `TAIL_BATCH_SIZE`'s doc comment for
+    /// why. `tracked` is `mem::take`n and restored once per batch (not once
+    /// for the whole multi-batch pass), so a panic inside one batch's
+    /// `spawn_blocking` closure only risks that batch's entries — the same
+    /// risk shape `discover_once` already accepts — rather than every batch
+    /// already completed in this pass.
     async fn tail_once(
         &self,
         tx: &EventSender,
@@ -429,46 +466,57 @@ impl FileInput {
         let id = self.cfg.id.clone();
         let mut emitted = 0u64;
 
-        let owned = std::mem::take(tracked);
-        let paths: Vec<PathBuf> = owned.keys().cloned().collect();
-        let state_for_blocking = Arc::clone(state);
-        let cancel_for_blocking = cancel.clone();
-        let id_for_blocking = id.clone();
+        let paths: Vec<PathBuf> = tracked.keys().cloned().collect();
 
-        let (owned, results) = tokio::task::spawn_blocking(move || {
-            Self::tail_paths_blocking(
-                owned,
-                paths,
-                &id_for_blocking,
-                &state_for_blocking,
-                &cancel_for_blocking,
-            )
-        })
-        .await
-        .map_err(|e| anyhow::anyhow!("file tail task panicked: {e}"))?;
-
-        *tracked = owned;
-
-        for r in results {
+        for chunk in paths.chunks(TAIL_BATCH_SIZE) {
             if cancel.is_cancelled() {
                 break;
             }
-            for line in r.lines {
-                let ev = self.parser.parse(&line, &r.path_str, &self.source_type);
-                metrics
-                    .events_received
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                emitted += 1;
-                tokio::select! {
-                    res = tx.send(ev) => {
-                        if res.is_err() {
-                            return Ok(emitted);
-                        }
-                    }
-                    _ = cancel.cancelled() => return Ok(emitted),
+
+            let owned = std::mem::take(tracked);
+            let chunk_paths = chunk.to_vec();
+            let state_for_blocking = Arc::clone(state);
+            let cancel_for_blocking = cancel.clone();
+            let id_for_blocking = id.clone();
+
+            let (owned, results) = tokio::task::spawn_blocking(move || {
+                Self::tail_paths_blocking(
+                    owned,
+                    chunk_paths,
+                    &id_for_blocking,
+                    &state_for_blocking,
+                    &cancel_for_blocking,
+                )
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("file tail task panicked: {e}"))?;
+
+            // Restore immediately, before parsing/sending this batch's
+            // results, so only the batch currently in flight (if any) is
+            // ever at risk of loss to a panic — not batches already done.
+            *tracked = owned;
+
+            for r in results {
+                if cancel.is_cancelled() {
+                    return Ok(emitted);
                 }
+                for line in r.lines {
+                    let ev = self.parser.parse(&line, &r.path_str, &self.source_type);
+                    metrics
+                        .events_received
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    emitted += 1;
+                    tokio::select! {
+                        res = tx.send(ev) => {
+                            if res.is_err() {
+                                return Ok(emitted);
+                            }
+                        }
+                        _ = cancel.cancelled() => return Ok(emitted),
+                    }
+                }
+                state.set_cursor(&id, &r.identity, &r.path_str, r.offset, r.hash);
             }
-            state.set_cursor(&id, &r.identity, &r.path_str, r.offset, r.hash);
         }
 
         Ok(emitted)
@@ -483,6 +531,13 @@ impl FileInput {
     /// does) since it both reads and updates each path's entry, and hands it
     /// back alongside the per-path read results the async caller needs to
     /// parse, send, and persist.
+    ///
+    /// `paths` is one `TAIL_BATCH_SIZE`-sized chunk of `tracked`'s full key
+    /// set, not necessarily all of it — `tail_once` calls this once per
+    /// batch. `tracked` itself is always the whole map regardless of batch
+    /// size: only entries named in `paths` are touched, so passing the whole
+    /// map is correctness-neutral and keeps this function's shape unchanged
+    /// from before batching existed.
     fn tail_paths_blocking(
         mut tracked: HashMap<PathBuf, Tracked>,
         paths: Vec<PathBuf>,
@@ -490,6 +545,8 @@ impl FileInput {
         state: &StateManager,
         cancel: &CancellationToken,
     ) -> (HashMap<PathBuf, Tracked>, Vec<TailReadResult>) {
+        #[cfg(test)]
+        TAIL_BATCH_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut results = Vec::new();
 
         for path in paths {
@@ -546,7 +603,15 @@ impl FileInput {
             // has neither changed. Gating on size alone would miss a
             // same-size truncate+rewrite (e.g. a fixed-width status file):
             // size crosses the poll boundary unchanged even though the
-            // content did, so mtime is needed as the second signal.
+            // content did, so mtime is needed as the second signal. Residual
+            // gap (fix round 2): on filesystems with coarse mtime resolution
+            // (some ext3/HFS+/FAT/NFS configurations, 1-2s granularity), a
+            // truncate+rewrite to the exact same byte count within the same
+            // mtime tick as the previous observation can still be missed.
+            // That needs coarse mtime AND an exact size match AND the file
+            // going idle immediately after — narrow enough that it's not
+            // worth engineering around further, but worth documenting so a
+            // future reader doesn't assume this gate is exhaustive.
             #[cfg(unix)]
             {
                 if size != t.last_size || mtime != t.last_mtime || t.first_line_hash.is_none() {
@@ -1244,5 +1309,140 @@ mod tests {
             calls, 1,
             "with a 2s discovery interval, only the priming pass should run in 150ms; got {calls} calls"
         );
+    }
+
+    #[tokio::test]
+    async fn tail_once_batches_large_tracked_sets() {
+        let _guard = lock_counters();
+        // Fix round 2: an earlier version handed the *entire* tracked set to
+        // one spawn_blocking call, staging an unboundedly large
+        // Vec<TailReadResult> in memory (scaling with the number of tracked
+        // files) before sending a single event. tail_once must instead split
+        // tracked's paths into TAIL_BATCH_SIZE-sized chunks, each processed
+        // via its own spawn_blocking call. Prove the batching actually
+        // happens (by counting tail_paths_blocking calls, i.e.
+        // TAIL_BATCH_CALLS) and prove it preserves correctness: every one of
+        // N > TAIL_BATCH_SIZE tracked files must still be tailed in full
+        // across the resulting batches.
+        let dir = tempfile::tempdir().unwrap();
+        let state_dir = tempfile::tempdir().unwrap();
+
+        let n = TAIL_BATCH_SIZE * 2 + 3;
+        let mut expected: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for i in 0..n {
+            let p = dir.path().join(format!("f{i}.log"));
+            let line = format!("line-{i}");
+            std::fs::write(&p, format!("{line}\n")).unwrap();
+            expected.insert(line);
+        }
+
+        let input = input_for(dir.path());
+        let state = Arc::new(StateManager::open(state_dir.path()).unwrap());
+        let metrics = Arc::new(Metrics::default());
+        let (raw_tx, mut rx) = mpsc::channel(1000);
+        let tx = EventSender::with_budget(raw_tx, 16 * 1024 * 1024);
+        let cancel = CancellationToken::new();
+        let mut tracked = HashMap::new();
+
+        input
+            .discover_once(&state, &mut tracked, false)
+            .await
+            .unwrap();
+        assert_eq!(tracked.len(), n);
+
+        let before = TAIL_BATCH_CALLS.load(Ordering::Relaxed);
+        input
+            .tail_once(&tx, &state, &metrics, &mut tracked, &cancel)
+            .await
+            .unwrap();
+
+        let batches = TAIL_BATCH_CALLS.load(Ordering::Relaxed) - before;
+        let expected_batches = (n as u64).div_ceil(TAIL_BATCH_SIZE as u64);
+        assert_eq!(
+            batches, expected_batches,
+            "with {n} tracked files and a batch size of {TAIL_BATCH_SIZE}, expected \
+             {expected_batches} spawn_blocking calls; got {batches}"
+        );
+
+        let got: std::collections::HashSet<String> = collect(&mut rx).await.into_iter().collect();
+        assert_eq!(
+            got, expected,
+            "every tracked file must still be tailed to completion across batches"
+        );
+    }
+
+    #[tokio::test]
+    async fn tail_once_cancels_promptly_mid_pass() {
+        let _guard = lock_counters();
+        // Fix round 2: cancellation during a multi-batch tailing pass must
+        // stop promptly rather than draining every remaining batch first.
+        // Force a multi-batch pass (N files spread across several
+        // TAIL_BATCH_SIZE-sized chunks) and give the event channel capacity
+        // 1, so the pipeline backs up after exactly one successful send.
+        // `#[tokio::test]` here runs on a current-thread runtime (see the
+        // module-level comment on COUNTER_LOCK), so calling `cancel.cancel()`
+        // synchronously right after this task's `rx.recv().await` resolves
+        // is guaranteed to happen before the spawned tail_once task -- merely
+        // *woken*, not yet re-polled -- can make any further progress. That
+        // makes this test deterministic: cancellation lands mid-pass, well
+        // before every batch could possibly have run.
+        let dir = tempfile::tempdir().unwrap();
+        let state_dir = tempfile::tempdir().unwrap();
+
+        let n = TAIL_BATCH_SIZE * 5;
+        for i in 0..n {
+            let p = dir.path().join(format!("f{i}.log"));
+            std::fs::write(&p, format!("line-{i}\n")).unwrap();
+        }
+
+        let input = input_for(dir.path());
+        let state = Arc::new(StateManager::open(state_dir.path()).unwrap());
+        let metrics = Arc::new(Metrics::default());
+        let (raw_tx, mut rx) = mpsc::channel(1);
+        let tx = EventSender::with_budget(raw_tx, 16 * 1024 * 1024);
+        let cancel = CancellationToken::new();
+        let mut tracked = HashMap::new();
+
+        input
+            .discover_once(&state, &mut tracked, false)
+            .await
+            .unwrap();
+        assert_eq!(tracked.len(), n);
+
+        let before = TAIL_BATCH_CALLS.load(Ordering::Relaxed);
+        let cancel_for_task = cancel.clone();
+        let handle = tokio::spawn(async move {
+            input
+                .tail_once(&tx, &state, &metrics, &mut tracked, &cancel_for_task)
+                .await
+        });
+
+        let first = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await
+            .expect("must receive the first event promptly")
+            .expect("channel must not be closed yet");
+        assert!(first.message.starts_with("line-"), "got: {first:?}");
+        cancel.cancel();
+
+        let emitted = tokio::time::timeout(std::time::Duration::from_secs(5), handle)
+            .await
+            .expect("tail_once must return promptly after cancellation")
+            .unwrap()
+            .unwrap();
+
+        let batches = TAIL_BATCH_CALLS.load(Ordering::Relaxed) - before;
+        let total_batches = (n as u64).div_ceil(TAIL_BATCH_SIZE as u64);
+        assert!(
+            batches < total_batches,
+            "cancellation should stop the pass well before all {total_batches} batches run; \
+             got {batches}"
+        );
+        assert!(
+            emitted < n as u64,
+            "cancellation should stop well short of tailing every one of {n} files; \
+             got {emitted}"
+        );
+
+        let _ = collect(&mut rx).await;
     }
 }
