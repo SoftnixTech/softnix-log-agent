@@ -701,6 +701,30 @@ pub fn validate(cfg: &Config) -> Result<Vec<String>> {
         if s.port == 0 {
             bail!("inputs.syslog[{}]: port must be 1-65535", s.id);
         }
+        // `0` is exactly the value an operator would reach for to mean
+        // "unlimited"/"disabled", but it actually breaks the listener: a
+        // zero-sized semaphore rejects every connection, and a zero
+        // `Duration` timeout elapses instantly, closing every connection or
+        // handshake as soon as it starts. 1 is a legitimate (if extreme)
+        // value for all three; 0 never is.
+        if s.max_connections == 0 {
+            bail!(
+                "inputs.syslog[{}]: `max_connections` must be >= 1 (got 0)",
+                s.id
+            );
+        }
+        if s.idle_timeout_secs == 0 {
+            bail!(
+                "inputs.syslog[{}]: `idle_timeout_secs` must be >= 1 (got 0)",
+                s.id
+            );
+        }
+        if s.handshake_timeout_secs == 0 {
+            bail!(
+                "inputs.syslog[{}]: `handshake_timeout_secs` must be >= 1 (got 0)",
+                s.id
+            );
+        }
         match s.protocol {
             SyslogProtocol::Tls => {
                 let tls = s.tls.as_ref().ok_or_else(|| {
@@ -1042,6 +1066,77 @@ outputs:
         assert!(
             msg.contains("not-an-ip-or-cidr"),
             "expected the bad entry in error: {msg}"
+        );
+    }
+
+    /// H-5 fix round 1: `0` for these knobs isn't "unlimited"/"disabled" —
+    /// it breaks the listener (a zero-sized semaphore rejects every
+    /// connection; a zero timeout elapses instantly) — so `validate()` must
+    /// reject it rather than silently accepting a config that drops 100% of
+    /// traffic.
+    #[test]
+    fn rejects_zero_max_connections() {
+        let yaml = r#"
+inputs:
+  syslog:
+    - id: rsyslog
+      protocol: tcp
+      port: 5514
+      max_connections: 0
+outputs:
+  - id: console
+    type: stdout
+"#;
+        let err = parse(yaml).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("rsyslog"), "expected input id in error: {msg}");
+        assert!(
+            msg.contains("max_connections"),
+            "expected field name in error: {msg}"
+        );
+    }
+
+    #[test]
+    fn rejects_zero_idle_timeout_secs() {
+        let yaml = r#"
+inputs:
+  syslog:
+    - id: rsyslog
+      protocol: tcp
+      port: 5514
+      idle_timeout_secs: 0
+outputs:
+  - id: console
+    type: stdout
+"#;
+        let err = parse(yaml).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("rsyslog"), "expected input id in error: {msg}");
+        assert!(
+            msg.contains("idle_timeout_secs"),
+            "expected field name in error: {msg}"
+        );
+    }
+
+    #[test]
+    fn rejects_zero_handshake_timeout_secs() {
+        let yaml = r#"
+inputs:
+  syslog:
+    - id: rsyslog
+      protocol: tcp
+      port: 5514
+      handshake_timeout_secs: 0
+outputs:
+  - id: console
+    type: stdout
+"#;
+        let err = parse(yaml).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("rsyslog"), "expected input id in error: {msg}");
+        assert!(
+            msg.contains("handshake_timeout_secs"),
+            "expected field name in error: {msg}"
         );
     }
 

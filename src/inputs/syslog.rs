@@ -26,7 +26,22 @@ const MAX_MSG: usize = 64 * 1024;
 /// occurrences per `counter`, mirroring the shedding-log idiom already used
 /// for the router's per-destination backpressure counters (see
 /// `engine::route`) — visible without letting a scanner fill the log buffer.
-fn log_rejection_rate_limited(counter: &AtomicU64, id: &str, peer: IpAddr, reason: &str) {
+///
+/// On the same throttled tick, also surface the rejection to `status` (as
+/// `last_error`) so a misconfigured allowlist or an undersized
+/// `max_connections` doesn't silently drop traffic while `/api/status`
+/// keeps reporting the input as healthy — mirroring the existing UDP
+/// receive-error path below, which reports to both `metrics` and `status`.
+/// Gated on the same throttle as the log line (rather than firing on every
+/// rejection) to avoid taking the status-registry lock on every packet from
+/// a flood.
+fn log_rejection_rate_limited(
+    counter: &AtomicU64,
+    id: &str,
+    peer: IpAddr,
+    reason: &str,
+    status: &StatusRegistry,
+) {
     let n = counter.fetch_add(1, Ordering::Relaxed) + 1;
     if n % 100 == 1 {
         tracing::warn!(
@@ -35,6 +50,26 @@ fn log_rejection_rate_limited(counter: &AtomicU64, id: &str, peer: IpAddr, reaso
             rejected_total = n,
             "syslog {reason} (logged every 100th occurrence)"
         );
+        status.update_input(id, |s| s.last_error = Some(format!("{n} {reason}")));
+    }
+}
+
+/// Canonicalize an IPv4-mapped IPv6 address (`::ffff:a.b.c.d`) to its
+/// underlying `IpAddr::V4` before allowlist matching.
+///
+/// `ipnet::IpNet::contains` returns `false` on any IP-family mismatch
+/// (`IpNet::V4` vs an `IpAddr::V6`). On a dual-stack listener (`bind: "::"`,
+/// the common Linux default with `net.ipv6.bindv6only=0`), an IPv4 client's
+/// peer address arrives as an IPv4-mapped IPv6 address rather than a plain
+/// `IpAddr::V4` — so without this, an `allowed_senders` entry like
+/// `10.0.0.0/8` would never match, silently rejecting every IPv4 sender.
+fn canonicalize(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(v6) => v6
+            .to_ipv4_mapped()
+            .map(IpAddr::V4)
+            .unwrap_or(IpAddr::V6(v6)),
+        v4 => v4,
     }
 }
 
@@ -72,6 +107,7 @@ impl SyslogInput {
 
     /// Empty `allowed_senders` preserves today's behavior: allow everyone.
     fn sender_allowed(&self, ip: IpAddr) -> bool {
+        let ip = canonicalize(ip);
         self.allowed_senders.is_empty() || self.allowed_senders.iter().any(|n| n.contains(&ip))
     }
 
@@ -146,11 +182,18 @@ impl SyslogInput {
                     match res {
                         Ok((n, peer)) => {
                             if !self.sender_allowed(peer.ip()) {
+                                // Counted for every rejected datagram (cheap
+                                // atomic increment), unlike the throttled
+                                // log/status below — matches how
+                                // `events_dropped` is used elsewhere for
+                                // "received but not processed" accounting.
+                                metrics.events_dropped.fetch_add(1, Ordering::Relaxed);
                                 log_rejection_rate_limited(
                                     &self.rejected_by_allowlist,
                                     &self.cfg.id,
                                     peer.ip(),
-                                    "datagram rejected: sender not in allowed_senders",
+                                    "datagrams rejected: sender not in allowed_senders",
+                                    &status,
                                 );
                                 continue;
                             }
@@ -212,11 +255,17 @@ impl SyslogInput {
                     };
 
                     if !me.sender_allowed(peer.ip()) {
+                        // A rejected CONNECTION isn't the same unit as a
+                        // rejected EVENT, so (unlike the UDP datagram path)
+                        // this doesn't touch `metrics.events_dropped` — the
+                        // throttled status/log signal below is the intended
+                        // observability surface here.
                         log_rejection_rate_limited(
                             &me.rejected_by_allowlist,
                             &me.cfg.id,
                             peer.ip(),
-                            "connection rejected: sender not in allowed_senders",
+                            "connections rejected: sender not in allowed_senders",
+                            &status,
                         );
                         continue; // `stream` dropped here => connection closed, no task spawned
                     }
@@ -228,7 +277,8 @@ impl SyslogInput {
                                 &me.rejected_over_cap,
                                 &me.cfg.id,
                                 peer.ip(),
-                                "connection rejected: max_connections reached",
+                                "connections rejected: over max_connections limit",
+                                &status,
                             );
                             continue; // `stream` dropped here => connection closed, no task spawned
                         }
@@ -396,6 +446,30 @@ mod tests {
         assert!(!input.sender_allowed("203.0.113.9".parse().unwrap()));
     }
 
+    /// H-5 fix round 1: on a dual-stack listener (`bind: "::"`), an IPv4
+    /// sender's peer address arrives as an IPv4-mapped IPv6 address
+    /// (`::ffff:10.1.2.3`), not a plain `IpAddr::V4`. Without canonicalizing
+    /// it first, `ipnet::IpNet::contains` would return `false` on the
+    /// family mismatch and silently reject every IPv4 sender even though
+    /// `10.0.0.0/8` is in `allowed_senders` — this would have failed before
+    /// the `canonicalize` fix.
+    #[test]
+    fn sender_allowed_canonicalizes_ipv4_mapped_ipv6() {
+        let mut cfg = test_cfg(SyslogProtocol::Udp, 0);
+        cfg.allowed_senders = vec!["10.0.0.0/8".to_string()];
+        let input = SyslogInput::new(&cfg);
+
+        let mapped: std::net::Ipv4Addr = "10.1.2.3".parse().unwrap();
+        let mapped = IpAddr::V6(mapped.to_ipv6_mapped());
+        assert!(input.sender_allowed(mapped));
+
+        // A mapped address outside the allowlisted range must still be
+        // rejected — canonicalizing must not widen the match.
+        let not_mapped: std::net::Ipv4Addr = "203.0.113.9".parse().unwrap();
+        let not_mapped = IpAddr::V6(not_mapped.to_ipv6_mapped());
+        assert!(!input.sender_allowed(not_mapped));
+    }
+
     #[tokio::test]
     async fn udp_drops_datagrams_from_disallowed_senders() {
         let mut cfg = test_cfg(SyslogProtocol::Udp, 0);
@@ -448,8 +522,19 @@ mod tests {
         let cancel = CancellationToken::new();
         tokio::spawn(input.run_tcp(listener, None, tx, status, metrics, cancel.clone()));
 
-        use tokio::io::AsyncReadExt;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let mut conn = tokio::net::TcpStream::connect(addr).await.unwrap();
+        // Actually send a real, valid syslog line before checking for
+        // closure/no-event: otherwise "no event received" is vacuous (a
+        // connection nothing was ever written to also produces no event,
+        // rejected or not). The server already dropped the stream at
+        // accept-time without spawning a reader, so this write may itself
+        // fail (broken pipe/reset) if the peer has already reset the
+        // connection — that failure is expected and consistent with
+        // rejection, not a test bug, so it's intentionally not unwrapped.
+        let _ = conn
+            .write_all(b"<13>Jun 10 12:00:00 host1 app[7]: should never be processed\n")
+            .await;
         // The server drops the stream without reading it, so depending on
         // the platform the client sees either a clean EOF (n == 0) or a
         // reset (the dropped socket had unread/unflushed data pending) —
