@@ -11,6 +11,6 @@ mod transform;
 
 pub use condition::{eval_condition, CompiledCondition};
 pub use enrich::Enricher;
-pub use parser::Parser;
+pub use parser::{parse_timestamp, Parser};
 pub use syslog::parse_syslog_into;
 pub use transform::Transformer;
