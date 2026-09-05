@@ -37,12 +37,15 @@ use windows::Win32::System::Threading::{CreateEventW, ResetEvent, WaitForSingleO
 const BATCH: usize = 64;
 /// How often the WaitForSingleObject loop wakes to re-check cancellation.
 const WAIT_MS: u32 = 1000;
-/// Re-subscribe backoff (milliseconds): starts here, doubles, capped at 30 s.
+/// Re-subscribe backoff (milliseconds): starts here, doubles, capped at 5 min.
+/// A channel must never permanently stop retrying (R-7): a Sysmon restart, a
+/// channel that does not exist yet at boot, or a transient ACCESS_DENIED while
+/// the SCM is still setting up the service token must not end collection for
+/// the rest of the process's life. The cap is generous specifically so a
+/// long-broken channel doesn't hammer the API on a short cycle forever, while
+/// still eventually retrying.
 const RESUBSCRIBE_INITIAL_BACKOFF_MS: u64 = 500;
-const RESUBSCRIBE_MAX_BACKOFF_MS: u64 = 30_000;
-/// Demote a flapping channel to fatal after this many consecutive transient
-/// failures, so a permanently broken channel does not spin silently.
-const RESUBSCRIBE_MAX_ATTEMPTS: u32 = 10;
+const RESUBSCRIBE_MAX_BACKOFF_MS: u64 = 300_000;
 /// `HRESULT_FROM_WIN32(ERROR_INVALID_OPERATION)` — observed at the
 /// real-time transition when the agent runs in Session 0 (Windows Service).
 /// Re-subscribing from the persisted bookmark typically clears it.
@@ -62,7 +65,9 @@ impl EventLogInput {
     }
 
     /// Spawn one blocking collector per channel; the returned task completes
-    /// when every channel has stopped (on cancellation or fatal error).
+    /// once every channel has stopped, which (R-7) only happens on
+    /// cancellation — a channel retries indefinitely rather than ending
+    /// collection permanently on error.
     pub fn spawn(
         self,
         tx: EventSender,
@@ -92,7 +97,11 @@ impl EventLogInput {
                     cancel.clone(),
                 );
                 handles.push(tokio::task::spawn_blocking(move || {
-                    if let Err(e) = run_channel(
+                    // `run_channel` now retries forever (R-7: a channel must
+                    // never permanently end collection) and only returns on
+                    // cancellation, so there is no fatal-error path to report
+                    // here any more.
+                    run_channel(
                         &cfg,
                         &channel,
                         &source_type,
@@ -101,12 +110,7 @@ impl EventLogInput {
                         &status,
                         &metrics,
                         &cancel,
-                    ) {
-                        let msg = format!("eventlog {} channel {channel}: {e}", cfg.id);
-                        tracing::error!("{msg}");
-                        metrics.record_error(&msg);
-                        status.update_input(&cfg.id, |s| s.last_error = Some(e.to_string()));
-                    }
+                    );
                 }));
             }
             for h in handles {
@@ -126,6 +130,13 @@ fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
+/// Retry loop for one channel. Never returns on error — only on cancellation
+/// (R-7: a Sysmon restart, a channel that does not exist yet at boot, or a
+/// transient ACCESS_DENIED while the SCM is still setting up the service
+/// token must not end collection for the rest of the process's life). Every
+/// subscribe/drain failure, allowlisted-transient or not, is logged, surfaced
+/// via `status.last_error`, and retried after a cancellation-aware backoff
+/// sleep that grows without bound (see [`RESUBSCRIBE_MAX_BACKOFF_MS`]).
 #[allow(clippy::too_many_arguments)]
 fn run_channel(
     cfg: &EventLogInputConfig,
@@ -136,15 +147,19 @@ fn run_channel(
     status: &StatusRegistry,
     metrics: &Metrics,
     cancel: &CancellationToken,
-) -> windows::core::Result<()> {
+) {
     let chan_w = wide(channel);
     let query_w = wide(&cfg.query);
 
     let mut backoff = Backoff::start();
+    // Survives across resubscribe attempts within this channel so a
+    // long-lived flapping channel doesn't keep reopening the same handful of
+    // providers' message-resource DLLs on every attempt.
+    let mut cache = PublisherCache::default();
 
     loop {
         if cancel.is_cancelled() {
-            return Ok(());
+            return;
         }
         // Read the latest bookmark before every attempt: a previous iteration
         // may have advanced it before failing, and re-subscribing from the
@@ -164,30 +179,34 @@ fn run_channel(
                 status,
                 metrics,
                 cancel,
+                &mut cache,
             )
         };
 
         match attempt {
-            Ok(()) => return Ok(()),
-            Err(e) if is_transient(&e) => {
-                // EVT-001: a transient failure only counts toward "giving up" if
-                // no progress was made this attempt. Draining events proves the
-                // subscription is healthy and the error was a blip, so the
-                // counter and delay reset — otherwise a channel that flaps once
-                // an hour still trips RESUBSCRIBE_MAX_ATTEMPTS over time.
+            Ok(()) => return,
+            Err(e) => {
+                // EVT-001: a failure only counts toward the backoff climb if
+                // no progress was made this attempt. Draining events proves
+                // the subscription is healthy and the error was a blip, so
+                // the counter and delay reset — otherwise a channel that
+                // flaps once an hour still climbs to the max backoff over
+                // time. R-7: retrying is no longer gated on `is_transient` —
+                // an error NOT on that narrow allowlist used to end the
+                // channel's collection forever on its very first occurrence;
+                // now every error retries, allowlisted or not. `is_transient`
+                // is kept purely as a diagnostic classifier here (operators
+                // can tell a known-recoverable blip from an unclassified
+                // error in the logs) — it no longer decides retry-or-die.
                 backoff = backoff.after_transient(events > 0);
-                if backoff.should_give_up() {
-                    tracing::error!(
-                        "eventlog {} channel {channel}: {} consecutive transient failures \
-                         (last: {e}); giving up",
-                        cfg.id,
-                        backoff.failures
-                    );
-                    return Err(e);
-                }
+                let kind = if is_transient(&e) {
+                    "transient error"
+                } else {
+                    "error"
+                };
                 tracing::warn!(
-                    "eventlog {} channel {channel}: transient error {e} (attempt \
-                     {}); re-subscribing from bookmark in {}ms",
+                    "eventlog {} channel {channel}: {kind} {e} (attempt {}); \
+                     re-subscribing from bookmark in {}ms",
                     cfg.id,
                     backoff.failures,
                     backoff.delay_ms
@@ -201,13 +220,12 @@ fn run_channel(
                 let until = Instant::now() + Duration::from_millis(backoff.delay_ms);
                 while Instant::now() < until {
                     if cancel.is_cancelled() {
-                        return Ok(());
+                        return;
                     }
                     std::thread::sleep(Duration::from_millis(100));
                 }
                 backoff = backoff.doubled();
             }
-            Err(e) => return Err(e),
         }
     }
 }
@@ -257,11 +275,12 @@ fn resume_mode(has_bookmark: bool, read_existing: bool) -> ResumeMode {
     }
 }
 
-/// Re-subscribe backoff after a transient error. Progress in the failed attempt
+/// Re-subscribe backoff after a failed attempt. Progress in the failed attempt
 /// (events drained) proves the subscription is healthy, so the consecutive-
 /// failure counter and delay reset to their starting values; a run of dry
-/// failures climbs toward [`RESUBSCRIBE_MAX_ATTEMPTS`] before we give up. Kept
-/// as a pure value type so the EVT-001 flap accounting is unit-testable.
+/// failures climbs the delay toward [`RESUBSCRIBE_MAX_BACKOFF_MS`] — but the
+/// channel never gives up retrying (R-7). Kept as a pure value type so the
+/// EVT-001 flap accounting is unit-testable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Backoff {
     failures: u32,
@@ -276,7 +295,7 @@ impl Backoff {
         }
     }
 
-    /// Account for one transient failure; `made_progress` is whether any event
+    /// Account for one failed attempt; `made_progress` is whether any event
     /// was drained during the attempt that failed.
     fn after_transient(self, made_progress: bool) -> Self {
         if made_progress {
@@ -287,10 +306,6 @@ impl Backoff {
                 delay_ms: self.delay_ms,
             }
         }
-    }
-
-    fn should_give_up(self) -> bool {
-        self.failures >= RESUBSCRIBE_MAX_ATTEMPTS
     }
 
     /// Double the delay for the next attempt, capped at the maximum.
@@ -319,6 +334,7 @@ unsafe fn subscribe_and_drain(
     status: &StatusRegistry,
     metrics: &Metrics,
     cancel: &CancellationToken,
+    cache: &mut PublisherCache,
 ) -> (windows::core::Result<()>, u64) {
     // Manual-reset signal event fired by the subscription on new records.
     let signal = match CreateEventW(None, true, false, PCWSTR::null()) {
@@ -398,6 +414,7 @@ unsafe fn subscribe_and_drain(
         cancel,
         &mut last_flush,
         &mut bookmark_updated,
+        cache,
     );
 
     // Persist the latest position so the next attempt (or the next process
@@ -430,6 +447,7 @@ unsafe fn drain_loop(
     cancel: &CancellationToken,
     last_flush: &mut Instant,
     bookmark_updated: &mut bool,
+    cache: &mut PublisherCache,
 ) -> (u64, windows::core::Result<()>) {
     let mut total_emitted = 0u64;
     loop {
@@ -461,7 +479,8 @@ unsafe fn drain_loop(
             }
 
             let mut emitted = 0u64;
-            for &raw in events.iter().take(returned as usize) {
+            let returned = returned as usize;
+            for (i, &raw) in events.iter().take(returned).enumerate() {
                 let ev_handle = EVT_HANDLE(raw);
                 match render_xml(ev_handle) {
                     Ok(xml) => {
@@ -471,6 +490,7 @@ unsafe fn drain_loop(
                             channel,
                             source_type,
                             cfg.keep_raw_message,
+                            cache,
                         );
                         emitted += 1;
                         metrics
@@ -482,7 +502,14 @@ unsafe fn drain_loop(
                         *bookmark_updated = true;
                         let _ = EvtClose(ev_handle);
                         if tx.blocking_send(event, cancel).is_err() {
-                            return (total_emitted + emitted, Ok(())); // pipeline shut down
+                            // Pipeline shut down. `ev_handle` above is already
+                            // closed, but any events later in this batch
+                            // (indices i+1..returned) haven't been processed
+                            // yet and would otherwise leak their EVT_HANDLEs.
+                            for &raw in &events[i + 1..returned] {
+                                let _ = EvtClose(EVT_HANDLE(raw));
+                            }
+                            return (total_emitted + emitted, Ok(()));
                         }
                     }
                     Err(e) => {
@@ -509,7 +536,7 @@ unsafe fn drain_loop(
                 *last_flush = Instant::now();
             }
 
-            if (returned as usize) < BATCH {
+            if returned < BATCH {
                 let _ = ResetEvent(signal);
                 break;
             }
@@ -555,15 +582,52 @@ unsafe fn render_handle(
     Ok(utf16_bytes_to_string(&buf[..used as usize]))
 }
 
+/// Closes the wrapped EVT_HANDLE on drop.
+struct EvtHandleGuard(EVT_HANDLE);
+
+impl Drop for EvtHandleGuard {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = EvtClose(self.0);
+        }
+    }
+}
+
+/// Caches EvtOpenPublisherMetadata handles per provider name (R-6). A channel
+/// typically has a handful of distinct providers; opening this per-event (as
+/// before) loads the provider's message resource DLL on every single record.
+#[derive(Default)]
+struct PublisherCache {
+    map: std::collections::HashMap<String, EvtHandleGuard>,
+}
+
+impl PublisherCache {
+    /// Returns the cached (or newly opened) publisher metadata handle for
+    /// `provider`, or `None` if it cannot be opened (unknown provider, etc).
+    unsafe fn get_or_open(&mut self, provider: &str) -> Option<EVT_HANDLE> {
+        if let Some(g) = self.map.get(provider) {
+            return Some(g.0);
+        }
+        let pw = wide(provider);
+        let meta =
+            EvtOpenPublisherMetadata(null_handle(), PCWSTR(pw.as_ptr()), PCWSTR::null(), 0, 0)
+                .ok()?;
+        self.map.insert(provider.to_string(), EvtHandleGuard(meta));
+        Some(meta)
+    }
+}
+
 /// Best-effort human-readable message via the publisher's metadata. Falls back
 /// to `None` when the provider is unknown or has no message for the event.
-unsafe fn format_message(event: EVT_HANDLE, provider: &str) -> Option<String> {
+unsafe fn format_message(
+    event: EVT_HANDLE,
+    provider: &str,
+    cache: &mut PublisherCache,
+) -> Option<String> {
     if provider.is_empty() {
         return None;
     }
-    let pw = wide(provider);
-    let meta =
-        EvtOpenPublisherMetadata(null_handle(), PCWSTR(pw.as_ptr()), PCWSTR::null(), 0, 0).ok()?;
+    let meta = cache.get_or_open(provider)?;
     let mut used = 0u32;
     // Probe length (in characters).
     let _ = EvtFormatMessage(
@@ -601,7 +665,6 @@ unsafe fn format_message(event: EVT_HANDLE, provider: &str) -> Option<String> {
     } else {
         None
     };
-    let _ = EvtClose(meta);
     result
 }
 
@@ -634,13 +697,14 @@ unsafe fn build_event(
     channel: &str,
     source_type: &str,
     keep_raw_message: bool,
+    cache: &mut PublisherCache,
 ) -> Event {
     let p = parse_event_xml(xml);
 
     // Message: prefer the formatted publisher message, then EventData, then a
     // synthesized line; the full XML is retained as raw_message only when
     // `keep_raw_message` is set (see EventLogInputConfig::keep_raw_message).
-    let message = format_message(event, &p.provider)
+    let message = format_message(event, &p.provider, cache)
         .or_else(|| {
             if p.data.is_empty() {
                 None
@@ -891,25 +955,26 @@ mod tests {
     #[test]
     fn backoff_resets_on_progress_but_climbs_on_dry_failures() {
         // EVT-001: a flap that still drained events must wipe the slate clean so
-        // an occasional blip never accumulates toward "giving up".
+        // an occasional blip never accumulates unbounded backoff growth.
         let mut b = Backoff::start();
         for _ in 0..5 {
             b = b.after_transient(false).doubled();
         }
         assert_eq!(b.failures, 5);
-        assert!(!b.should_give_up());
         assert_eq!(b.after_transient(true), Backoff::start());
     }
 
     #[test]
-    fn backoff_gives_up_only_after_max_consecutive_dry_failures() {
+    fn backoff_climbs_without_bound_on_sustained_dry_failures() {
+        // R-7: a channel must never permanently stop retrying, so `Backoff`
+        // has no "give up" threshold — the failure count is free to climb
+        // indefinitely as long as the delay itself stays capped (see
+        // `backoff_delay_doubles_and_caps`).
         let mut b = Backoff::start();
-        for _ in 0..RESUBSCRIBE_MAX_ATTEMPTS - 1 {
+        for _ in 0..50 {
             b = b.after_transient(false);
         }
-        assert!(!b.should_give_up(), "must not give up before the limit");
-        b = b.after_transient(false);
-        assert!(b.should_give_up());
+        assert_eq!(b.failures, 50);
     }
 
     #[test]
