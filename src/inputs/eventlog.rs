@@ -204,13 +204,17 @@ fn run_channel(
                 } else {
                     "error"
                 };
-                tracing::warn!(
+                let msg = format!(
                     "eventlog {} channel {channel}: {kind} {e} (attempt {}); \
                      re-subscribing from bookmark in {}ms",
-                    cfg.id,
-                    backoff.failures,
-                    backoff.delay_ms
+                    cfg.id, backoff.failures, backoff.delay_ms
                 );
+                metrics.record_error(&msg);
+                if backoff.delay_ms >= RESUBSCRIBE_MAX_BACKOFF_MS {
+                    tracing::error!("{msg}");
+                } else {
+                    tracing::warn!("{msg}");
+                }
                 let attempt = backoff.failures;
                 status.update_input(&cfg.id, |s| {
                     s.last_error = Some(format!("{e} (re-subscribing, attempt {attempt})"));
@@ -230,9 +234,10 @@ fn run_channel(
     }
 }
 
-/// Returns true if the error is potentially recoverable by re-subscribing from
-/// the persisted bookmark. Kept narrow on purpose: only errors we have evidence
-/// are recoverable. Add to this allowlist as new transient codes are confirmed.
+/// Classifies an error as a known-recoverable blip purely for the log line
+/// (`run_channel` retries every error regardless of this result — see R-7).
+/// Kept narrow on purpose: only errors we have evidence are recoverable.
+/// Add to this allowlist as new transient codes are confirmed.
 fn is_transient(e: &windows::core::Error) -> bool {
     is_transient_code(e.code().0)
 }
@@ -248,8 +253,9 @@ fn is_transient_code(code: i32) -> bool {
 /// up) rather than a real failure? Both `ERROR_NO_MORE_ITEMS` and the idle
 /// transition `ERROR_INVALID_OPERATION` (0x800710DD) belong here: after ~2 s of
 /// channel silence a healthy pull subscription surfaces the latter, and treating
-/// it as fatal runs the input into "giving up" within minutes (EVT-001). In both
-/// cases the subscription is fine — reset the signal and wait for the next one.
+/// it as fatal would spuriously count against the resubscribe backoff (EVT-001).
+/// In both cases the subscription is fine — reset the signal and wait for the
+/// next one.
 fn is_drain_idle(code: windows::core::HRESULT) -> bool {
     code == ERROR_NO_MORE_ITEMS.to_hresult() || code.0 as u32 == HRESULT_INVALID_OPERATION as u32
 }
@@ -479,7 +485,7 @@ unsafe fn drain_loop(
             }
 
             let mut emitted = 0u64;
-            let returned = returned as usize;
+            let returned = (returned as usize).min(events.len());
             for (i, &raw) in events.iter().take(returned).enumerate() {
                 let ev_handle = EVT_HANDLE(raw);
                 match render_xml(ev_handle) {
@@ -598,22 +604,26 @@ impl Drop for EvtHandleGuard {
 /// before) loads the provider's message resource DLL on every single record.
 #[derive(Default)]
 struct PublisherCache {
-    map: std::collections::HashMap<String, EvtHandleGuard>,
+    map: std::collections::HashMap<String, Option<EvtHandleGuard>>,
 }
 
 impl PublisherCache {
     /// Returns the cached (or newly opened) publisher metadata handle for
     /// `provider`, or `None` if it cannot be opened (unknown provider, etc).
+    /// A failed open is cached too — a provider whose metadata can never be
+    /// opened (e.g. no manifest installed locally) would otherwise retry the
+    /// open on every single event, the same hot path R-6 exists to remove.
     unsafe fn get_or_open(&mut self, provider: &str) -> Option<EVT_HANDLE> {
-        if let Some(g) = self.map.get(provider) {
-            return Some(g.0);
+        if let Some(cached) = self.map.get(provider) {
+            return cached.as_ref().map(|g| g.0);
         }
         let pw = wide(provider);
-        let meta =
-            EvtOpenPublisherMetadata(null_handle(), PCWSTR(pw.as_ptr()), PCWSTR::null(), 0, 0)
-                .ok()?;
-        self.map.insert(provider.to_string(), EvtHandleGuard(meta));
-        Some(meta)
+        let opened =
+            EvtOpenPublisherMetadata(null_handle(), PCWSTR(pw.as_ptr()), PCWSTR::null(), 0, 0).ok();
+        let handle = opened;
+        self.map
+            .insert(provider.to_string(), opened.map(EvtHandleGuard));
+        handle
     }
 }
 
@@ -639,7 +649,7 @@ unsafe fn format_message(
         None,
         &mut used,
     );
-    let result = if used > 0 {
+    if used > 0 {
         let mut buf = vec![0u16; used as usize];
         match EvtFormatMessage(
             meta,
@@ -664,8 +674,7 @@ unsafe fn format_message(
         }
     } else {
         None
-    };
-    result
+    }
 }
 
 fn utf16_bytes_to_string(bytes: &[u8]) -> String {
@@ -923,8 +932,8 @@ mod tests {
 
     #[test]
     fn transient_matches_only_known_idle_transition() {
-        // EVT-001: 0x800710DD is the one code we treat as recoverable; anything
-        // else (e.g. ACCESS_DENIED) must stay fatal so we don't spin forever.
+        // EVT-001: 0x800710DD is the one code we classify as recoverable in
+        // logs (run_channel retries every error either way, per R-7).
         assert!(is_transient_code(HRESULT_INVALID_OPERATION));
         assert!(!is_transient_code(0));
         assert!(!is_transient_code(0x8007_0005u32 as i32)); // ERROR_ACCESS_DENIED
