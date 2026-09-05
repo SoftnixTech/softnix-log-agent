@@ -138,6 +138,10 @@ Receive syslog over the network.
 | `tls` | object | — | Required when `protocol: tls`. See below. |
 | `source_type` | string | `syslog` | Overrides `source_type` on emitted events. |
 | `keep_raw_message` | bool | `false` | Keep the original wire line (PRI, timestamp, hostname, tag included) in `raw_message`. Before this version this was implicitly always on; `message` (the parsed body) and `raw_message` genuinely differ for syslog, so leaving this off is real information loss, not just savings — enable it if you need the original line (forensics, a downstream SIEM that re-parses raw text). Doubles memory, queue usage and wire size per event. |
+| `max_connections` | int | `512` | TCP/TLS only (UDP is connectionless). Maximum number of concurrently open connections. An accepted connection past this cap is closed immediately, without being served, so an unauthenticated remote party opening many idle connections cannot exhaust the process's file descriptor limit (`LimitNOFILE`) and starve legitimate senders or the agent's own outbound connections. |
+| `idle_timeout_secs` | int | `300` | TCP/TLS only. A connection that sends no complete line for this long is closed. Prevents a slowloris-style idle hold from pinning a connection-limit slot and a file descriptor indefinitely. |
+| `handshake_timeout_secs` | int | `10` | TLS only. A TLS handshake that does not complete within this long is abandoned and the connection closed. |
+| `allowed_senders` | list of string | `[]` (empty = allow all) | Restrict which source IPs may connect (TCP/TLS) or send (UDP). Each entry is an IP (e.g. `10.0.0.1`) or CIDR range (e.g. `10.0.0.0/8`). A UDP datagram, or a TCP/TLS connection attempt, from a sender not in this list is dropped/closed before any processing. Leave empty to preserve the default of accepting from any sender. |
 
 **`tls` (server) options** — required for `protocol: tls`:
 

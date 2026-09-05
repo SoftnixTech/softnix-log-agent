@@ -151,10 +151,60 @@ pub struct SyslogInputConfig {
     /// queue usage and wire size per event; off by default.
     #[serde(default)]
     pub keep_raw_message: bool,
+    /// Maximum number of concurrently open TCP/TLS connections (UDP is
+    /// connectionless and ignores this). Caps how many idle or slow senders
+    /// can pin file descriptors before legitimate senders and the agent's
+    /// own outbound connections start starving.
+    #[serde(default = "default_max_connections")]
+    pub max_connections: usize,
+    /// Close a TCP/TLS connection that has sent no complete line for this
+    /// long, in seconds. Prevents a slowloris-style idle hold from pinning a
+    /// connection-limit slot and a file descriptor indefinitely.
+    #[serde(default = "default_idle_timeout_secs")]
+    pub idle_timeout_secs: u64,
+    /// Abandon a TLS handshake that has not completed within this many
+    /// seconds. TCP only (plain TCP has no handshake).
+    #[serde(default = "default_handshake_timeout_secs")]
+    pub handshake_timeout_secs: u64,
+    /// Allowlist of source IPs/CIDRs permitted to send to this input, e.g.
+    /// ["10.0.0.0/8", "192.168.1.5"]. Empty (the default) allows any sender,
+    /// preserving pre-existing behavior.
+    #[serde(default)]
+    pub allowed_senders: Vec<String>,
 }
 
 fn default_bind_all() -> String {
     "0.0.0.0".to_string()
+}
+
+fn default_max_connections() -> usize {
+    512
+}
+
+fn default_idle_timeout_secs() -> u64 {
+    300
+}
+
+fn default_handshake_timeout_secs() -> u64 {
+    10
+}
+
+/// Parse one `allowed_senders` entry as an `ipnet::IpNet`. `ipnet::IpNet`'s
+/// `FromStr` requires an explicit prefix (e.g. "10.0.0.0/8") and rejects a
+/// bare IP address, so a bare IP is widened to a host route (`/32` for IPv4,
+/// `/128` for IPv6) before being treated as an error.
+pub fn parse_ip_net(s: &str) -> Result<ipnet::IpNet> {
+    if let Ok(net) = s.parse::<ipnet::IpNet>() {
+        return Ok(net);
+    }
+    let addr: IpAddr = s
+        .parse()
+        .with_context(|| format!("invalid IP or CIDR: {s:?}"))?;
+    let prefix_len = match addr {
+        IpAddr::V4(_) => 32,
+        IpAddr::V6(_) => 128,
+    };
+    Ok(ipnet::IpNet::new(addr, prefix_len).expect("prefix_len is valid for the address family"))
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -674,6 +724,14 @@ pub fn validate(cfg: &Config) -> Result<Vec<String>> {
                 }
             }
         }
+        for entry in &s.allowed_senders {
+            parse_ip_net(entry).with_context(|| {
+                format!(
+                    "inputs.syslog[{}]: `allowed_senders` entry {:?} is not a valid IP or CIDR",
+                    s.id, entry
+                )
+            })?;
+        }
     }
 
     for e in &cfg.inputs.eventlog {
@@ -916,6 +974,75 @@ outputs:
         assert_eq!(cfg.inputs.files.len(), 1);
         assert_eq!(cfg.inputs.files[0].discovery_interval_ms, 30_000);
         assert_eq!(cfg.inputs.syslog[0].port, 5514);
+    }
+
+    /// H-5: connection-cap/timeout/allowlist knobs default to safe values
+    /// when a syslog input doesn't set them, preserving pre-existing
+    /// behavior (unlimited senders) while still bounding connections.
+    #[test]
+    fn syslog_input_defaults_for_new_knobs() {
+        let (cfg, _w) = parse(SAMPLE).unwrap();
+        let s = &cfg.inputs.syslog[0];
+        assert_eq!(s.max_connections, 512);
+        assert_eq!(s.idle_timeout_secs, 300);
+        assert_eq!(s.handshake_timeout_secs, 10);
+        assert!(s.allowed_senders.is_empty());
+    }
+
+    #[test]
+    fn parse_ip_net_accepts_bare_ips_and_cidrs() {
+        assert!(parse_ip_net("10.0.0.1").is_ok());
+        assert!(parse_ip_net("10.0.0.0/8").is_ok());
+        assert!(parse_ip_net("::1").is_ok());
+        assert!(parse_ip_net("2001:db8::/32").is_ok());
+        assert!(parse_ip_net("not-an-ip").is_err());
+        assert!(parse_ip_net("10.0.0.0/99").is_err());
+    }
+
+    #[test]
+    fn parse_ip_net_bare_ipv4_matches_only_itself() {
+        let net = parse_ip_net("10.0.0.1").unwrap();
+        assert!(net.contains(&"10.0.0.1".parse::<IpAddr>().unwrap()));
+        assert!(!net.contains(&"10.0.0.2".parse::<IpAddr>().unwrap()));
+    }
+
+    #[test]
+    fn accepts_valid_allowed_senders() {
+        let yaml = r#"
+inputs:
+  syslog:
+    - id: rsyslog
+      protocol: udp
+      port: 5514
+      allowed_senders: ["10.0.0.0/8", "192.168.1.5", "::1"]
+outputs:
+  - id: console
+    type: stdout
+"#;
+        let (cfg, _w) = parse(yaml).unwrap();
+        assert_eq!(cfg.inputs.syslog[0].allowed_senders.len(), 3);
+    }
+
+    #[test]
+    fn rejects_invalid_allowed_senders_entry() {
+        let yaml = r#"
+inputs:
+  syslog:
+    - id: rsyslog
+      protocol: udp
+      port: 5514
+      allowed_senders: ["10.0.0.0/8", "not-an-ip-or-cidr"]
+outputs:
+  - id: console
+    type: stdout
+"#;
+        let err = parse(yaml).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("rsyslog"), "expected input id in error: {msg}");
+        assert!(
+            msg.contains("not-an-ip-or-cidr"),
+            "expected the bad entry in error: {msg}"
+        );
     }
 
     #[test]

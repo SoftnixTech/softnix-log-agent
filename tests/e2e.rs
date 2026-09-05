@@ -556,3 +556,64 @@ web:
         "port {free} is still held by a leaked listener task"
     );
 }
+
+/// H-5: an unauthenticated remote party opening far more TCP connections than
+/// `max_connections` must not be able to exhaust the process's file
+/// descriptors. Connections past the cap are accepted at the TCP layer
+/// (the OS backlog) but closed immediately by the agent rather than served.
+#[tokio::test]
+async fn syslog_tcp_enforces_the_connection_cap() {
+    let dir = tempfile::tempdir().unwrap();
+    let port = {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let p = l.local_addr().unwrap().port();
+        drop(l);
+        p
+    };
+    let yaml = format!(
+        r#"
+agent:
+  data_dir: {data}
+inputs:
+  syslog:
+    - id: in
+      protocol: tcp
+      bind: 127.0.0.1
+      port: {port}
+      max_connections: 2
+outputs:
+  - id: out
+    type: stdout
+web:
+  enabled: false
+"#,
+        data = dir.path().display(),
+        port = port,
+    );
+    let (cfg, _w) = config::parse(&yaml).unwrap();
+    let engine = Engine::start(cfg).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let mut held = Vec::new();
+    for _ in 0..2 {
+        held.push(
+            tokio::net::TcpStream::connect(("127.0.0.1", port))
+                .await
+                .unwrap(),
+        );
+    }
+    // The third connection is accepted at the TCP layer but must be closed
+    // immediately by the cap rather than being served.
+    let mut third = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .unwrap();
+    let mut buf = [0u8; 1];
+    let n = tokio::time::timeout(Duration::from_secs(3), third.read(&mut buf))
+        .await
+        .expect("over-cap connection should be closed, not held")
+        .unwrap();
+    assert_eq!(n, 0, "expected EOF on the over-cap connection");
+
+    drop(held);
+    engine.stop().await;
+}

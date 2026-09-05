@@ -137,6 +137,10 @@ offset ถูกเก็บข้าม restart บน Windows การระ�
 | `tls` | object | — | บังคับเมื่อ `protocol: tls` (ดูด้านล่าง) |
 | `source_type` | string | `syslog` | แทนค่า `source_type` ของ event |
 | `keep_raw_message` | bool | `false` | เก็บบรรทัดต้นฉบับทั้งบรรทัด (รวม PRI, timestamp, hostname, tag) ไว้ใน `raw_message` ก่อนเวอร์ชันนี้ค่านี้เปิดอยู่เสมอโดยปริยาย — `message` (เนื้อหาที่ parse แล้ว) กับ `raw_message` สำหรับ syslog นั้นต่างกันจริง ดังนั้นการปิดค่านี้คือการสูญเสียข้อมูลจริง ไม่ใช่แค่การประหยัด — เปิดใช้หากต้องการบรรทัดต้นฉบับ (สำหรับ forensics หรือ SIEM ปลายทางที่ parse ข้อความดิบเอง) ทำให้หน่วยความจำ การใช้ queue และขนาดข้อมูลที่ส่งต่อเหตุการณ์เพิ่มเป็นสองเท่า |
+| `max_connections` | int | `512` | เฉพาะ TCP/TLS (UDP ไม่มี connection) จำนวนสูงสุดของ connection ที่เปิดพร้อมกันได้ connection ที่ accept เกินขีดจำกัดนี้จะถูกปิดทันทีโดยไม่ถูกประมวลผล เพื่อป้องกันไม่ให้ผู้ส่งที่ไม่ผ่านการยืนยันตัวตนเปิด connection ค้างไว้จำนวนมากจนใช้ file descriptor ของโปรเซสหมด (`LimitNOFILE`) และทำให้ผู้ส่งที่ถูกต้องหรือ connection ขาออกของ agent เองต้องอดอยาก |
+| `idle_timeout_secs` | int | `300` | เฉพาะ TCP/TLS connection ที่ไม่มีการส่งบรรทัดข้อมูลที่สมบูรณ์มาเป็นเวลานานเท่านี้จะถูกปิด เพื่อป้องกันการค้าง connection แบบ slowloris ที่จะยึด slot ของ connection limit และ file descriptor ไว้ตลอดไป |
+| `handshake_timeout_secs` | int | `10` | เฉพาะ TLS การทำ TLS handshake ที่ไม่เสร็จภายในเวลานี้จะถูกยกเลิกและปิด connection |
+| `allowed_senders` | list of string | `[]` (ว่าง = อนุญาตทุกแหล่ง) | จำกัดว่า source IP ใดสามารถเชื่อมต่อ (TCP/TLS) หรือส่งข้อมูล (UDP) ได้ แต่ละรายการเป็น IP เดี่ยว (เช่น `10.0.0.1`) หรือช่วง CIDR (เช่น `10.0.0.0/8`) datagram UDP หรือความพยายามเชื่อมต่อ TCP/TLS จากผู้ส่งที่ไม่อยู่ในรายการนี้จะถูกทิ้ง/ปิดก่อนการประมวลผลใด ๆ ปล่อยว่างไว้เพื่อคงพฤติกรรมเดิมที่ยอมรับผู้ส่งทุกราย |
 
 **ตัวเลือก `tls` (ฝั่ง server)** — บังคับสำหรับ `protocol: tls`:
 
