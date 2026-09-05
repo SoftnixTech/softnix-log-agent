@@ -53,7 +53,6 @@ pub(crate) fn redact(msg: String, secrets: &[String]) -> String {
     msg
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
