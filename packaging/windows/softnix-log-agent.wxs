@@ -84,6 +84,23 @@
       </Directory>
     </Directory>
 
+    <!-- ProgramData subfolder inherits an ACE letting Users create/append
+         files. The service runs as LocalSystem and its config controls which
+         files it reads and where it ships them, so a user-writable config is
+         a privilege escalation (H-4). Break inheritance and grant only
+         SYSTEM+Administrators, mirroring install-windows.ps1's equivalent
+         icacls call. -->
+    <CustomAction Id="LockDownAgentDataAcl"
+                  ExeCommand='icacls.exe "[AGENTDATADIR]" /inheritance:r /grant:r "SYSTEM:(OI)(CI)F" "Administrators:(OI)(CI)F"'
+                  Directory="AGENTDATADIR"
+                  Execute="deferred"
+                  Impersonate="no"
+                  Return="check" />
+
+    <InstallExecuteSequence>
+      <Custom Action="LockDownAgentDataAcl" After="InstallFiles">NOT REMOVE</Custom>
+    </InstallExecuteSequence>
+
     <Feature Id="Complete" Title="Softnix Log Agent" Level="1">
       <ComponentRef Id="MainExecutable" />
       <ComponentRef Id="DefaultConfig" />

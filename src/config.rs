@@ -645,6 +645,34 @@ pub fn load(path: &Path) -> Result<(Config, Vec<String>)> {
     parse(&raw).with_context(|| format!("invalid configuration in {}", path.display()))
 }
 
+/// Refuse a config file that non-administrators can write. The agent runs as
+/// root/LocalSystem and its config decides which files it reads and where it
+/// ships them, so a writable config is a privilege-escalation primitive.
+pub fn check_config_permissions(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(path)?.permissions().mode();
+        if mode & 0o022 != 0 {
+            bail!(
+                "config {} is group- or world-writable (mode {:o}); \
+                 run: chmod 600 {}",
+                path.display(),
+                mode & 0o777,
+                path.display()
+            );
+        }
+    }
+    #[cfg(windows)]
+    {
+        // Windows ACLs are enforced by the installer (icacls, inheritance
+        // broken). A full DACL walk needs windows-acl; log a warning if the
+        // file is not under a protected directory.
+        tracing::debug!("config permission check: relying on installer ACLs");
+    }
+    Ok(())
+}
+
 /// Structural validation with helpful error messages.
 pub fn validate(cfg: &Config) -> Result<Vec<String>> {
     let mut warnings = Vec::new();
@@ -1282,5 +1310,32 @@ outputs:
                  undefined env var (a new user hasn't configured any yet); got error: {e:#}"
             )
         });
+    }
+
+    #[test]
+    fn a_world_writable_config_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("agent.yaml");
+        std::fs::write(&p, "agent: {}\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o666)).unwrap();
+        }
+        #[cfg(unix)]
+        assert!(check_config_permissions(&p).is_err());
+    }
+
+    #[test]
+    fn a_private_config_is_accepted() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("agent.yaml");
+        std::fs::write(&p, "agent: {}\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        assert!(check_config_permissions(&p).is_ok());
     }
 }

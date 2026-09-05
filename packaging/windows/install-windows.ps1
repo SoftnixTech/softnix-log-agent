@@ -90,6 +90,18 @@ if ($svc -and $svc.Status -eq "Running") {
 # --- Install files -----------------------------------------------------------
 Step "Installing files"
 New-Item -ItemType Directory -Force -Path $InstallDir, $DataDir | Out-Null
+
+# ProgramData subfolders inherit an ACE that lets Users create and append
+# files. The service runs as LocalSystem and its config controls which files
+# it reads and where it ships them, so a user-writable config is a privilege
+# escalation. Break inheritance and grant only SYSTEM and Administrators.
+foreach ($p in @($DataDir, $ConfigPath)) {
+    if (Test-Path $p) {
+        icacls $p /inheritance:r | Out-Null
+        icacls $p /grant:r "SYSTEM:(OI)(CI)F" "Administrators:(OI)(CI)F" | Out-Null
+    }
+}
+
 Copy-Item -Force $BinaryPath $ExePath
 Ok "binary    -> $ExePath"
 

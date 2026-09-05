@@ -185,6 +185,8 @@ async fn run_agent(
 
     let (cfg, warnings) =
         config::load(&config_path).context("configuration error (fix it or run `validate`)")?;
+    config::check_config_permissions(&config_path)
+        .context("configuration error (fix it or run `validate`)")?;
 
     // Tracing: stderr + in-memory ring buffer for the web UI.
     let log_buffer = LogBuffer::default();
@@ -354,6 +356,9 @@ async fn try_reload(
 
     let new_cfg = match config::load(config_path) {
         Ok((cfg, warnings)) => {
+            if let Err(e) = config::check_config_permissions(config_path) {
+                return Ok((engine, Err(format!("{e:#}"))));
+            }
             for w in &warnings {
                 tracing::warn!("{w}");
             }
