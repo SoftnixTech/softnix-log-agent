@@ -98,7 +98,7 @@
                   Return="check" />
 
     <InstallExecuteSequence>
-      <Custom Action="LockDownAgentDataAcl" After="InstallFiles">NOT REMOVE</Custom>
+      <Custom Action="LockDownAgentDataAcl" After="CreateFolders">NOT REMOVE</Custom>
     </InstallExecuteSequence>
 
     <Feature Id="Complete" Title="Softnix Log Agent" Level="1">

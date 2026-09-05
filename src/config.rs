@@ -668,7 +668,7 @@ pub fn check_config_permissions(path: &Path) -> Result<()> {
         // Windows ACLs are enforced by the installer (icacls, inheritance
         // broken). A full DACL walk needs windows-acl; log a warning if the
         // file is not under a protected directory.
-        tracing::debug!("config permission check: relying on installer ACLs");
+        tracing::debug!(path = %path.display(), "config permission check: relying on installer ACLs");
     }
     Ok(())
 }
