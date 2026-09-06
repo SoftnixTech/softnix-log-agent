@@ -149,7 +149,15 @@ impl OutputWorker {
                     tracing::warn!("output {id}: send failed ({e}); retrying in {backoff}ms");
                     tokio::select! {
                         _ = tokio::time::sleep(std::time::Duration::from_millis(backoff)) => {}
-                        _ = cancel.cancelled() => break,
+                        _ = cancel.cancelled() => {
+                            // Shutting down: still reset the sink so the
+                            // graceful-shutdown flush below (which reuses
+                            // this same Sink instance) attempts a fresh
+                            // connection instead of reusing the stale one
+                            // from this failed send.
+                            let _ = self.sink.reconnect().await;
+                            break;
+                        }
                     }
                     let _ = self.sink.reconnect().await;
                     backoff = (backoff * 2).min(self.retry.max_backoff_ms);
