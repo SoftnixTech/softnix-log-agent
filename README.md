@@ -13,7 +13,7 @@ Inputs (files, syslog UDP/TCP/TLS, Windows Event Log)
   → Outputs (syslog UDP/TCP/TLS, stdout)
 ```
 
-**Measured footprint** (release build, macOS arm64): 4.1 MB binary, ~12 MB RSS, <1% CPU while ingesting 5,000 events.
+**Measured footprint** (release build, macOS arm64): 4.6 MB binary, ~12 MB RSS, <1% CPU while ingesting 5,000 events.
 
 ## Features
 

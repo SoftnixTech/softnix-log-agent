@@ -39,6 +39,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 crc32fast = "1"
 rand = "0.8"
 ipnet = "2"
+async-trait = "0.1"
 
 [target.'cfg(windows)'.dependencies]
 windows-service = "0.7"
