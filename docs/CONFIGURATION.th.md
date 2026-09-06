@@ -43,8 +43,17 @@ web:      { … }      # GUI / API สำหรับจัดการ
 ```yaml
 enrich:
   environment: ${ENVIRONMENT:-production}
+```
+
+ห้ามใช้รูปแบบ `:-` (default) กับ `web.auth_token` (หรือ secret อื่นใด):
+`${WEB_TOKEN:-}` เมื่อไม่ได้ตั้งค่า `WEB_TOKEN` จะขยายเป็น string ว่าง ซึ่งตอนนี้
+agent จะถือว่า "ยังไม่ได้ตั้งค่า" แล้วสร้าง token ใหม่ให้แทน — แต่ string ว่างไม่ใช่
+ค่าที่ปลอดภัยสำหรับ secret จริง ให้ใช้รูปแบบบังคับแทน เพื่อให้ validate ล้มเหลว
+ทันทีหากลืมตั้งค่าตัวแปร:
+
+```yaml
 web:
-  auth_token: ${WEB_TOKEN:-}
+  auth_token: ${WEB_TOKEN}
 ```
 
 ---
@@ -57,11 +66,13 @@ web:
 |---|---|---|---|
 | `data_dir` | path | `data` | โฟลเดอร์หลักเก็บ state (offset ไฟล์, bookmark ของ Event Log) และคิวบนดิสก์ การติดตั้งแบบ service จะตั้งเป็น path เต็ม (`/var/lib/softnix-log-agent`, `C:\ProgramData\Softnix\LogAgent`) |
 | `log_level` | string | `info` | ระดับ log ของตัว agent เอง: `trace`, `debug`, `info`, `warn`, `error` |
+| `state_retention_hours` | integer | `24` | ระยะเวลาที่ cursor ของไฟล์จะถูกเก็บไว้โดยไม่ถูกแตะต้อง (เช่น ไฟล์ที่ถูก rotate ทิ้งไปแล้ว) ก่อนจะถูกลบออกจาก `state.json` การลบ (pruning) จะทำงานทุกครั้งที่มีการ flush state ตามรอบ (ทุก 5 วินาที) ไม่ใช่ตามรอบรายชั่วโมงแยกต่างหากอีกต่อไป |
 
 ```yaml
 agent:
   data_dir: /var/lib/softnix-log-agent
   log_level: info
+  state_retention_hours: 24
 ```
 
 ---
@@ -88,7 +99,8 @@ inputs:
 | `id` | string | — (บังคับ) | ตัวระบุที่ไม่ซ้ำ |
 | `paths` | list | — (บังคับ) | glob pattern รองรับ `*`, recursive `**` และ Windows path (`C:\Logs\*.log`) |
 | `exclude` | list | `[]` | glob pattern ที่ต้องการข้าม |
-| `poll_interval_ms` | int | `500` | ช่วงเวลา poll การเปลี่ยนแปลง/ค้นหาไฟล์ ขั้นต่ำ `50` ยิ่งต่ำยิ่งสด แต่กิน CPU มากขึ้นเล็กน้อย |
+| `poll_interval_ms` | int | `500` | ช่วงเวลา poll สำหรับอ่านไฟล์ที่ค้นพบแล้ว ขั้นต่ำ `50` ยิ่งต่ำยิ่งสด แต่กิน CPU มากขึ้นเล็กน้อย |
+| `discovery_interval_ms` | int | `30000` | ช่วงเวลาระหว่างการค้นหาไฟล์ (glob walk) เพื่อหาไฟล์ใหม่/ที่ถูกลบ แยกออกจาก `poll_interval_ms` และช้ากว่ามาก เพราะ glob walk เป็นส่วนที่มีค่าใช้จ่ายสูง หากรันทุกรอบ poll จะเกิด I/O โดยไม่จำเป็นบนเครื่องที่มีไฟล์ตรงกับ glob จำนวนมาก ยิ่งต่ำยิ่งพบไฟล์ใหม่/ที่ถูกลบเร็วขึ้น แต่มีภาระ discovery มากขึ้น |
 | `read_from_start` | bool | `false` | ครั้งแรกที่รัน อ่านเนื้อหาเดิมตั้งแต่ต้นไฟล์ ค่า default จะข้ามเนื้อหาเดิมและอ่านเฉพาะบรรทัดใหม่ (ไฟล์ที่ถูกค้นพบ *ภายหลัง* จะอ่านตั้งแต่ต้นเสมอ) |
 | `parser` | object | `mode: raw` | ดู [Parsers](#parsers) |
 | `source_type` | string | `file` | แทนค่า field `source_type` ของ event ที่สร้าง |
@@ -102,6 +114,7 @@ inputs:
         - /app/logs/**/*.log
       exclude: ["**/*.gz"]
       poll_interval_ms: 500
+      discovery_interval_ms: 30000
       read_from_start: false
       parser: { mode: json }
 ```
@@ -123,6 +136,11 @@ offset ถูกเก็บข้าม restart บน Windows การระ�
 | `format` | enum | `auto` | `auto`, `rfc3164`, `rfc5424`, `json`, `raw` — `auto` ลองตามลำดับ RFC5424 → RFC3164 → JSON → raw |
 | `tls` | object | — | บังคับเมื่อ `protocol: tls` (ดูด้านล่าง) |
 | `source_type` | string | `syslog` | แทนค่า `source_type` ของ event |
+| `keep_raw_message` | bool | `false` | เก็บบรรทัดต้นฉบับทั้งบรรทัด (รวม PRI, timestamp, hostname, tag) ไว้ใน `raw_message` ก่อนเวอร์ชันนี้ค่านี้เปิดอยู่เสมอโดยปริยาย — `message` (เนื้อหาที่ parse แล้ว) กับ `raw_message` สำหรับ syslog นั้นต่างกันจริง ดังนั้นการปิดค่านี้คือการสูญเสียข้อมูลจริง ไม่ใช่แค่การประหยัด — เปิดใช้หากต้องการบรรทัดต้นฉบับ (สำหรับ forensics หรือ SIEM ปลายทางที่ parse ข้อความดิบเอง) ทำให้หน่วยความจำ การใช้ queue และขนาดข้อมูลที่ส่งต่อเหตุการณ์เพิ่มเป็นสองเท่า |
+| `max_connections` | int | `512` | เฉพาะ TCP/TLS (UDP ไม่มี connection) จำนวนสูงสุดของ connection ที่เปิดพร้อมกันได้ connection ที่ accept เกินขีดจำกัดนี้จะถูกปิดทันทีโดยไม่ถูกประมวลผล เพื่อป้องกันไม่ให้ผู้ส่งที่ไม่ผ่านการยืนยันตัวตนเปิด connection ค้างไว้จำนวนมากจนใช้ file descriptor ของโปรเซสหมด (`LimitNOFILE`) และทำให้ผู้ส่งที่ถูกต้องหรือ connection ขาออกของ agent เองต้องอดอยาก |
+| `idle_timeout_secs` | int | `300` | เฉพาะ TCP/TLS connection ที่ไม่มีการส่งบรรทัดข้อมูลที่สมบูรณ์มาเป็นเวลานานเท่านี้จะถูกปิด เพื่อป้องกันการค้าง connection แบบ slowloris ที่จะยึด slot ของ connection limit และ file descriptor ไว้ตลอดไป |
+| `handshake_timeout_secs` | int | `10` | เฉพาะ TLS การทำ TLS handshake ที่ไม่เสร็จภายในเวลานี้จะถูกยกเลิกและปิด connection |
+| `allowed_senders` | list of string | `[]` (ว่าง = อนุญาตทุกแหล่ง) | จำกัดว่า source IP ใดสามารถเชื่อมต่อ (TCP/TLS) หรือส่งข้อมูล (UDP) ได้ แต่ละรายการเป็น IP เดี่ยว (เช่น `10.0.0.1`) หรือช่วง CIDR (เช่น `10.0.0.0/8`) datagram UDP หรือความพยายามเชื่อมต่อ TCP/TLS จากผู้ส่งที่ไม่อยู่ในรายการนี้จะถูกทิ้ง/ปิดก่อนการประมวลผลใด ๆ ปล่อยว่างไว้เพื่อคงพฤติกรรมเดิมที่ยอมรับผู้ส่งทุกราย สำหรับ TCP/TLS นี่คือการควบคุมการเข้าถึงจริง เพราะต้องผ่าน handshake ที่สมบูรณ์ก่อนจึงจะเชื่อมต่อได้ แต่สำหรับ UDP นี่**ไม่ใช่**การยืนยันตัวตน — UDP ไม่มี handshake ผู้โจมตีจากภายนอกจึงสามารถปลอม (spoof) source address ให้ตรงกับ allowlist ได้ง่าย ให้ถือว่าเป็นเพียงสุขอนามัยด้านการตั้งค่า/ป้องกันข้อมูลปะปนกันโดยไม่ตั้งใจเท่านั้น หากต้องการการยืนยันตัวตนผู้ส่งจริง ให้ใช้ `protocol: tls` ร่วมกับ `tls.client_ca` (mutual TLS) |
 
 **ตัวเลือก `tls` (ฝั่ง server)** — บังคับสำหรับ `protocol: tls`:
 
@@ -161,6 +179,7 @@ Windows การตั้งค่า eventlog จะถูกเพิกเ�
 | `query` | string | `*` | ตัวกรอง XPath สำหรับแต่ละ channel `*` = ทุก event |
 | `read_existing` | bool | `false` | ครั้งแรกที่รัน (ยังไม่มี bookmark) อ่าน event เดิมตั้งแต่ record เก่าสุด ค่า default เก็บเฉพาะ event ที่เข้ามาหลังเริ่มทำงาน |
 | `source_type` | string | `eventlog` | แทนค่า `source_type` ของ event |
+| `keep_raw_message` | bool | `false` | เก็บ Event XML ฉบับเต็ม (2-4 KB) ไว้ใน `raw_message` ก่อนเวอร์ชันนี้ค่านี้เปิดอยู่เสมอโดยปริยาย `message` มีข้อความที่มนุษย์อ่านได้อยู่แล้ว จึงจำเป็นเฉพาะกรณีที่ต้องใช้ XML ดิบต่อ ทำให้หน่วยความจำ การใช้ queue และขนาดข้อมูลที่ส่งต่อเหตุการณ์เพิ่มเป็นสองเท่า |
 
 ```yaml
 inputs:
@@ -178,7 +197,7 @@ inputs:
   `agent.data_dir` → ส่งแบบ at-least-once และ resume ต่อได้หลัง restart
 - ข้อความที่มนุษย์อ่านได้ถูก render จาก metadata ของ publisher หาก message DLL
   ของ provider ไม่มี จะ fallback ไปใช้ `EventData` ที่ต่อกัน ส่วน XML เต็มจะถูก
-  เก็บไว้ใน `raw_message` เสมอ
+  เก็บไว้ใน `raw_message` เฉพาะเมื่อตั้งค่า `keep_raw_message: true` เท่านั้น
 - การ map field: `Level` → `severity`, `Provider` → `application`,
   `Computer` → `hostname` พร้อม `event_id`, `channel`, `record_id`, `keywords`
   และแต่ละรายการใน `EventData` เป็น `data_<Name>`
@@ -204,6 +223,7 @@ inputs:
 | `pair_separator` | string | `" "` | ตัวคั่นระหว่างคู่ (`kv`) |
 | `kv_separator` | string | `=` | ตัวคั่นระหว่าง key กับ value (`kv`) |
 | `timestamp_format` | string | — | รูปแบบ `chrono` สำหรับ parse group ชื่อ `timestamp` เช่น `%d/%b/%Y:%H:%M:%S %z` |
+| `keep_raw_message` | bool | `false` | เก็บบรรทัดก่อน parse ไว้ใน `raw_message` แม้จะเหมือนกับ `message` ทุกตัวอักษร (เช่น `mode: raw`) ก่อนเวอร์ชันนี้ค่านี้เปิดอยู่เสมอโดยปริยาย — `Event::new` เก็บเนื้อหาซ้ำสองครั้งโดยไม่มีเงื่อนไข ทำให้หน่วยความจำ การใช้ queue และขนาดข้อมูลที่ส่งต่อเหตุการณ์เพิ่มเป็นสองเท่าโดยไม่มีประโยชน์ภายใต้ `mode: raw` ตั้งเป็น `true` เพื่อคืนพฤติกรรมเดิม หรือเพื่อเก็บข้อความก่อน parse ควบคู่กับ `message` ที่ parse แล้วภายใต้ `json`/`kv`/`regex`/`syslog` |
 
 ```yaml
 parser:
@@ -235,7 +255,7 @@ list ที่มีลำดับ แต่ละขั้นมี `type` ข
 | `remove_field` | `field`, `when?` | ลบ field |
 | `rename_field` | `from`, `to`, `when?` | เปลี่ยนชื่อ field |
 | `convert` | `field`, `to`, `when?` | แปลงชนิด field — `to`: `int`, `float`, `string`, `bool` |
-| `mask` | `field`, `pattern`, `replacement?`, `when?` | แทนค่าด้วย regex ภายใน field — `replacement` default `****` **การ mask `message` จะ mask `raw_message` ด้วย** |
+| `mask` | `field`, `pattern`, `replacement?`, `when?` | แทนค่าด้วย regex ภายใน field — `replacement` default `****` **การ mask `message` จะ mask `raw_message` ด้วยหากมีอยู่** (เฉพาะเมื่อ `keep_raw_message: true`) |
 | `drop` | `when` *(บังคับ)* | ทิ้ง event ที่ตรง `when` |
 | `keep` | `when` *(บังคับ)* | เก็บเฉพาะ event ที่ตรง `when` ที่เหลือทิ้ง |
 
@@ -330,7 +350,7 @@ pipeline:
 
 | ค่า | พฤติกรรม |
 |---|---|
-| `block` | back-pressure ไปยัง input การอ่านไฟล์หยุดชั่วคราว (ไม่สูญหาย) สำหรับ UDP syslog เคอร์เนลอาจ drop |
+| `block` | ไม่ทิ้ง event ตราบใดที่ยังมีที่ว่าง โดย "ที่ว่าง" คือคิวบนดิสก์ของปลายทางนั้นเอง (`max_size_mb`) บวกกับบัฟเฟอร์ในหน่วยความจำขนาดเล็ก (~4096 event) ที่ช่วยรองรับ burst ช่วงสั้น ๆ และการรอ lock ของคิวบนดิสก์ — ไม่ใช่ input หยุดอ่าน เมื่อทั้งสองเต็มแล้ว event ใหม่สำหรับปลายทางนั้นจะถูกทิ้ง (นับแยกต่อปลายทางใน `agent_router_shed_total` พร้อม log) แทนที่จะไปหยุดปลายทางอื่น, pipeline, หรือ input ใด ๆ เมื่อมีการ reload config หรือหยุด agent แบบ graceful ระบบจะบังคับส่ง event ที่ยังค้างอยู่ในบัฟเฟอร์ในหน่วยความจำทั้งหมดเข้าคิวบนดิสก์ของปลายทางแทนการทิ้ง — ยกเว้นกรณีที่คิวบนดิสก์ของปลายทางนั้นเต็มอยู่แล้วในขณะนั้น ซึ่งไม่มีที่ว่างเหลือให้เก็บ event เหล่านั้นอีก จึงยังถูกนับเป็น dropped (`agent_events_dropped_total`) |
 | `drop_oldest` | ทิ้ง event เก่าสุดเพื่อให้มีที่ว่าง — เน้นข้อมูลใหม่ |
 | `drop_newest` | ปฏิเสธ event ใหม่เมื่อเต็ม — เน้นเก็บประวัติ |
 
@@ -362,6 +382,7 @@ list ของปลายทาง แต่ละ event จะถูก route 
 | `when` | condition | — | route เฉพาะ event ที่ตรงมาที่นี่ |
 | `failover_for` | string | — | รับ traffic เฉพาะตอน output ที่ระบุไม่ healthy |
 | `retry` | object | ดูด้านล่าง | การปรับจูนการส่ง/retry |
+| `full_policy` | enum | — (ใช้ค่า `buffer.full_policy` ถ้าไม่ระบุ) | override `buffer.full_policy` เฉพาะปลายทางนี้ — ดูหัวข้อ [`buffer`](#buffer) ด้านบน |
 
 **ตัวเลือก `tls` (ฝั่ง client):**
 
@@ -426,10 +447,11 @@ GUI สำหรับจัดการและ JSON/metrics API ในตั�
 | `enabled` | bool | `true` | เปิดให้บริการ GUI/API |
 | `bind` | IP | `127.0.0.1` | address ที่ listen ค่า default คือ localhost เท่านั้น |
 | `port` | int | `8080` | พอร์ตที่ listen |
-| `auth_token` | string | — | bearer token ที่ทุก request ของ API ต้องส่งมา |
+| `auth_token` | string | — | bearer token ที่ทุก route ต้องส่งมา ยกเว้น `/` และ `/healthz` หากไม่ตั้งค่าไว้ agent จะสร้าง token ให้เองโดยอัตโนมัติลงในไฟล์ `<data_dir>/web-token` (สิทธิ์ไฟล์ `0600`) และ GUI จะใช้ token นั้นเองโดยอัตโนมัติ — กล่าวคือ auth ไม่ใช่สิ่งที่เลือกได้แม้จะ bind ไว้ที่ localhost มีเพียง *แหล่งที่มา* ของ token เท่านั้นที่ต่างกัน (ตั้งค่าเองในไฟล์ config หรือให้ agent สร้างให้อัตโนมัติ) |
 
 หากต้องการเปิด GUI ออกนอก localhost ให้ตั้ง `bind: 0.0.0.0` **และ** `auth_token`
-(มิฉะนั้น agent จะเตือนตอนเริ่มทำงาน) จากนั้น client ต้องส่ง
+— หากปล่อย `auth_token` ไว้ไม่ตั้งค่าแล้ว bind ออกนอก localhost ตอนนี้ agent
+จะ**ปฏิเสธการเริ่มทำงานทันที** ไม่ใช่แค่เตือนอีกต่อไป จากนั้น client ต้องส่ง
 `Authorization: Bearer <token>` (หรือ `X-Auth-Token`) แนะนำให้ใช้ firewall หรือ
 SSH tunnel — GUI เป็น HTTP ธรรมดา
 
@@ -438,7 +460,7 @@ web:
   enabled: true
   bind: 127.0.0.1
   port: 8080
-  # auth_token: ${WEB_TOKEN:-}
+  # auth_token: replace-with-a-long-random-secret
 ```
 
 ---

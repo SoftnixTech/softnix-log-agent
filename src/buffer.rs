@@ -50,7 +50,9 @@ pub enum PushOutcome {
     /// make room under the `drop_oldest` full policy (0 otherwise). Callers
     /// must count these toward the global dropped metric, otherwise oldest-drop
     /// evictions are invisible on the Overview page.
-    Stored { evicted: u64 },
+    Stored {
+        evicted: u64,
+    },
     Dropped,
     Full,
 }
@@ -64,6 +66,7 @@ pub struct DiskQueue {
     seg_bytes: u64,
     policy: FullPolicy,
     dropped: AtomicU64,
+    corrupt: AtomicU64,
 }
 
 impl DiskQueue {
@@ -143,6 +146,7 @@ impl DiskQueue {
             seg_bytes: cfg.segment_size_mb * 1024 * 1024,
             policy: cfg.full_policy,
             dropped: AtomicU64::new(0),
+            corrupt: AtomicU64::new(0),
         };
         Ok(Arc::new(q))
     }
@@ -179,7 +183,20 @@ impl DiskQueue {
                 .open(seg_path(&inner.dir, inner.write_seg))?;
             inner.writer = Some(f);
         }
-        inner.writer.as_mut().unwrap().write_all(&rec)?;
+        // write_all can fail (ENOSPC) *after* writing part of the record. If the
+        // counters advanced anyway the next push would append after a partial
+        // record and leave a CRC-failing record wedged mid-segment.
+        if let Err(e) = inner.writer.as_mut().unwrap().write_all(&rec) {
+            let real_len = std::fs::metadata(seg_path(&inner.dir, inner.write_seg))
+                .map(|m| m.len())
+                .unwrap_or(inner.write_off);
+            let torn = real_len.saturating_sub(inner.write_off);
+            inner.write_off = real_len;
+            inner.bytes += torn;
+            inner.writer = None;
+            roll_segment(&mut inner)?;
+            return Err(e.into());
+        }
         inner.write_off += rec_len;
         inner.bytes += rec_len;
         inner.count += 1;
@@ -226,23 +243,33 @@ impl DiskQueue {
             let start = if seg == pos.seg { pos.off } else { 0 };
             let path = seg_path(&inner.dir, seg);
             let mut f = File::open(&path)?;
+            // Bound the length check on the file's actual size, not the
+            // configured segment size — a legitimate record can exceed
+            // `segment_size_mb` (see `read_record`'s doc comment).
+            let file_len = f.metadata()?.len();
             f.seek(SeekFrom::Start(start))?;
             let mut off = start;
             loop {
                 if out.len() >= max {
                     break;
                 }
-                match read_record(&mut f)? {
-                    Some((payload, rec_len)) => {
+                match read_record(&mut f, file_len)? {
+                    RecordRead::Ok { payload, rec_len } => {
                         off += rec_len;
                         match serde_json::from_slice::<Event>(&payload) {
                             Ok(ev) => out.push(ev),
                             Err(e) => {
-                                tracing::warn!(queue = %self.id, "skipping corrupt queue record: {e}");
+                                self.corrupt.fetch_add(1, Ordering::Relaxed);
+                                tracing::warn!(queue = %self.id, "skipping undecodable queue record: {e}");
                             }
                         }
                     }
-                    None => break,
+                    RecordRead::Corrupt { skip } => {
+                        off += skip;
+                        self.corrupt.fetch_add(1, Ordering::Relaxed);
+                        tracing::warn!(queue = %self.id, skip, "skipping CRC-failed queue record");
+                    }
+                    RecordRead::Eof => break,
                 }
             }
             pos = Cursor { seg, off };
@@ -275,7 +302,7 @@ impl DiskQueue {
         }
 
         let cursor_path = inner.dir.join("cursor.json");
-        std::fs::write(&cursor_path, serde_json::to_vec(&inner.cursor)?)
+        crate::fsutil::write_atomic(&cursor_path, &serde_json::to_vec(&inner.cursor)?)
             .with_context(|| format!("cannot persist queue cursor {}", cursor_path.display()))?;
         drop(inner);
         self.space_notify.notify_waiters();
@@ -292,6 +319,10 @@ impl DiskQueue {
         self.inner.lock().unwrap().count
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     pub fn bytes(&self) -> u64 {
         self.inner.lock().unwrap().bytes
     }
@@ -300,8 +331,40 @@ impl DiskQueue {
         self.max_bytes
     }
 
+    /// True when the next average-sized push would exceed the size cap. Used by
+    /// /healthz so a blocked queue is visible instead of silently wedging the
+    /// agent.
+    ///
+    /// `push` stops *before* writing a record that would cross the cap, so
+    /// `bytes` alone rarely reaches `max_bytes` exactly — a queue can sit a few
+    /// hundred bytes under the cap yet still be permanently rejecting every
+    /// push (under `block`, stalling the router). Comparing against the
+    /// average size of the records currently held catches that state.
+    pub fn is_full(&self) -> bool {
+        let inner = self.inner.lock().unwrap();
+        if inner.count == 0 {
+            return false;
+        }
+        let avg = inner.bytes / inner.count;
+        inner.bytes + avg >= self.max_bytes
+    }
+
+    /// The full-queue policy this queue was configured with. Lets callers
+    /// (e.g. `/healthz`) distinguish a `block` queue that is genuinely
+    /// stalled from a `drop_oldest`/`drop_newest` queue sitting at its cap as
+    /// normal, correct operation.
+    pub fn policy(&self) -> FullPolicy {
+        self.policy
+    }
+
     pub fn dropped(&self) -> u64 {
         self.dropped.load(Ordering::Relaxed)
+    }
+
+    /// Records skipped because they failed CRC or would not decode. Surfaced on
+    /// /api/buffer so silent corruption is visible.
+    pub fn corrupt_records(&self) -> u64 {
+        self.corrupt.load(Ordering::Relaxed)
     }
 
     /// Age in seconds of the oldest unacked event, if any.
@@ -318,8 +381,9 @@ impl DiskQueue {
                 0
             };
             let mut f = File::open(seg_path(&inner.dir, seg)).ok()?;
+            let file_len = f.metadata().ok()?.len();
             f.seek(SeekFrom::Start(start)).ok()?;
-            if let Ok(Some((payload, _))) = read_record(&mut f) {
+            if let Ok(RecordRead::Ok { payload, .. }) = read_record(&mut f, file_len) {
                 if let Ok(ev) = serde_json::from_slice::<Event>(&payload) {
                     return Some((chrono::Utc::now() - ev.received_at).num_seconds());
                 }
@@ -333,10 +397,12 @@ impl DiskQueue {
         loop {
             {
                 let inner = self.inner.lock().unwrap();
-                let has = inner.peek != Cursor {
-                    seg: inner.write_seg,
-                    off: inner.write_off,
-                } && inner.count > 0;
+                let has = inner.peek
+                    != Cursor {
+                        seg: inner.write_seg,
+                        off: inner.write_off,
+                    }
+                    && inner.count > 0;
                 if has {
                     return;
                 }
@@ -385,7 +451,9 @@ fn drop_oldest_segment(inner: &mut Inner, _seg_bytes: u64) -> Result<u64> {
     let dropped = if start == u64::MAX {
         0
     } else {
-        scan_segment(&path, start, None).map(|(_, n)| n).unwrap_or(0)
+        scan_segment(&path, start, None)
+            .map(|(_, n)| n)
+            .unwrap_or(0)
     };
     if let Ok(md) = std::fs::metadata(&path) {
         inner.bytes = inner.bytes.saturating_sub(md.len());
@@ -405,11 +473,8 @@ fn drop_oldest_segment(inner: &mut Inner, _seg_bytes: u64) -> Result<u64> {
 }
 
 /// Walk records from `start`; returns (offset after last valid record, count).
-fn scan_segment(
-    path: &std::path::Path,
-    start: u64,
-    max: Option<u64>,
-) -> Result<(u64, u64)> {
+fn scan_segment(path: &std::path::Path, start: u64, max: Option<u64>) -> Result<(u64, u64)> {
+    let seg_bytes = std::fs::metadata(path)?.len();
     let mut f = File::open(path)?;
     f.seek(SeekFrom::Start(start))?;
     let mut off = start;
@@ -420,40 +485,71 @@ fn scan_segment(
                 break;
             }
         }
-        match read_record(&mut f)? {
-            Some((_payload, rec_len)) => {
+        match read_record(&mut f, seg_bytes)? {
+            RecordRead::Ok { rec_len, .. } => {
                 off += rec_len;
                 n += 1;
             }
-            None => break,
+            RecordRead::Corrupt { skip } => {
+                off += skip;
+            }
+            RecordRead::Eof => break,
         }
     }
     Ok((off, n))
 }
 
-/// Read one record; None on EOF, torn record, or CRC mismatch.
-fn read_record(f: &mut File) -> Result<Option<(Vec<u8>, u64)>> {
+enum RecordRead {
+    Ok {
+        payload: Vec<u8>,
+        rec_len: u64,
+    },
+    /// Framing is intact enough to step over this record.
+    Corrupt {
+        skip: u64,
+    },
+    /// Nothing more can be read from this segment.
+    Eof,
+}
+
+/// Read one record. A CRC mismatch is reported as `Corrupt` with the number of
+/// bytes to step over, so the reader can make progress instead of parking on it
+/// forever (which pins a core at 100% via the empty-batch loop in outputs.rs).
+///
+/// `max_believable_len` must be a safe upper bound on a real record's length —
+/// i.e. the actual size of the file being read, not the configured segment
+/// size. A single record legitimately written by `push` can exceed
+/// `segment_size_mb` (the rollover check only runs *after* the write), so
+/// using the configured size here would misclassify a valid oversized record
+/// as `Eof` and permanently stall the reader at that offset.
+fn read_record(f: &mut File, max_believable_len: u64) -> Result<RecordRead> {
     let mut header = [0u8; 8];
     match f.read_exact(&mut header) {
         Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(RecordRead::Eof),
         Err(e) => return Err(e.into()),
     }
-    let len = u32::from_le_bytes(header[0..4].try_into().unwrap()) as usize;
+    let len = u32::from_le_bytes(header[0..4].try_into().unwrap()) as u64;
     let crc = u32::from_le_bytes(header[4..8].try_into().unwrap());
-    if len == 0 || len > 64 * 1024 * 1024 {
-        return Ok(None);
+    // A length header that cannot be real means the framing is lost; there is
+    // no safe skip distance, so give up on the rest of this segment.
+    if len == 0 || len > max_believable_len {
+        return Ok(RecordRead::Eof);
     }
-    let mut payload = vec![0u8; len];
+    let mut payload = vec![0u8; len as usize];
     match f.read_exact(&mut payload) {
         Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+        // Truncated tail: not skippable, and open() repairs it.
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(RecordRead::Eof),
         Err(e) => return Err(e.into()),
     }
     if crc32fast::hash(&payload) != crc {
-        return Ok(None);
+        return Ok(RecordRead::Corrupt { skip: HEADER + len });
     }
-    Ok(Some((payload, HEADER + len as u64)))
+    Ok(RecordRead::Ok {
+        payload,
+        rec_len: HEADER + len,
+    })
 }
 
 #[cfg(test)]
@@ -479,7 +575,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let q = DiskQueue::open(dir.path(), "d1", &cfg(16, FullPolicy::Block)).unwrap();
         for i in 0..10 {
-            assert!(matches!(q.push(&ev(i)).unwrap(), PushOutcome::Stored { .. }));
+            assert!(matches!(
+                q.push(&ev(i)).unwrap(),
+                PushOutcome::Stored { .. }
+            ));
         }
         assert_eq!(q.len(), 10);
         let batch = q.peek_batch(4).unwrap();
@@ -577,5 +676,117 @@ mod tests {
         assert_eq!(batch.len(), 12);
         q.ack(12).unwrap();
         assert_eq!(q.len(), 0);
+    }
+
+    #[test]
+    fn peek_batch_skips_a_corrupt_record_in_the_middle() {
+        use std::io::{Seek, SeekFrom, Write};
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = BufferConfig::default();
+        let q = DiskQueue::open(dir.path(), "dest", &cfg).unwrap();
+        for i in 0..3 {
+            q.push(&Event::new("s", "test", &format!("event-{i}")))
+                .unwrap();
+        }
+        drop(q);
+
+        // Corrupt the payload of the middle record without changing its length
+        // header, so the CRC fails but the framing is still walkable.
+        let seg = dir.path().join("dest").join("00000000000000000000.seg");
+        let first_len = {
+            let bytes = std::fs::read(&seg).unwrap();
+            u32::from_le_bytes(bytes[0..4].try_into().unwrap()) as u64
+        };
+        let second_payload_start = 8 + first_len + 8;
+        let mut f = std::fs::OpenOptions::new().write(true).open(&seg).unwrap();
+        f.seek(SeekFrom::Start(second_payload_start)).unwrap();
+        f.write_all(b"X").unwrap();
+        drop(f);
+
+        let q = DiskQueue::open(dir.path(), "dest", &cfg).unwrap();
+        let batch = q.peek_batch(10).unwrap();
+        assert_eq!(batch.len(), 2, "must return the two intact records");
+        assert_eq!(q.corrupt_records(), 1);
+
+        // The critical property: peek advanced past the corrupt record, so a
+        // second call cannot return an empty batch forever.
+        q.ack(batch.len() as u64).unwrap();
+        assert!(q.peek_batch(10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn peek_batch_returns_a_record_larger_than_the_configured_segment_size() {
+        // segment_size_mb: 1 (see `cfg()` above), but push() only checks for
+        // rollover *after* writing a record in full, so a single legitimate
+        // record can exceed the configured segment size. Before the fix,
+        // read_record compared the length header against `self.seg_bytes`
+        // (the configured 1 MiB) instead of the file's actual size, so this
+        // record was misclassified as Eof and `peek_batch` returned nothing
+        // for it - permanently, since the peek offset never advanced past it.
+        let dir = tempfile::tempdir().unwrap();
+        let q = DiskQueue::open(dir.path(), "d1", &cfg(16, FullPolicy::Block)).unwrap();
+        let huge = "z".repeat(2 * 1024 * 1024); // record body > 1 MiB segment_size_mb
+        assert!(matches!(
+            q.push(&Event::new("t", "raw", &huge)).unwrap(),
+            PushOutcome::Stored { .. }
+        ));
+        assert_eq!(q.len(), 1);
+
+        let batch = q.peek_batch(10).unwrap();
+        assert_eq!(
+            batch.len(),
+            1,
+            "a legitimate oversized record must not be treated as Eof"
+        );
+        assert_eq!(batch[0].message, huge);
+
+        // The offset must have advanced past the record, not stayed pinned.
+        q.ack(1).unwrap();
+        assert!(q.peek_batch(10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn is_full_reports_the_block_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = BufferConfig {
+            max_size_mb: 1,
+            ..BufferConfig::default()
+        };
+        let q = DiskQueue::open(dir.path(), "dest", &cfg).unwrap();
+        assert!(!q.is_full());
+        let big = "x".repeat(4096);
+        for _ in 0..400 {
+            if let Ok(PushOutcome::Full) = q.push(&Event::new("s", "test", &big)) {
+                break;
+            }
+        }
+        assert!(
+            q.is_full(),
+            "queue should report full after hitting the cap"
+        );
+    }
+
+    #[test]
+    fn cursor_is_written_atomically_and_survives_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = BufferConfig::default();
+        let q = DiskQueue::open(dir.path(), "dest", &cfg).unwrap();
+        for i in 0..10 {
+            q.push(&Event::new("s", "test", &format!("event {i}")))
+                .unwrap();
+        }
+        let batch = q.peek_batch(10).unwrap();
+        assert_eq!(batch.len(), 10);
+        q.ack(10).unwrap();
+
+        // No temp file must survive an ack.
+        assert!(!dir.path().join("dest").join("cursor.json.tmp").exists());
+
+        drop(q);
+        let q2 = DiskQueue::open(dir.path(), "dest", &cfg).unwrap();
+        assert!(
+            q2.peek_batch(10).unwrap().is_empty(),
+            "acked events replayed"
+        );
     }
 }

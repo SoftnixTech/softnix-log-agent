@@ -43,8 +43,17 @@ comments). Always use the `:-` form for variables that may be unset.
 ```yaml
 enrich:
   environment: ${ENVIRONMENT:-production}
+```
+
+Do not use the `:-` default form for `web.auth_token` (or any other secret):
+`${WEB_TOKEN:-}` with `WEB_TOKEN` unset expands to an empty string, which the
+agent now treats as "not configured" and replaces with a freshly generated
+token — but an empty string is never a safe stand-in for a real secret. Use
+the required form instead so a missing variable fails validation loudly:
+
+```yaml
 web:
-  auth_token: ${WEB_TOKEN:-}
+  auth_token: ${WEB_TOKEN}
 ```
 
 ---
@@ -57,11 +66,13 @@ Process-wide settings.
 |---|---|---|---|
 | `data_dir` | path | `data` | Base directory for state (file offsets, Event Log bookmarks) and the persistent queue. Service installs set an absolute path (`/var/lib/softnix-log-agent`, `C:\ProgramData\Softnix\LogAgent`). |
 | `log_level` | string | `info` | Agent's own log verbosity: `trace`, `debug`, `info`, `warn`, `error`. |
+| `state_retention_hours` | integer | `24` | How long a file cursor may go untouched (e.g. a rotated-away file) before it is pruned from `state.json`. Pruning runs on every periodic state flush (every 5s), not on a separate hourly timer. |
 
 ```yaml
 agent:
   data_dir: /var/lib/softnix-log-agent
   log_level: info
+  state_retention_hours: 24
 ```
 
 ---
@@ -88,7 +99,8 @@ Tail local files with glob discovery and rotation handling.
 | `id` | string | — (required) | Unique identifier. |
 | `paths` | list | — (required) | Glob patterns. Supports `*`, recursive `**`, and Windows paths (`C:\Logs\*.log`). |
 | `exclude` | list | `[]` | Glob patterns to skip. |
-| `poll_interval_ms` | int | `500` | File-change/discovery poll interval. Minimum `50`. Lower = fresher, slightly more CPU. |
+| `poll_interval_ms` | int | `500` | Poll interval for tailing already-discovered files. Minimum `50`. Lower = fresher, slightly more CPU. |
+| `discovery_interval_ms` | int | `30000` | Interval between filesystem discovery passes (the glob walk that finds new/removed files). Kept separate from, and much slower than, `poll_interval_ms`: the glob walk is the expensive part, so re-running it on every tail tick would do needless I/O on hosts with many globbed files. Lower = new/removed files noticed sooner, more discovery overhead. |
 | `read_from_start` | bool | `false` | On first run, read pre-existing content from the beginning. By default existing content is skipped and only new lines are read. (Files discovered *later* are always read from the start.) |
 | `parser` | object | `mode: raw` | See [Parsers](#parsers). |
 | `source_type` | string | `file` | Overrides the `source_type` field on emitted events. |
@@ -102,6 +114,7 @@ inputs:
         - /app/logs/**/*.log
       exclude: ["**/*.gz"]
       poll_interval_ms: 500
+      discovery_interval_ms: 30000
       read_from_start: false
       parser: { mode: json }
 ```
@@ -124,6 +137,11 @@ Receive syslog over the network.
 | `format` | enum | `auto` | `auto`, `rfc3164`, `rfc5424`, `json`, `raw`. `auto` tries RFC5424 → RFC3164 → JSON → raw. |
 | `tls` | object | — | Required when `protocol: tls`. See below. |
 | `source_type` | string | `syslog` | Overrides `source_type` on emitted events. |
+| `keep_raw_message` | bool | `false` | Keep the original wire line (PRI, timestamp, hostname, tag included) in `raw_message`. Before this version this was implicitly always on; `message` (the parsed body) and `raw_message` genuinely differ for syslog, so leaving this off is real information loss, not just savings — enable it if you need the original line (forensics, a downstream SIEM that re-parses raw text). Doubles memory, queue usage and wire size per event. |
+| `max_connections` | int | `512` | TCP/TLS only (UDP is connectionless). Maximum number of concurrently open connections. An accepted connection past this cap is closed immediately, without being served, so an unauthenticated remote party opening many idle connections cannot exhaust the process's file descriptor limit (`LimitNOFILE`) and starve legitimate senders or the agent's own outbound connections. |
+| `idle_timeout_secs` | int | `300` | TCP/TLS only. A connection that sends no complete line for this long is closed. Prevents a slowloris-style idle hold from pinning a connection-limit slot and a file descriptor indefinitely. |
+| `handshake_timeout_secs` | int | `10` | TLS only. A TLS handshake that does not complete within this long is abandoned and the connection closed. |
+| `allowed_senders` | list of string | `[]` (empty = allow all) | Restrict which source IPs may connect (TCP/TLS) or send (UDP). Each entry is an IP (e.g. `10.0.0.1`) or CIDR range (e.g. `10.0.0.0/8`). A UDP datagram, or a TCP/TLS connection attempt, from a sender not in this list is dropped/closed before any processing. Leave empty to preserve the default of accepting from any sender. For TCP/TLS this is real access control, since a full handshake is required to establish the connection. For UDP it is **not** authentication: UDP has no handshake, so a remote attacker can trivially forge (spoof) a source address that happens to fall inside the allowlist — treat it as misconfiguration hygiene / defense against accidental cross-talk only. If you need real sender verification, use `protocol: tls` with `tls.client_ca` (mutual TLS). |
 
 **`tls` (server) options** — required for `protocol: tls`:
 
@@ -162,6 +180,7 @@ platforms a configured eventlog input is ignored with a validation warning.
 | `query` | string | `*` | XPath filter applied to each channel. `*` = all events. |
 | `read_existing` | bool | `false` | On first run (no saved bookmark), read existing events from the oldest record. Default collects only events arriving after start. |
 | `source_type` | string | `eventlog` | Overrides `source_type` on emitted events. |
+| `keep_raw_message` | bool | `false` | Keep the full rendered Event XML (2-4 KB) in `raw_message`. Before this version this was implicitly always on. `message` already carries the human-readable text, so this only matters if you need the raw XML downstream. Doubles memory, queue usage and wire size per event. |
 
 ```yaml
 inputs:
@@ -179,7 +198,7 @@ inputs:
   `agent.data_dir` → at-least-once delivery that resumes after a restart.
 - The human-readable message is resolved from the publisher's metadata; if the
   provider's message DLL is unavailable it falls back to the joined `EventData`.
-  The full event XML is always kept in `raw_message`.
+  The full event XML is kept in `raw_message` only when `keep_raw_message: true`.
 - Mapped event fields: `Level` → `severity`, `Provider` → `application`,
   `Computer` → `hostname`, plus `event_id`, `channel`, `record_id`, `keywords`
   and each `EventData` item as `data_<Name>`.
@@ -205,6 +224,7 @@ Used by `inputs.files[].parser`. Syslog inputs parse via their own `format`.
 | `pair_separator` | string | `" "` | Separator between pairs (`kv`). |
 | `kv_separator` | string | `=` | Separator between key and value (`kv`). |
 | `timestamp_format` | string | — | `chrono` format to parse a captured `timestamp` group, e.g. `%d/%b/%Y:%H:%M:%S %z`. |
+| `keep_raw_message` | bool | `false` | Keep the pre-parse line in `raw_message`, even when it's identical to `message` (e.g. `mode: raw`). Before this version this was implicitly always on — `Event::new` stored the body twice unconditionally, doubling memory, queue usage and wire size per event for no benefit under `mode: raw`. Set to `true` to restore the old behavior or to keep the pre-parse text alongside a parsed `message` under `json`/`kv`/`regex`/`syslog`. |
 
 ```yaml
 parser:
@@ -236,7 +256,7 @@ when it matches (see [Conditions](#conditions)).
 | `remove_field` | `field`, `when?` | Delete a field. |
 | `rename_field` | `from`, `to`, `when?` | Rename a field. |
 | `convert` | `field`, `to`, `when?` | Convert a field type. `to`: `int`, `float`, `string`, `bool`. |
-| `mask` | `field`, `pattern`, `replacement?`, `when?` | Regex-replace within a field. `replacement` default `****`. **Masking `message` also masks `raw_message`.** |
+| `mask` | `field`, `pattern`, `replacement?`, `when?` | Regex-replace within a field. `replacement` default `****`. **Masking `message` also masks `raw_message` when present** (only if `keep_raw_message: true`). |
 | `drop` | `when` *(required)* | Discard events matching `when`. |
 | `keep` | `when` *(required)* | Keep only events matching `when`; drop the rest. |
 
@@ -331,7 +351,7 @@ Per-destination, crash-safe disk queue between the pipeline and each output.
 
 | Value | Behaviour |
 |---|---|
-| `block` | Back-pressure inputs. File reading pauses (no loss); for UDP syslog the kernel may drop. |
+| `block` | Never drop while there's room. Room is the destination's own on-disk queue (`max_size_mb`) *plus* a small (~4096-event) in-memory buffer that absorbs brief bursts and disk-queue lock contention — not inputs pausing. Once both are exhausted, new events for that destination are shed (counted per destination in `agent_router_shed_total`, logged) rather than stalling other destinations, the pipeline, or any input. A config reload or graceful stop force-delivers everything still sitting in the in-memory buffer into the on-disk queue instead of shedding it — except when that destination's on-disk queue is already full at the time, in which case there is nowhere left to put those events and they are still counted as dropped (`agent_events_dropped_total`). |
 | `drop_oldest` | Evict the oldest queued events to make room — favors fresh data. |
 | `drop_newest` | Reject new events when full — favors history. |
 
@@ -363,6 +383,7 @@ condition matches (or all outputs, if no `when`), subject to failover.
 | `when` | condition | — | Only route matching events here. |
 | `failover_for` | string | — | Receive traffic only while the named output is unhealthy. |
 | `retry` | object | see below | Send/retry tuning. |
+| `full_policy` | enum | — (falls back to `buffer.full_policy`) | Overrides the global `buffer.full_policy` for this destination only — see [`buffer`](#buffer) above. |
 
 **`tls` (client) options:**
 
@@ -427,10 +448,11 @@ Built-in management GUI and JSON/metrics API.
 | `enabled` | bool | `true` | Serve the GUI/API. |
 | `bind` | IP | `127.0.0.1` | Listen address. Localhost-only by default. |
 | `port` | int | `8080` | Listen port. |
-| `auth_token` | string | — | Bearer token required for all API requests. |
+| `auth_token` | string | — | Bearer token required for every route except `/` and `/healthz`. When left unset, a token is auto-generated into `<data_dir>/web-token` (mode `0600`) and used automatically by the GUI — auth is not actually optional even on localhost, only the *source* of the token differs (explicit config vs. auto-generated file). |
 
-To expose the GUI beyond localhost, set `bind: 0.0.0.0` **and** `auth_token`
-(the agent warns at startup otherwise). Clients then send
+To expose the GUI beyond localhost, set `bind: 0.0.0.0` **and** `auth_token` —
+leaving `auth_token` unset while binding beyond localhost is now a hard
+startup refusal, not a warning: the agent will not start. Clients then send
 `Authorization: Bearer <token>` (or `X-Auth-Token`). Prefer a firewall or SSH
 tunnel — the GUI is plain HTTP.
 
@@ -439,7 +461,7 @@ web:
   enabled: true
   bind: 127.0.0.1
   port: 8080
-  # auth_token: ${WEB_TOKEN:-}
+  # auth_token: replace-with-a-long-random-secret
 ```
 
 ---

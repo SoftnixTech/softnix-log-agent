@@ -27,14 +27,14 @@ Modules map 1:1 to the suggested component list:
 
 | Component | Module |
 |---|---|
-| Config Manager | `src/config.rs` |
+| Config Manager | `src/config/` |
 | State Manager | `src/state.rs` |
 | File Tailer | `src/inputs/file.rs` |
 | Syslog Receiver | `src/inputs/syslog.rs` |
-| Parser / Transform / Normalize / Enrich engines | `src/pipeline.rs` |
+| Parser / Transform / Normalize / Enrich engines | `src/pipeline/` |
 | Routing Engine | `src/engine.rs` (`route_event`) |
 | Persistent Queue | `src/buffer.rs` |
-| Output Manager | `src/outputs.rs` |
+| Output Manager | `src/outputs/` |
 | Metrics + Health | `src/metrics.rs`, `/healthz`, `/metrics` |
 | Web UI Server | `src/web.rs` + `src/ui.html` |
 | Service Manager | `src/service.rs` |
@@ -46,7 +46,7 @@ Modules map 1:1 to the suggested component list:
 
 **Restartable engine = config reload.** All inputs/pipeline/outputs live inside an `Engine` value built purely from a `Config`. Reload = validate new config → stop engine → start new engine; if the new engine fails to start (e.g. port conflict), the previous config file is restored from backup and the old engine is restarted. The web server lives *outside* the engine so the GUI stays available during/after a failed reload. This is dramatically simpler and safer than incremental hot-reconfiguration, at the cost of a sub-second pipeline gap (queues are durable, file offsets persist — nothing buffered is lost).
 
-**Per-destination persistent queue (segmented log).** Each destination has its own directory of append-only segment files (`[len][crc32][json]` records, 8 MB segments by default). The pipeline appends; the output worker *peeks* a batch, sends, then *acks*, which advances a persisted cursor (`cursor.json`) and deletes fully-consumed segments. A crash before ack ⇒ the batch is re-sent ⇒ at-least-once. Torn tail records are truncated on startup; CRC failures stop the reader at the bad record. Full-queue policies: `block` (backpressure into the bounded channel and ultimately the inputs), `drop_oldest` (delete oldest segment), `drop_newest`.
+**Per-destination persistent queue (segmented log).** Each destination has its own directory of append-only segment files (`[len][crc32][json]` records, 8 MB segments by default). The pipeline appends; the output worker *peeks* a batch, sends, then *acks*, which advances a persisted cursor (`cursor.json`) and deletes fully-consumed segments. A crash before ack ⇒ the batch is re-sent ⇒ at-least-once. Torn tail records are truncated on startup; CRC failures stop the reader at the bad record. Full-queue policies: `block` (never drop while there's room in the destination's own on-disk queue plus a small in-memory buffer; once both are full, new events for that destination are shed via a non-blocking `try_send` rather than backpressuring the pipeline or any input), `drop_oldest` (delete oldest segment), `drop_newest`.
 
 **Polling file tailer, identity-keyed offsets.** Polling (default 500 ms) was chosen over inotify/ReadDirectoryChangesW deliberately: identical semantics on both platforms, no watch-descriptor leaks, robust against network filesystems and editor quirks, and discovery + change detection in a single mechanism. Cost is negligible at endpoint scale. Offsets are keyed by `(input_id, file identity)` where identity = device:inode on Unix and creation time on Windows, which makes rename-rotation and recreation detectable; truncation is detected by `size < offset`. Offsets only advance past complete lines, so partially written lines are never emitted or skipped.
 
@@ -56,6 +56,6 @@ Modules map 1:1 to the suggested component list:
 
 **rustls (ring) everywhere.** One TLS stack for listeners and clients, mTLS both directions, no OpenSSL system dependency — simplifies cross-compilation and keeps the binary self-contained. Verification-off mode exists but is explicit and logged as a warning.
 
-**Web GUI: one embedded HTML file.** No frontend framework, no build step, no websockets — plain `fetch` + 3 s polling against tiny JSON endpoints. The page is `include_str!`-ed into the binary. This keeps the GUI cost near zero and the attack surface small; auth is an optional bearer token, and binding beyond localhost produces a logged security warning.
+**Web GUI: one embedded HTML file.** No frontend framework, no build step, no websockets — plain `fetch` + 3 s polling against tiny JSON endpoints. The page is `include_str!`-ed into the binary. This keeps the GUI cost near zero and the attack surface small; auth is required on every route except `/` and `/healthz`, auto-generated into a token file when not explicitly configured, and binding beyond localhost without a token is a hard startup refusal rather than a warning.
 
 **State writes are atomic and lazy.** `state.json` (file cursors) is written via tmp-file + rename, flushed every 5 s and on shutdown; queue cursors are written per ack. Worst-case crash window: a few seconds of file-offset progress (re-read ⇒ duplicates, not loss) and one un-acked batch per destination.

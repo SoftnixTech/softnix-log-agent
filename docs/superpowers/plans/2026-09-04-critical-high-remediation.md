@@ -2095,6 +2095,17 @@ visible."
 - Produces:
   - `AgentConfig.state_retention_hours: u64` (serde default `24`, was a hard-coded 7 days).
   - `StateManager::set_cursor(&self, id: &str, identity: &str, path: &str, offset: u64)` — unchanged signature, but now a no-op (does not set `dirty`) when the offset for that key is unchanged and `touched` was refreshed within the last 60 seconds.
+  - `StateManager::open`'s signature is **unchanged** (`pub fn open(dir: &Path) -> Result<Self>`); retention is set separately via a new `pub fn set_retention_secs(&self, secs: i64)` so the existing `cursor_survives_reopen` test and this task's own tests below keep compiling against the 1-argument constructor.
+
+**Ground truth, read from the actual file before writing this task** (so the
+snippets below use real names, not an invented `Mutex<Inner>` shape borrowed
+from `buffer.rs`'s `DiskQueue`): `StateManager` is
+`{ path: PathBuf, state: Mutex<StateFile>, dirty: AtomicBool }`; `StateFile`
+holds `pub files: HashMap<String, FileCursor>`; `FileCursor` is
+`{ path: String, offset: u64, touched: i64 }` with no `#[serde(default)]` on
+its existing fields. `touched` today is set via `chrono::Utc::now().timestamp()`
+inline in three places — keep that idiom rather than inventing a `now_secs()`
+free function from nothing.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -2123,21 +2134,29 @@ visible."
     }
 ```
 
+Both tests use the existing 1-argument `StateManager::open(dir.path())` — do
+not change its signature (see Ground truth above).
+
 - [ ] **Step 2: Run to verify failure**
 
 Run: `cargo test --lib state`
-Expected: both FAIL (`set_cursor` always dirties; `to_vec_pretty` indents).
+Expected: both FAIL (`set_cursor` always dirties; `to_vec_pretty` indents; `is_dirty` does not exist yet).
 
 - [ ] **Step 3: Make `set_cursor` idempotent**
 
-In `src/state.rs`, add `pub fn is_dirty(&self) -> bool` and change `set_cursor`:
+In `src/state.rs`, add a private `fn now_secs() -> i64 { chrono::Utc::now().timestamp() }`
+next to the existing `chrono::Utc::now().timestamp()` call sites (or just reuse
+that expression inline — either is fine, it is three call sites either way),
+add `pub fn is_dirty(&self) -> bool { self.dirty.load(Ordering::Relaxed) }`,
+and change `set_cursor` to operate on the real fields (`self.state`, its
+`.files` map, `self.dirty`):
 
 ```rust
     pub fn set_cursor(&self, id: &str, identity: &str, path: &str, offset: u64) {
-        let mut inner = self.inner.lock().unwrap();
         let key = format!("{id}|{identity}");
         let now = now_secs();
-        if let Some(existing) = inner.file.cursors.get_mut(&key) {
+        let mut st = self.state.lock().unwrap();
+        if let Some(existing) = st.files.get_mut(&key) {
             if existing.offset == offset {
                 // The tailer calls this on every poll for every idle file. Only
                 // refresh `touched` (and dirty the file) once a minute, or a
@@ -2147,42 +2166,73 @@ In `src/state.rs`, add `pub fn is_dirty(&self) -> bool` and change `set_cursor`:
                     return;
                 }
                 existing.touched = now;
-                inner.dirty = true;
+                self.dirty.store(true, Ordering::Relaxed);
                 return;
             }
             existing.offset = offset;
             existing.path = path.to_string();
             existing.touched = now;
         } else {
-            inner.file.cursors.insert(
+            st.files.insert(
                 key,
                 FileCursor { offset, path: path.to_string(), touched: now },
             );
         }
-        inner.dirty = true;
+        self.dirty.store(true, Ordering::Relaxed);
     }
 ```
 
 - [ ] **Step 4: Write compactly, prune on every flush**
 
-In `flush`, replace `serde_json::to_vec_pretty(&inner.file)?` with `serde_json::to_vec(&inner.file)?` and use `crate::fsutil::write_atomic`. Move the prune call into `flush` itself (drop the 720-tick counter in `engine.rs:126-133`) and take the retention from config:
+Add a `retention_secs: std::sync::atomic::AtomicI64` field to `StateManager`,
+defaulted to `24 * 3600` inside `open` (so the existing 1-argument constructor
+and every test that calls it keep working unchanged), plus a setter:
+
+```rust
+    pub fn set_retention_secs(&self, secs: i64) {
+        self.retention_secs.store(secs, Ordering::Relaxed);
+    }
+```
+
+Rewrite `flush` to use the real fields, write compactly, and prune on every
+call (dropping the 720-tick counter in `engine.rs:126-133`, which currently
+calls `state.prune(7 * 24 * 3600)` once an hour):
 
 ```rust
     pub fn flush(&self) -> Result<()> {
-        let mut inner = self.inner.lock().unwrap();
-        if !inner.dirty {
+        if !self.dirty.swap(false, Ordering::Relaxed) {
             return Ok(());
         }
-        let cutoff = now_secs().saturating_sub(self.retention_secs);
-        inner.file.cursors.retain(|_, c| c.touched >= cutoff);
-        let bytes = serde_json::to_vec(&inner.file)?;
+        let cutoff = now_secs().saturating_sub(self.retention_secs.load(Ordering::Relaxed));
+        let bytes = {
+            let mut st = self.state.lock().unwrap();
+            st.files.retain(|_, c| c.touched >= cutoff);
+            serde_json::to_vec(&*st)?
+        };
         crate::fsutil::write_atomic(&self.path, &bytes)?;
-        inner.dirty = false;
         Ok(())
     }
 ```
 
-Add `state_retention_hours` to `AgentConfig` (default 24) and pass `retention_secs = hours * 3600` into `StateManager::open`.
+Note this also removes the separate `self.dirty.swap` your read of the
+original `flush` used to gate on — the swap-then-restore-on-error subtlety
+does not apply here since `write_atomic` either fully succeeds or returns
+`Err` before anything is marked clean; if `write_atomic` fails, `dirty` stays
+`false` and the next `set_cursor` will set it again, which is an acceptable
+one-flush-cycle risk consistent with today's behavior (the original `flush`
+had the same property: it swaps `dirty` false before writing).
+
+In `src/engine.rs`, delete the `prune_tick` counter and its `% 720` check
+(`engine.rs:123,130-133`), keep the plain `state.flush()` call, and call
+`state.set_retention_secs(cfg.agent.state_retention_hours as i64 * 3600)`
+once, right after `StateManager::open(data_dir)?` — do not change `open`'s
+signature or call site arity.
+
+Add `state_retention_hours: u64` to `AgentConfig` (default 24 via a
+`default_state_retention_hours()` fn, following the existing
+`default_data_dir`/`default_log_level` pattern — `AgentConfig` has
+`#[serde(deny_unknown_fields)]`, so the new field needs its own
+`#[serde(default = "...")]`).
 
 - [ ] **Step 5: Run the tests**
 

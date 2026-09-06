@@ -46,9 +46,19 @@ impl Event {
             application: None,
             process_id: None,
             message: raw.to_string(),
-            raw_message: Some(raw.to_string()),
+            // Opt-in: storing the body twice doubled RSS, queue occupancy and
+            // the JSON wire size for every event, including `parser.mode: raw`
+            // where the two copies were byte-identical.
+            raw_message: None,
             collector_version: AGENT_VERSION.to_string(),
             fields: Map::new(),
+        }
+    }
+
+    /// Keep the pre-parse body. No-op if one is already recorded.
+    pub fn preserve_raw(&mut self, raw: &str) {
+        if self.raw_message.is_none() {
+            self.raw_message = Some(raw.to_string());
         }
     }
 
@@ -183,5 +193,21 @@ mod tests {
         assert_eq!(e.severity, Some(3));
         e.remove_field("custom");
         assert!(e.get_field("custom").is_none());
+    }
+
+    #[test]
+    fn new_event_does_not_duplicate_the_body() {
+        let ev = Event::new("s", "test", "some log line");
+        assert_eq!(ev.message, "some log line");
+        assert!(ev.raw_message.is_none(), "raw_message must be opt-in");
+    }
+
+    #[test]
+    fn preserve_raw_sets_it_once() {
+        let mut ev = Event::new("s", "test", "original");
+        ev.preserve_raw("original");
+        assert_eq!(ev.raw_message.as_deref(), Some("original"));
+        ev.preserve_raw("second call");
+        assert_eq!(ev.raw_message.as_deref(), Some("original"));
     }
 }

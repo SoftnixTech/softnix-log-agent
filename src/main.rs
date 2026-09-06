@@ -1,11 +1,11 @@
 //! Softnix Log Agent — lightweight, reliable, cross-platform log collector.
 
 use anyhow::{Context, Result};
-use softnix_log_agent::{config, engine, event, logbuf, metrics, service, web};
 use clap::{Parser, Subcommand};
 use engine::Engine;
 use logbuf::{LogBuffer, LogBufferLayer};
-use std::path::PathBuf;
+use softnix_log_agent::{config, engine, event, logbuf, metrics, service, web};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -80,7 +80,7 @@ fn main() -> Result<()> {
     }
 }
 
-fn validate_cmd(path: &PathBuf) -> Result<()> {
+fn validate_cmd(path: &Path) -> Result<()> {
     match config::load(path) {
         Ok((_cfg, warnings)) => {
             println!("OK: {} is valid", path.display());
@@ -175,13 +175,18 @@ fn run_as_windows_service(config: PathBuf) -> Result<()> {
 }
 
 /// Core agent: logging, web server, engine lifecycle, reload/rollback loop.
-async fn run_agent(config_path: PathBuf, external_shutdown: Option<CancellationToken>) -> Result<()> {
+async fn run_agent(
+    config_path: PathBuf,
+    external_shutdown: Option<CancellationToken>,
+) -> Result<()> {
     rustls::crypto::ring::default_provider()
         .install_default()
         .ok();
 
     let (cfg, warnings) =
         config::load(&config_path).context("configuration error (fix it or run `validate`)")?;
+    config::check_config_permissions(&config_path)
+        .context("configuration error (fix it or run `validate`)")?;
 
     // Tracing: stderr + in-memory ring buffer for the web UI.
     let log_buffer = LogBuffer::default();
@@ -204,13 +209,35 @@ async fn run_agent(config_path: PathBuf, external_shutdown: Option<CancellationT
 
     let shutdown = external_shutdown.unwrap_or_default();
     let (control_tx, mut control_rx) = mpsc::channel::<ControlMsg>(4);
+    // DNS rebinding protection: the only hostnames a legitimate browser
+    // request for this agent's own GUI can carry in Host/Origin (audit H-1).
+    let allowed_hosts = vec![
+        format!("{}:{}", cfg.web.bind, cfg.web.port),
+        format!("localhost:{}", cfg.web.port),
+        format!("127.0.0.1:{}", cfg.web.port),
+    ];
+    // DNS rebinding requires the real server to actually be on loopback —
+    // once an operator explicitly binds non-loopback, `config::validate`
+    // already forces a real `web.auth_token`, and that token becomes the
+    // security boundary instead of same-origin. `.unwrap_or(false)` is a
+    // defensive fallback for a bind value that somehow fails to parse as an
+    // IP here; `config::validate` will already have rejected a genuinely
+    // invalid `web.bind` before this point in normal operation.
+    let host_check_enabled = cfg
+        .web
+        .bind
+        .parse::<std::net::IpAddr>()
+        .map(|ip| ip.is_loopback())
+        .unwrap_or(false);
     let app_state = Arc::new(AppState {
         engine: tokio::sync::RwLock::new(None),
         logs: log_buffer,
         config_path: config_path.clone(),
         control: control_tx,
         uptime: metrics::Uptime::default(),
-        auth_token: cfg.web.auth_token.clone(),
+        auth_token: web::resolve_token(&cfg.web, &cfg.agent.data_dir)?,
+        allowed_hosts,
+        host_check_enabled,
     });
 
     // Web server lives outside the engine so it survives reloads.
@@ -233,11 +260,9 @@ async fn run_agent(config_path: PathBuf, external_shutdown: Option<CancellationT
 
     // Control loop: shutdown signals, SIGHUP, and web-triggered reloads.
     #[cfg(unix)]
-    let mut sighup =
-        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())?;
+    let mut sighup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())?;
     #[cfg(unix)]
-    let mut sigterm =
-        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
 
     loop {
         #[cfg(unix)]
@@ -331,6 +356,9 @@ async fn try_reload(
 
     let new_cfg = match config::load(config_path) {
         Ok((cfg, warnings)) => {
+            if let Err(e) = config::check_config_permissions(config_path) {
+                return Ok((engine, Err(format!("{e:#}"))));
+            }
             for w in &warnings {
                 tracing::warn!("{w}");
             }
@@ -362,7 +390,10 @@ async fn try_reload(
                 .await
                 .context("FATAL: could not restart previous configuration")?;
             *app_state.engine.write().await = Some(old_engine.shared.clone());
-            Ok((old_engine, Err(format!("{e:#} (previous configuration restored)"))))
+            Ok((
+                old_engine,
+                Err(format!("{e:#} (previous configuration restored)")),
+            ))
         }
     }
 }

@@ -131,8 +131,7 @@ pub mod platform {
     }
 
     pub fn uninstall() -> Result<()> {
-        let manager =
-            ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)?;
+        let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)?;
         let service = manager.open_service(
             SERVICE_NAME,
             ServiceAccess::STOP | ServiceAccess::DELETE | ServiceAccess::QUERY_STATUS,
@@ -144,8 +143,7 @@ pub mod platform {
     }
 
     pub fn start() -> Result<()> {
-        let manager =
-            ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)?;
+        let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)?;
         let service = manager.open_service(SERVICE_NAME, ServiceAccess::START)?;
         service.start::<&str>(&[])?;
         println!("service started");
@@ -153,8 +151,7 @@ pub mod platform {
     }
 
     pub fn stop() -> Result<()> {
-        let manager =
-            ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)?;
+        let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)?;
         let service = manager.open_service(SERVICE_NAME, ServiceAccess::STOP)?;
         service.stop()?;
         println!("service stopped");

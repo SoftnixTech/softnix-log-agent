@@ -14,6 +14,10 @@ pub struct Metrics {
     pub events_dropped: AtomicU64,
     pub errors: AtomicU64,
     pub last_error: Mutex<Option<String>>,
+    /// Bytes currently admitted into the input→pipeline channel but not yet
+    /// drained by `run_pipeline` (see `engine::EventSender`). A gauge, not a
+    /// counter: it tracks live occupancy of the byte budget, not a total.
+    pub channel_bytes: AtomicU64,
 }
 
 impl Metrics {
@@ -30,6 +34,7 @@ impl Metrics {
             events_dropped: self.events_dropped.load(Ordering::Relaxed),
             errors: self.errors.load(Ordering::Relaxed),
             last_error: self.last_error.lock().unwrap().clone(),
+            channel_bytes: self.channel_bytes.load(Ordering::Relaxed),
         }
     }
 }
@@ -42,6 +47,7 @@ pub struct MetricsSnapshot {
     pub events_dropped: u64,
     pub errors: u64,
     pub last_error: Option<String>,
+    pub channel_bytes: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
