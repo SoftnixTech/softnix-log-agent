@@ -32,8 +32,15 @@ pub trait Sink: Send {
     /// regardless of `n` (it only uses `n` to adjust an in-memory counter) —
     /// so a real partial ack here would silently drop the un-acked tail of
     /// the batch rather than retrying it.
+    ///
+    /// A partial ack (n < events.len()) is treated by OutputWorker as a full
+    /// failure and the whole batch is retried — DiskQueue cannot commit a
+    /// partial peek, so this is the only safe way to honor a smaller n.
     async fn send_batch(&mut self, events: &[Event]) -> anyhow::Result<usize>;
-    /// Called after a delivery failure, before the next attempt.
+    /// Called after a delivery failure and after the worker's backoff delay,
+    /// just before the next attempt. A Sink that does real I/O here (e.g. an
+    /// eager reconnect) still respects the worker's backoff — this is not
+    /// called immediately on failure.
     async fn reconnect(&mut self) -> anyhow::Result<()> {
         Ok(())
     }

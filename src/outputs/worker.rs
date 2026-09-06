@@ -103,7 +103,16 @@ impl OutputWorker {
                 }
             };
 
-            match self.sink.send_batch(&batch).await {
+            let outcome: anyhow::Result<usize> = match self.sink.send_batch(&batch).await {
+                Ok(n) if n < batch.len() => Err(anyhow::anyhow!(
+                    "sink returned partial ack {n}/{} events; DiskQueue cannot partially \
+                     ack a peeked batch, retrying the whole batch",
+                    batch.len()
+                )),
+                other => other,
+            };
+
+            match outcome {
                 Ok(n) => {
                     // See the doc comment on Sink::send_batch in mod.rs: n is
                     // expected to equal batch.len() for every Sink in this
@@ -126,7 +135,6 @@ impl OutputWorker {
                 }
                 Err(e) => {
                     self.queue.reset_peek();
-                    let _ = self.sink.reconnect().await;
                     metrics
                         .events_failed
                         .fetch_add(batch.len() as u64, std::sync::atomic::Ordering::Relaxed);
@@ -143,6 +151,7 @@ impl OutputWorker {
                         _ = tokio::time::sleep(std::time::Duration::from_millis(backoff)) => {}
                         _ = cancel.cancelled() => break,
                     }
+                    let _ = self.sink.reconnect().await;
                     backoff = (backoff * 2).min(self.retry.max_backoff_ms);
                 }
             }
