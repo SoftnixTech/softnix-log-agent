@@ -27,14 +27,14 @@ Modules map 1:1 to the suggested component list:
 
 | Component | Module |
 |---|---|
-| Config Manager | `src/config.rs` |
+| Config Manager | `src/config/` |
 | State Manager | `src/state.rs` |
 | File Tailer | `src/inputs/file.rs` |
 | Syslog Receiver | `src/inputs/syslog.rs` |
-| Parser / Transform / Normalize / Enrich engines | `src/pipeline.rs` |
+| Parser / Transform / Normalize / Enrich engines | `src/pipeline/` |
 | Routing Engine | `src/engine.rs` (`route_event`) |
 | Persistent Queue | `src/buffer.rs` |
-| Output Manager | `src/outputs.rs` |
+| Output Manager | `src/outputs/` |
 | Metrics + Health | `src/metrics.rs`, `/healthz`, `/metrics` |
 | Web UI Server | `src/web.rs` + `src/ui.html` |
 | Service Manager | `src/service.rs` |
@@ -56,6 +56,6 @@ Modules map 1:1 to the suggested component list:
 
 **rustls (ring) everywhere.** One TLS stack for listeners and clients, mTLS both directions, no OpenSSL system dependency — simplifies cross-compilation and keeps the binary self-contained. Verification-off mode exists but is explicit and logged as a warning.
 
-**Web GUI: one embedded HTML file.** No frontend framework, no build step, no websockets — plain `fetch` + 3 s polling against tiny JSON endpoints. The page is `include_str!`-ed into the binary. This keeps the GUI cost near zero and the attack surface small; auth is an optional bearer token, and binding beyond localhost produces a logged security warning.
+**Web GUI: one embedded HTML file.** No frontend framework, no build step, no websockets — plain `fetch` + 3 s polling against tiny JSON endpoints. The page is `include_str!`-ed into the binary. This keeps the GUI cost near zero and the attack surface small; auth is required on every route except `/` and `/healthz`, auto-generated into a token file when not explicitly configured, and binding beyond localhost without a token is a hard startup refusal rather than a warning.
 
 **State writes are atomic and lazy.** `state.json` (file cursors) is written via tmp-file + rename, flushed every 5 s and on shutdown; queue cursors are written per ack. Worst-case crash window: a few seconds of file-offset progress (re-read ⇒ duplicates, not loss) and one un-acked batch per destination.

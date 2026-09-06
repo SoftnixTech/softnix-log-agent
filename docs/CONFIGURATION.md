@@ -448,10 +448,11 @@ Built-in management GUI and JSON/metrics API.
 | `enabled` | bool | `true` | Serve the GUI/API. |
 | `bind` | IP | `127.0.0.1` | Listen address. Localhost-only by default. |
 | `port` | int | `8080` | Listen port. |
-| `auth_token` | string | — | Bearer token required for all API requests. |
+| `auth_token` | string | — | Bearer token required for every route except `/` and `/healthz`. When left unset, a token is auto-generated into `<data_dir>/web-token` (mode `0600`) and used automatically by the GUI — auth is not actually optional even on localhost, only the *source* of the token differs (explicit config vs. auto-generated file). |
 
-To expose the GUI beyond localhost, set `bind: 0.0.0.0` **and** `auth_token`
-(the agent warns at startup otherwise). Clients then send
+To expose the GUI beyond localhost, set `bind: 0.0.0.0` **and** `auth_token` —
+leaving `auth_token` unset while binding beyond localhost is now a hard
+startup refusal, not a warning: the agent will not start. Clients then send
 `Authorization: Bearer <token>` (or `X-Auth-Token`). Prefer a firewall or SSH
 tunnel — the GUI is plain HTTP.
 

@@ -355,6 +355,10 @@ async fn metrics_text(State(state): S) -> Response {
             q.dropped()
         ));
         out.push_str(&format!(
+            "agent_queue_corrupt_records_total{{destination=\"{id}\"}} {}\n",
+            q.corrupt_records()
+        ));
+        out.push_str(&format!(
             "agent_queue_full{{output=\"{id}\"}} {}\n",
             // Same policy-aware gating as /healthz: a full drop_* queue is
             // shedding load as configured, not stalled, so it does not trip
@@ -373,6 +377,12 @@ async fn metrics_text(State(state): S) -> Response {
             "agent_output_healthy{{destination=\"{}\"}} {}\n",
             o.id,
             u8::from(o.healthy)
+        ));
+    }
+    for i in eng.status.inputs_snapshot() {
+        out.push_str(&format!(
+            "agent_input_events_total{{input=\"{}\"}} {}\n",
+            i.id, i.events
         ));
     }
     out.into_response()
@@ -443,6 +453,7 @@ async fn api_buffer(State(state): S) -> Response {
             "usage_percent": (q.bytes() as f64 / q.max_bytes() as f64 * 100.0).round(),
             "oldest_event_age_seconds": q.oldest_age_secs(),
             "dropped_events": q.dropped(),
+            "corrupt_records": q.corrupt_records(),
         }));
     }
     Json(out).into_response()

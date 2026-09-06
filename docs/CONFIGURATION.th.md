@@ -447,10 +447,11 @@ GUI สำหรับจัดการและ JSON/metrics API ในตั�
 | `enabled` | bool | `true` | เปิดให้บริการ GUI/API |
 | `bind` | IP | `127.0.0.1` | address ที่ listen ค่า default คือ localhost เท่านั้น |
 | `port` | int | `8080` | พอร์ตที่ listen |
-| `auth_token` | string | — | bearer token ที่ทุก request ของ API ต้องส่งมา |
+| `auth_token` | string | — | bearer token ที่ทุก route ต้องส่งมา ยกเว้น `/` และ `/healthz` หากไม่ตั้งค่าไว้ agent จะสร้าง token ให้เองโดยอัตโนมัติลงในไฟล์ `<data_dir>/web-token` (สิทธิ์ไฟล์ `0600`) และ GUI จะใช้ token นั้นเองโดยอัตโนมัติ — กล่าวคือ auth ไม่ใช่สิ่งที่เลือกได้แม้จะ bind ไว้ที่ localhost มีเพียง *แหล่งที่มา* ของ token เท่านั้นที่ต่างกัน (ตั้งค่าเองในไฟล์ config หรือให้ agent สร้างให้อัตโนมัติ) |
 
 หากต้องการเปิด GUI ออกนอก localhost ให้ตั้ง `bind: 0.0.0.0` **และ** `auth_token`
-(มิฉะนั้น agent จะเตือนตอนเริ่มทำงาน) จากนั้น client ต้องส่ง
+— หากปล่อย `auth_token` ไว้ไม่ตั้งค่าแล้ว bind ออกนอก localhost ตอนนี้ agent
+จะ**ปฏิเสธการเริ่มทำงานทันที** ไม่ใช่แค่เตือนอีกต่อไป จากนั้น client ต้องส่ง
 `Authorization: Bearer <token>` (หรือ `X-Auth-Token`) แนะนำให้ใช้ firewall หรือ
 SSH tunnel — GUI เป็น HTTP ธรรมดา
 

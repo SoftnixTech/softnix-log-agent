@@ -3,7 +3,7 @@
 ## Automated tests
 
 ```bash
-cargo test            # unit + integration (31 tests)
+cargo test            # unit + integration (116 tests: 110 unit + 6 integration)
 ```
 
 **Unit tests** (in-module):
@@ -20,6 +20,9 @@ cargo test            # unit + integration (31 tests)
 1. `file_to_tcp_syslog_end_to_end` — file write → tail → transform/enrich → persistent queue → TCP syslog sink; asserts content, enrichment fields and exact sent count.
 2. `syslog_in_queue_survives_restart` — UDP syslog ingest while the destination is **down**, engine stop ("crash"), destination comes up, engine restart → the queued event is delivered in RFC5424 format. Covers disk buffering, retry, queue recovery and state survival.
 3. `conditional_routing_to_multiple_destinations` — JSON-parsed events fan out to an "everything" destination while only `severity < 4` reaches the errors destination.
+4. `a_backed_up_destination_does_not_stop_its_peers` — one destination's on-disk queue is driven genuinely full behind a TCP peer that accepts but never reads, while a second, healthy UDP destination keeps receiving events the whole time; guards the non-blocking per-destination fan-out (a full destination sheds its own events instead of stalling the router for every other destination).
+5. `failed_start_releases_bound_ports` — a config with two inputs where the first bind succeeds and the second fails (port already taken) must fail `Engine::start` as a whole *and* release the first, already-bound listener, so the port is free again immediately after; guards against a partial-start task leak.
+6. `syslog_tcp_enforces_the_connection_cap` — opening far more TCP connections than `max_connections` must not exhaust file descriptors: connections past the cap are accepted at the TCP layer but closed immediately by the agent rather than served.
 
 ## Manual smoke test
 
@@ -34,7 +37,7 @@ mv demo/app.log demo/app.log.1; echo "fresh" >> demo/app.log   # rotation
 printf '<13>Jun 10 12:00:00 h app: hi' | nc -u -w1 127.0.0.1 5514  # if syslog input configured
 
 curl -s localhost:8080/healthz
-curl -s localhost:8080/metrics
+curl -s -H "Authorization: Bearer $(cat /tmp/smoke/data/web-token)" localhost:8080/metrics   # needs the auth token; /healthz stays public
 open http://127.0.0.1:8080        # GUI: all seven pages
 ```
 

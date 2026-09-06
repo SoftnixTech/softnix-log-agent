@@ -13,7 +13,7 @@ msiexec /i softnix-log-agent-0.1.0-x64.msi /qn
 msiexec /x softnix-log-agent-0.1.0-x64.msi /qn
 ```
 
-After install, edit `C:\ProgramData\Softnix\LogAgent\agent.yaml` and reload via the web GUI (`http://127.0.0.1:8080`) or `Restart-Service softnix-log-agent`. Upgrades: just run the newer MSI — a modified config is kept.
+After install, edit `C:\ProgramData\Softnix\LogAgent\agent.yaml` and reload via the web GUI (`http://127.0.0.1:8080`) or `Restart-Service softnix-log-agent`. First visit to the GUI needs the auth token from `C:\ProgramData\Softnix\LogAgent\web-token` — either via a `#token=…` URL fragment or the browser's prompt, which points at that same file. Upgrades: just run the newer MSI — a modified config is kept.
 
 Rebuild the MSI from source (works on Windows with WiX, or on Linux/macOS with `msitools` + a cross-compiled exe):
 
@@ -79,7 +79,7 @@ The service entry point is `softnix-log-agent.exe service-run --config <path>`, 
 # or use sc.exe / services.msc — the service name is "softnix-log-agent"
 ```
 
-Configuration reload on Windows: use the web GUI (`http://127.0.0.1:8080` → Configuration → Save & Reload) or `service restart`.
+Configuration reload on Windows: use the web GUI (`http://127.0.0.1:8080` → Configuration → Save & Reload) or `service restart`. If the GUI hasn't already saved the token to session storage, it prompts for the one at `C:\ProgramData\Softnix\LogAgent\web-token`.
 
 ## Collecting Windows Event Log
 

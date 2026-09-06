@@ -65,7 +65,8 @@ systemctl status softnix-log-agent
 # ดู agent logs
 journalctl -u softnix-log-agent -f
 
-# เปิด web GUI
+# เปิด web GUI (เข้าครั้งแรกต้องใช้ token จาก <data_dir>/web-token
+# ถ้าไม่ได้ตั้ง web.auth_token ไว้เอง — GUI จะขอ token นี้ให้กรอก)
 open http://127.0.0.1:8080
 
 # health check endpoint

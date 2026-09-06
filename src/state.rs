@@ -171,21 +171,55 @@ impl StateManager {
         if !self.dirty.swap(false, Ordering::Relaxed) {
             return Ok(());
         }
-        let cutoff = now_secs().saturating_sub(self.retention_secs.load(Ordering::Relaxed));
-        let bytes = {
-            let mut st = self.state.lock().unwrap();
-            st.files.retain(|_, c| c.touched >= cutoff);
-            serde_json::to_vec(&*st)?
-        };
-        crate::fsutil::write_atomic(&self.path, &bytes)
-            .with_context(|| format!("cannot write state file {}", self.path.display()))?;
-        Ok(())
+        let result = (|| -> Result<()> {
+            let cutoff = now_secs().saturating_sub(self.retention_secs.load(Ordering::Relaxed));
+            let bytes = {
+                let mut st = self.state.lock().unwrap();
+                st.files.retain(|_, c| c.touched >= cutoff);
+                serde_json::to_vec(&*st)?
+            };
+            crate::fsutil::write_atomic(&self.path, &bytes)
+                .with_context(|| format!("cannot write state file {}", self.path.display()))?;
+            Ok(())
+        })();
+        if result.is_err() {
+            // A failed write must not look like a successful one to the next
+            // flush() call - otherwise the failure is retried never, not
+            // eventually, until some unrelated mutation re-dirties the state.
+            self.dirty.store(true, Ordering::Relaxed);
+        }
+        result
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_failed_flush_stays_dirty_and_retries_next_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let sm = StateManager::open(dir.path()).unwrap();
+        sm.set_cursor("in1", "dev:1:42", "/var/log/a.log", 1234, Some(0xdead_beef));
+        // Make the state file's parent path unwritable so the write inside
+        // flush() fails - simplest reliable way: point at a directory that
+        // does not exist for the atomic write's tmp file.
+        std::fs::remove_dir_all(dir.path()).unwrap();
+        assert!(
+            sm.flush().is_err(),
+            "flush must fail when the directory is gone"
+        );
+        // Re-create the directory and flush again - if dirty was
+        // incorrectly cleared on the first (failed) attempt, this second
+        // flush silently no-ops instead of retrying, and state.json is
+        // never written.
+        std::fs::create_dir_all(dir.path()).unwrap();
+        sm.flush().unwrap();
+        assert!(
+            dir.path().join("state.json").exists(),
+            "the second flush must actually retry the write, not silently skip it"
+        );
+    }
 
     #[test]
     fn cursor_survives_reopen() {
