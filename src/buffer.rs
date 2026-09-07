@@ -178,9 +178,19 @@ impl DiskQueue {
         rec.extend_from_slice(&payload);
 
         if inner.writer.is_none() {
+            let path = seg_path(&inner.dir, inner.write_seg);
+            // `.create(true)` is deliberate belt-and-braces for R-3: if the
+            // write segment's file is missing for any reason — including a
+            // queue left wedged by an older build, which advanced `write_seg`
+            // before the fallible `File::create` — `append(true)` alone
+            // returns NotFound from every push forever. Recreating it costs
+            // nothing in the normal case (the file exists) and turns a
+            // permanent wedge into a self-healing gap.
             let f = OpenOptions::new()
                 .append(true)
-                .open(seg_path(&inner.dir, inner.write_seg))?;
+                .create(true)
+                .open(&path)
+                .with_context(|| format!("cannot open queue segment {}", path.display()))?;
             inner.writer = Some(f);
         }
         // write_all can fail (ENOSPC) *after* writing part of the record. If the
@@ -420,15 +430,26 @@ fn seg_path(dir: &std::path::Path, seg: u64) -> PathBuf {
     dir.join(format!("{seg:020}.seg"))
 }
 
+/// Advance the write cursor to a fresh segment.
+///
+/// Every fallible step happens **before** any state is mutated: the old code
+/// incremented `write_seg` first, so a single transient `File::create` failure
+/// (EMFILE, inode exhaustion, a momentarily unwritable queue directory, an
+/// antivirus lock on Windows) left the write cursor pointing at a file that
+/// nothing would ever create, and every subsequent `push` failed forever. On
+/// failure here the caller's state is untouched, so the next `push` reopens
+/// the current segment and appends to it as normal.
 fn roll_segment(inner: &mut Inner) -> Result<()> {
     if let Some(w) = inner.writer.take() {
         drop(w);
     }
-    inner.write_seg += 1;
+    let next = inner.write_seg + 1;
+    let path = seg_path(&inner.dir, next);
+    File::create(&path)
+        .with_context(|| format!("cannot create queue segment {}", path.display()))?;
+    inner.write_seg = next;
     inner.write_off = 0;
-    File::create(seg_path(&inner.dir, inner.write_seg))?;
-    let seg = inner.write_seg;
-    inner.segments.insert(seg);
+    inner.segments.insert(next);
     Ok(())
 }
 
@@ -788,5 +809,109 @@ mod tests {
             q2.peek_batch(10).unwrap().is_empty(),
             "acked events replayed"
         );
+    }
+
+    /// R-3: `roll_segment` used to increment `write_seg` *before* the fallible
+    /// `File::create`, so one transient failure at a segment boundary left the
+    /// write cursor pointing at a segment file that nothing would ever create.
+    /// Every later `push` then returned `NotFound` forever, even after the
+    /// original fault cleared, and `run_router` turned into a per-event
+    /// `format!` + mutex loop while silently dropping every event.
+    #[test]
+    #[cfg(unix)]
+    fn a_transient_segment_create_failure_does_not_wedge_the_queue() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let q = DiskQueue::open(dir.path(), "d1", &cfg(64, FullPolicy::Block)).unwrap();
+        let qdir = dir.path().join("d1");
+        // `cfg()` sets segment_size_mb: 1. Five ~205 KB records leave seg 0 at
+        // ~1_025_670 bytes, just under the 1 MiB rollover threshold, so the
+        // sixth push is the one that rolls.
+        let big = "y".repeat(200 * 1024);
+        for _ in 0..5 {
+            assert!(matches!(
+                q.push(&Event::new("t", "raw", &big)).unwrap(),
+                PushOutcome::Stored { .. }
+            ));
+        }
+
+        // Make the queue directory unwritable so the rollover's File::create
+        // fails. Writes to the already-open segment fd are unaffected.
+        let orig = std::fs::metadata(&qdir).unwrap().permissions();
+        let mut ro = orig.clone();
+        ro.set_mode(0o500);
+        std::fs::set_permissions(&qdir, ro).unwrap();
+
+        // Directory permissions are not enforced for uid 0; in a container that
+        // runs tests as root there is nothing to reproduce.
+        let probe = qdir.join(".probe");
+        if std::fs::File::create(&probe).is_ok() {
+            std::fs::remove_file(&probe).ok();
+            std::fs::set_permissions(&qdir, orig).unwrap();
+            eprintln!("skipping: directory permissions are not enforced for this user");
+            return;
+        }
+
+        let boundary = q.push(&Event::new("t", "raw", &big));
+        // Restore before asserting so a failure cannot leave an undeletable dir.
+        std::fs::set_permissions(&qdir, orig).unwrap();
+        assert!(
+            boundary.is_err(),
+            "the rollover must fail while the queue directory is read-only"
+        );
+
+        // The transient fault has cleared: pushes must work again.
+        assert!(
+            matches!(
+                q.push(&Event::new("t", "raw", &big)).unwrap(),
+                PushOutcome::Stored { .. }
+            ),
+            "queue stayed wedged after the fault cleared"
+        );
+        // 5 + the boundary push (whose write succeeded; only the roll failed)
+        // + the recovery push.
+        assert_eq!(q.len(), 7);
+        let mut segs: Vec<String> = std::fs::read_dir(&qdir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".seg"))
+            .collect();
+        segs.sort();
+        assert_eq!(
+            segs,
+            vec![
+                "00000000000000000000.seg".to_string(),
+                "00000000000000000001.seg".to_string()
+            ],
+            "recovery must roll into the next segment, not skip one"
+        );
+    }
+
+    /// R-3, upgrade path: a queue already wedged by 0.1.1 has a write segment
+    /// index whose file does not exist. `OpenOptions::append(true)` without
+    /// `.create(true)` returns NotFound for that forever, so the append open
+    /// must be self-healing or upgrading the agent does not un-wedge the queue.
+    #[test]
+    fn a_queue_whose_write_segment_file_is_missing_recreates_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let qdir = dir.path().join("d1");
+        {
+            let q = DiskQueue::open(dir.path(), "d1", &cfg(16, FullPolicy::Block)).unwrap();
+            q.push(&ev(0)).unwrap();
+        }
+        // Reproduce the 0.1.1 wedge exactly: write_seg points at segment 1,
+        // whose file is gone.
+        std::fs::File::create(qdir.join("00000000000000000001.seg")).unwrap();
+        let q = DiskQueue::open(dir.path(), "d1", &cfg(16, FullPolicy::Block)).unwrap();
+        std::fs::remove_file(qdir.join("00000000000000000001.seg")).unwrap();
+
+        assert!(
+            matches!(q.push(&ev(1)).unwrap(), PushOutcome::Stored { .. }),
+            "push must recreate the missing write segment instead of failing"
+        );
+        assert!(qdir.join("00000000000000000001.seg").exists());
+        assert_eq!(q.len(), 2);
     }
 }
