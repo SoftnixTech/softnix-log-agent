@@ -33,6 +33,15 @@ struct Inner {
     segments: BTreeSet<u64>,
     write_seg: u64,
     write_off: u64,
+    /// Valid records physically present in the *write* segment, counted from
+    /// offset 0 (any already-acked records included). `count` below is a
+    /// queue-wide total that can span several not-yet-fully-consumed
+    /// segments, so this is what lets `reconcile_write_segment` isolate a
+    /// correction to just the segment whose buffer was discarded: acked
+    /// records are never removed from the write segment (`ack` only deletes
+    /// segments strictly behind it), so counting from 0 makes the delta
+    /// against a rescan cancel them out and land purely on newly-lost ones.
+    write_seg_count: u64,
     /// Buffered so `push` does not issue one `write(2)` per event on the
     /// runtime while holding the queue mutex; 8 KiB (the `BufWriter::new`
     /// default) collapses ~40 syslog-sized records into one syscall. Every
@@ -98,7 +107,7 @@ impl DiskQueue {
 
         // Only the last segment can have a torn tail record; repair it.
         let write_seg = *segments.iter().last().unwrap();
-        let valid_len = scan_segment(&seg_path(&dir, write_seg), 0, None)?.0;
+        let (valid_len, write_seg_count) = scan_segment(&seg_path(&dir, write_seg), 0, None)?;
         let f = OpenOptions::new()
             .write(true)
             .open(seg_path(&dir, write_seg))?;
@@ -140,6 +149,7 @@ impl DiskQueue {
                 dir,
                 segments,
                 write_seg,
+                write_seg_count,
                 writer: None,
                 cursor,
                 peek: cursor,
@@ -199,30 +209,30 @@ impl DiskQueue {
                 .with_context(|| format!("cannot open queue segment {}", path.display()))?;
             inner.writer = Some(BufWriter::new(f));
         }
-        // write_all can fail (ENOSPC) *after* writing part of the record. If the
-        // counters advanced anyway the next push would append after a partial
-        // record and leave a CRC-failing record wedged mid-segment.
+        // write_all can fail (ENOSPC) *after* writing part of the record, or
+        // because it had to flush the buffer's *prior* pushes first and that
+        // flush is what failed -- several already-`Stored` records, not just
+        // this one, can be the ones that never reach disk. A byte delta
+        // against `write_off` can't tell those apart from a torn write of
+        // just this record, so `reconcile_write_segment` re-derives the
+        // truth from what `scan_segment` can actually read back, the same
+        // ground truth `open()` trusts at startup.
         if let Err(e) = inner.writer.as_mut().unwrap().write_all(&rec) {
-            let real_len = std::fs::metadata(seg_path(&inner.dir, inner.write_seg))
-                .map(|m| m.len())
-                .unwrap_or(inner.write_off);
-            let torn = real_len.saturating_sub(inner.write_off);
-            inner.write_off = real_len;
-            inner.bytes += torn;
-            // Discard the buffer *without* flushing: `real_len` above is the
-            // truth about what reached the file, and `BufWriter::drop` would
-            // otherwise retry the failed write behind our back and append
-            // bytes after we have re-based `write_off`. `into_parts` is the
-            // only way to drop a BufWriter without flushing it.
+            // Discard the buffer *without* flushing: `BufWriter::drop` would
+            // otherwise retry the failed write behind our back after we've
+            // already re-derived these counters from disk. `into_parts` is
+            // the only way to drop a BufWriter without flushing it.
             if let Some(w) = inner.writer.take() {
                 let _ = w.into_parts();
             }
+            reconcile_write_segment(&mut inner);
             roll_segment(&mut inner)?;
             return Err(e.into());
         }
         inner.write_off += rec_len;
         inner.bytes += rec_len;
         inner.count += 1;
+        inner.write_seg_count += 1;
 
         if inner.write_off >= self.seg_bytes {
             roll_segment(&mut inner)?;
@@ -521,15 +531,13 @@ fn roll_segment(inner: &mut Inner) -> Result<()> {
     if let Some(mut w) = inner.writer.take() {
         if let Err(e) = w.flush() {
             // Do not let the implicit Drop retry this flush and partially
-            // succeed after we stop tracking it: discard the buffer and
-            // re-base the write offset on what actually reached the file. The
-            // segment index is left alone, so the next `push` reopens this
-            // same segment and appends to it.
+            // succeed after we stop tracking it: discard the buffer first,
+            // then re-derive write_off/bytes/count from what actually
+            // reached the file. The segment index is left alone, so the next
+            // `push` reopens this same segment and appends to it.
             let _ = w.into_parts();
+            reconcile_write_segment(inner);
             let path = seg_path(&inner.dir, inner.write_seg);
-            inner.write_off = std::fs::metadata(&path)
-                .map(|m| m.len())
-                .unwrap_or(inner.write_off);
             return Err(anyhow::Error::new(e)
                 .context(format!("cannot flush queue segment {}", path.display())));
         }
@@ -540,8 +548,56 @@ fn roll_segment(inner: &mut Inner) -> Result<()> {
         .with_context(|| format!("cannot create queue segment {}", path.display()))?;
     inner.write_seg = next;
     inner.write_off = 0;
+    inner.write_seg_count = 0;
     inner.segments.insert(next);
     Ok(())
+}
+
+/// Re-derive `write_off`/`bytes`/`count` for the write segment from what
+/// `scan_segment` can actually read back off disk -- the same ground truth
+/// `open()` trusts at startup -- after the writer's buffer had to be
+/// discarded unflushed. A `BufWriter` can hold several already-`Stored`
+/// pushes at once, so a byte delta against the old `write_off` can't tell
+/// which records survived; comparing valid-record counts from offset 0 can,
+/// because acked records are never removed from the write segment (`ack`
+/// only deletes segments strictly behind it), so they appear in both the old
+/// and new counts and cancel out of the delta.
+///
+/// The write segment is reopened in `append` mode (see `push`), so its
+/// on-disk length -- not just the in-memory `write_off` -- must be repaired
+/// to the same valid boundary `open()` would compute, or the next append
+/// lands after a torn tail instead of at `write_off`.
+fn reconcile_write_segment(inner: &mut Inner) {
+    let path = seg_path(&inner.dir, inner.write_seg);
+    let Ok((valid_len, valid_count)) = scan_segment(&path, 0, None) else {
+        tracing::warn!(
+            queue_dir = %inner.dir.display(),
+            seg = inner.write_seg,
+            "cannot rescan write segment after discarding its write buffer; \
+             counters may over-report until the queue is reopened"
+        );
+        return;
+    };
+    inner.count = inner
+        .count
+        .saturating_sub(inner.write_seg_count.saturating_sub(valid_count));
+    inner.write_seg_count = valid_count;
+
+    let end = match OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .and_then(|f| f.set_len(valid_len))
+    {
+        Ok(()) => valid_len,
+        Err(_) => std::fs::metadata(&path)
+            .map(|m| m.len())
+            .unwrap_or(inner.write_off),
+    };
+    inner.bytes = inner
+        .bytes
+        .saturating_sub(inner.write_off)
+        .saturating_add(end);
+    inner.write_off = end;
 }
 
 /// Delete the oldest segment to reclaim space; returns dropped event count.
@@ -684,6 +740,19 @@ mod tests {
 
     fn ev(n: usize) -> Event {
         Event::new("test", "raw", &format!("event number {n}"))
+    }
+
+    /// Test-only failure injection: run exactly the "discard the writer's
+    /// buffer, then reconcile" sequence the real error paths in `push` and
+    /// `roll_segment` run on a write/flush failure, without needing a
+    /// genuine (and unportable across Linux/macOS/Windows CI) ENOSPC or
+    /// flush error.
+    fn discard_write_buffer(q: &DiskQueue) {
+        let mut inner = q.inner.lock().unwrap();
+        if let Some(w) = inner.writer.take() {
+            let _ = w.into_parts();
+        }
+        reconcile_write_segment(&mut inner);
     }
 
     #[test]
@@ -1191,5 +1260,98 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(q.len(), 0);
+    }
+
+    /// R-2 regression: `Inner::writer` is a `BufWriter`, so a push can return
+    /// `PushOutcome::Stored` before its record has left the process for the
+    /// segment file. If a later flush of that buffer fails, a byte delta
+    /// against the old `write_off` can't tell a lost *record* from a torn
+    /// write of just the newest one, and silently overcounts `count`/`bytes`
+    /// forever. `reconcile_write_segment` must re-derive both from what
+    /// `scan_segment` can actually read back, exactly as `open()` does at
+    /// startup.
+    #[test]
+    fn discarding_the_write_buffer_does_not_overcount_unflushed_pushes() {
+        let dir = tempfile::tempdir().unwrap();
+        let q = DiskQueue::open(dir.path(), "d1", &cfg(64, FullPolicy::Block)).unwrap();
+        for i in 0..5 {
+            q.push(&ev(i)).unwrap();
+        }
+        assert_eq!(q.len(), 5);
+        // Confirm the premise: these 5 tiny records fit well inside the
+        // 8 KiB BufWriter default, so nothing has actually reached disk yet.
+        let seg = dir.path().join("d1").join(format!("{:020}.seg", 0));
+        assert_eq!(
+            std::fs::metadata(&seg).unwrap().len(),
+            0,
+            "test premise broken: the buffer already flushed"
+        );
+
+        discard_write_buffer(&q);
+
+        assert_eq!(
+            q.len(),
+            0,
+            "records that never reached disk must not still be counted as stored"
+        );
+        assert_eq!(q.bytes(), 0);
+        assert!(q.peek_batch(10, TEST_PEEK_BYTES).unwrap().is_empty());
+
+        // The queue must keep working afterward, not wedge or leave a torn
+        // tail that misframes the next append.
+        q.push(&ev(99)).unwrap();
+        assert_eq!(q.len(), 1);
+        let batch = q.peek_batch(10, TEST_PEEK_BYTES).unwrap();
+        assert_eq!(batch.len(), 1);
+        assert_eq!(batch[0].message, "event number 99");
+        q.ack(1).unwrap();
+        assert_eq!(q.len(), 0);
+    }
+
+    /// Pins the from-offset-0 counting in `reconcile_write_segment`: acked
+    /// records are never removed from the *write* segment (only whole
+    /// segments strictly behind the cursor are deleted), so a
+    /// discard-then-reconcile must not re-lose them a second time by
+    /// comparing against the wrong baseline. A cursor-relative baseline was
+    /// considered and rejected: it would under-count `write_seg_count` after
+    /// a reopen and silently defeat this whole fix.
+    #[test]
+    fn discarding_the_write_buffer_after_a_reopen_only_loses_the_unacked_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let q = DiskQueue::open(dir.path(), "d1", &cfg(64, FullPolicy::Block)).unwrap();
+        for i in 0..5 {
+            q.push(&ev(i)).unwrap();
+        }
+        let batch = q.peek_batch(2, TEST_PEEK_BYTES).unwrap();
+        assert_eq!(batch.len(), 2);
+        q.ack(2).unwrap();
+        assert_eq!(q.len(), 3);
+        drop(q);
+
+        // Reopen: 2 acked + 3 unacked records are all still on disk in
+        // segment 0 (BufWriter's Drop flushes best-effort), which is also
+        // the (only, so still the write) segment.
+        let q = DiskQueue::open(dir.path(), "d1", &cfg(64, FullPolicy::Block)).unwrap();
+        assert_eq!(q.len(), 3);
+
+        for i in 5..8 {
+            q.push(&ev(i)).unwrap();
+        }
+        assert_eq!(q.len(), 6, "3 unacked + 3 freshly buffered");
+
+        discard_write_buffer(&q);
+
+        assert_eq!(
+            q.len(),
+            3,
+            "reconcile must lose only the 3 unflushed pushes, not also the 2 \
+             already-acked records still physically present in the write \
+             segment"
+        );
+        let remaining = q.peek_batch(10, TEST_PEEK_BYTES).unwrap();
+        assert_eq!(remaining.len(), 3);
+        for (i, ev) in remaining.iter().enumerate() {
+            assert_eq!(ev.message, format!("event number {}", i + 2));
+        }
     }
 }
