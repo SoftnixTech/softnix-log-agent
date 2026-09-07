@@ -32,6 +32,15 @@ struct Inner {
     dir: PathBuf,
     segments: BTreeSet<u64>,
     write_seg: u64,
+    /// The write segment's contribution to `bytes` below, at all times —
+    /// every mutation site keeps the two in lockstep (`push` adds `rec_len`
+    /// to both; `roll_segment` zeroes this while the new segment is 0 bytes;
+    /// `reconcile_write_segment` corrects both together from the same
+    /// rescan). This is what makes `bytes = bytes - write_off + end` in
+    /// `reconcile_write_segment` correct: it is exactly "swap the write
+    /// segment's old contribution for its real one," not an arbitrary
+    /// subtraction. A future edit to any of those sites that changes one
+    /// without the other silently breaks that arithmetic.
     write_off: u64,
     /// Valid records physically present in the *write* segment, counted from
     /// offset 0 (any already-acked records included). `count` below is a

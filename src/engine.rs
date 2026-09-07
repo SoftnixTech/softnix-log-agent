@@ -39,8 +39,11 @@ const CHANNEL_BYTES: usize = 64 * 1024 * 1024;
 /// Capacity of each per-destination router channel. This exists to absorb
 /// transient bursts and, in particular, the brief lock contention between a
 /// router's `push`/`push_blocking` and the output worker's `ack`/
-/// `peek_batch` on `DiskQueue`'s shared mutex (`ack` holds it across two
-/// `fsync` calls per batch) — not to let one slow destination buffer memory
+/// `peek_batch` on `DiskQueue`'s shared mutex (`peek_batch` holds it across
+/// its read I/O — `File::open`, `seek`, and up to a batch's worth of
+/// `read_exact` + `serde_json::from_slice` — for the duration of one batch
+/// read; `ack`'s own fsyncs no longer hold this mutex, see `DiskQueue::ack`'s
+/// doc comment) — not to let one slow destination buffer memory
 /// unboundedly beyond its own on-disk queue. 4096 gives routine contention
 /// generous room to be absorbed (each slot is just an `Arc<Event>` pointer +
 /// refcount, not the event body, so the memory cost is small) while still
