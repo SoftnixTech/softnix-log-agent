@@ -1,0 +1,101 @@
+name: Release
+
+# Builds and publishes a GitHub Release when a `vX.Y.Z` tag is pushed.
+# Two artifacts: a Linux tarball (binary + install-linux.sh + service unit +
+# example config) and a Windows MSI — both cross-compiled from ubuntu-latest,
+# matching the exact recipes already documented for a manual build (see
+# docs/TESTING.md's cargo-zigbuild note and packaging/windows/build-msi.sh's
+# own header comment), so CI and a human doing this by hand take the same path.
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check-version:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tag must match Cargo.toml version
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          CARGO_VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          if [ "$TAG" != "$CARGO_VERSION" ]; then
+            echo "::error::tag ${GITHUB_REF_NAME} does not match Cargo.toml version ${CARGO_VERSION} — bump Cargo.toml first"
+            exit 1
+          fi
+
+  build-linux:
+    needs: check-version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release
+      - name: Package
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          STAGE="softnix-log-agent-${VERSION}-linux-x86_64"
+          mkdir -p "$STAGE"
+          cp target/release/softnix-log-agent "$STAGE/"
+          cp packaging/install-linux.sh "$STAGE/"
+          cp packaging/softnix-log-agent.service "$STAGE/"
+          cp examples/agent.yaml "$STAGE/"
+          tar czf "${STAGE}.tar.gz" "$STAGE"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-release
+          path: softnix-log-agent-*-linux-x86_64.tar.gz
+          if-no-files-found: error
+
+  build-windows-msi:
+    needs: check-version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-gnu
+      - uses: Swatinem/rust-cache@v2
+      - name: Install mingw-w64 + msitools (wixl)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mingw-w64 msitools
+      - name: Cross-compile Windows binary
+        run: |
+          CC_x86_64_pc_windows_gnu=x86_64-w64-mingw32-gcc \
+            cargo build --release --target x86_64-pc-windows-gnu
+      - name: Build MSI
+        run: ./packaging/windows/build-msi.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-msi
+          path: dist/*.msi
+          if-no-files-found: error
+
+  publish:
+    needs: [build-linux, build-windows-msi]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            artifacts/linux-release/*.tar.gz \
+            artifacts/windows-msi/*.msi \
+            --title "${GITHUB_REF_NAME}" \
+            --generate-notes

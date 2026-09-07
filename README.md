@@ -87,7 +87,13 @@ Full design rationale (why polling over inotify, why `rand`'s CSPRNG page for th
 
 ### Linux
 
-**ติดตั้งด้วย shell script (แนะนำ)**
+**One-line install (แนะนำ)** — ดาวน์โหลด release ล่าสุดจาก GitHub แล้วติดตั้งให้อัตโนมัติ ไม่ต้อง clone repo:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/SoftnixTech/softnix-log-agent/main/packaging/install.sh | sudo bash
+```
+
+**ติดตั้งด้วย shell script จาก repo (ทางเลือก)**
 
 สคริปต์ตรวจสอบ dependency ทุกรายการ (systemd, C compiler, Rust 1.80+) และเสนอติดตั้งให้อัตโนมัติก่อนดำเนินการ
 
@@ -153,7 +159,13 @@ sudo softnix-log-agent service start
 
 ### Windows
 
-**ติดตั้งด้วย MSI (แนะนำ)**
+**One-line install (แนะนำ)** — ดาวน์โหลด MSI release ล่าสุดจาก GitHub แล้วติดตั้งให้อัตโนมัติ (ต้องเปิด PowerShell แบบ elevated):
+
+```powershell
+irm https://raw.githubusercontent.com/SoftnixTech/softnix-log-agent/main/packaging/windows/install.ps1 | iex
+```
+
+**ติดตั้งด้วย MSI ที่ดาวน์โหลดเอง (ทางเลือก)**
 
 ไฟล์ MSI พร้อมใช้งานที่ `dist/softnix-log-agent-0.1.0-x64.msi` ติดตั้ง binary ไปที่ `C:\Program Files\Softnix\LogAgent` และลงทะเบียน Windows service (auto start, LocalSystem) ให้อัตโนมัติ
 
