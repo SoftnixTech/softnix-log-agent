@@ -128,8 +128,19 @@ impl OutputWorker {
                     // expected to equal batch.len() for every Sink in this
                     // codebase today, since DiskQueue::ack always commits the
                     // whole peeked position regardless of n.
-                    if let Err(e) = self.queue.ack(n as u64) {
-                        metrics.record_error(format!("output {id}: queue ack: {e}"));
+                    // R-1: `ack` fsyncs the cursor twice. Do it on the
+                    // blocking pool instead of parking one of the runtime's
+                    // two worker threads inside fsync.
+                    let q = std::sync::Arc::clone(&self.queue);
+                    let acked = n as u64;
+                    match tokio::task::spawn_blocking(move || q.ack(acked)).await {
+                        Ok(Ok(())) => {}
+                        Ok(Err(e)) => {
+                            metrics.record_error(format!("output {id}: queue ack: {e}"));
+                        }
+                        Err(e) => {
+                            metrics.record_error(format!("output {id}: queue ack task: {e}"));
+                        }
                     }
                     metrics
                         .events_sent
@@ -182,7 +193,9 @@ impl OutputWorker {
                 if let Ok(Ok(n)) =
                     tokio::time::timeout(std::time::Duration::from_secs(3), flush).await
                 {
-                    let _ = self.queue.ack(n as u64);
+                    let q = std::sync::Arc::clone(&self.queue);
+                    let acked = n as u64;
+                    let _ = tokio::task::spawn_blocking(move || q.ack(acked)).await;
                     metrics
                         .events_sent
                         .fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);

@@ -322,31 +322,53 @@ impl DiskQueue {
 
     /// Confirm delivery of everything peeked so far; persists the cursor and
     /// removes fully-consumed segments.
+    ///
+    /// The cursor is *serialised* under the queue mutex but *written* outside
+    /// it. `write_atomic` does two `fsync`s (the temp file, then the parent
+    /// directory), and at the default `retry.batch_size: 200` and a few
+    /// thousand events/s that is ~100 fsyncs/s with the mutex held — on a
+    /// consumer SSD, 50-100% of wall-clock time. `run_router`'s `push` takes
+    /// the same mutex, so that, not "brief lock contention", is what
+    /// `ROUTER_CAPACITY` and the `router_shed` counter were absorbing.
+    ///
+    /// Releasing the lock across the write is safe because the cursor is
+    /// single-consumer: only `OutputWorker::run`'s loop calls `ack` and
+    /// `reset_peek`, and never concurrently with itself. The one other writer
+    /// of `inner.cursor` is `drop_oldest_segment`, which can only move it
+    /// *forward* past segments it has just deleted; a cursor persisted from
+    /// before such a move points at a deleted segment, which `open()` already
+    /// clamps to the next surviving one (see the clamp at the top of `open`).
+    /// The unlink loop stays inside the lock: it is `unlink(2)` with no fsync
+    /// and only runs when a whole segment has been consumed.
     pub fn ack(&self, acked_events: u64) -> Result<()> {
-        let mut inner = self.inner.lock().unwrap();
-        inner.cursor = inner.peek;
-        inner.count = inner.count.saturating_sub(acked_events);
+        let (cursor_path, bytes) = {
+            let mut inner = self.inner.lock().unwrap();
+            inner.cursor = inner.peek;
+            inner.count = inner.count.saturating_sub(acked_events);
 
-        // Delete segments wholly behind the cursor (never the write segment).
-        let done: Vec<u64> = inner
-            .segments
-            .range(..inner.cursor.seg)
-            .copied()
-            .filter(|&s| s != inner.write_seg)
-            .collect();
-        for seg in done {
-            let path = seg_path(&inner.dir, seg);
-            if let Ok(md) = std::fs::metadata(&path) {
-                inner.bytes = inner.bytes.saturating_sub(md.len());
+            // Delete segments wholly behind the cursor (never the write segment).
+            let done: Vec<u64> = inner
+                .segments
+                .range(..inner.cursor.seg)
+                .copied()
+                .filter(|&s| s != inner.write_seg)
+                .collect();
+            for seg in done {
+                let path = seg_path(&inner.dir, seg);
+                if let Ok(md) = std::fs::metadata(&path) {
+                    inner.bytes = inner.bytes.saturating_sub(md.len());
+                }
+                std::fs::remove_file(&path).ok();
+                inner.segments.remove(&seg);
             }
-            std::fs::remove_file(&path).ok();
-            inner.segments.remove(&seg);
-        }
 
-        let cursor_path = inner.dir.join("cursor.json");
-        crate::fsutil::write_atomic(&cursor_path, &serde_json::to_vec(&inner.cursor)?)
+            let cursor_path = inner.dir.join("cursor.json");
+            let bytes = serde_json::to_vec(&inner.cursor)?;
+            (cursor_path, bytes)
+        };
+        // Lock released: the two fsyncs below no longer block `push`.
+        crate::fsutil::write_atomic(&cursor_path, &bytes)
             .with_context(|| format!("cannot persist queue cursor {}", cursor_path.display()))?;
-        drop(inner);
         self.space_notify.notify_waiters();
         Ok(())
     }
@@ -1024,5 +1046,92 @@ mod tests {
         let next = q.peek_batch(10, 1024).unwrap();
         assert_eq!(next.len(), 1);
         assert_eq!(next[0].message, "event number 1");
+    }
+
+    /// R-1: `ack` serialises the cursor under the queue mutex but does
+    /// `write_atomic`'s two fsyncs outside it, so the router's `push` is no
+    /// longer blocked for ~5-10 ms per fsync. The contract must not move: the
+    /// cursor is single-consumer (only the output worker's loop calls
+    /// `ack`/`reset_peek`, never concurrently with itself), so every pushed
+    /// event must still be peeked exactly once, in order, and an acked event
+    /// must never be replayed after a reopen.
+    #[test]
+    fn ack_is_durable_under_concurrent_pushes() {
+        let dir = tempfile::tempdir().unwrap();
+        let q = DiskQueue::open(dir.path(), "d1", &cfg(16, FullPolicy::Block)).unwrap();
+
+        let seen = std::thread::scope(|s| {
+            let writer = s.spawn(|| {
+                for i in 0..200 {
+                    assert!(matches!(
+                        q.push(&ev(i)).unwrap(),
+                        PushOutcome::Stored { .. }
+                    ));
+                }
+            });
+            let reader = s.spawn(|| {
+                let mut seen: Vec<String> = Vec::new();
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+                while seen.len() < 200 && std::time::Instant::now() < deadline {
+                    let batch = q.peek_batch(10, TEST_PEEK_BYTES).unwrap();
+                    if batch.is_empty() {
+                        std::thread::yield_now();
+                        continue;
+                    }
+                    let n = batch.len() as u64;
+                    seen.extend(batch.into_iter().map(|e| e.message));
+                    q.ack(n).unwrap();
+                }
+                seen
+            });
+            writer.join().unwrap();
+            reader.join().unwrap()
+        });
+
+        assert_eq!(
+            seen.len(),
+            200,
+            "every pushed event must be peeked exactly once"
+        );
+        for (i, msg) in seen.iter().enumerate() {
+            assert_eq!(msg, &format!("event number {i}"), "order broken at {i}");
+        }
+        assert_eq!(q.len(), 0);
+
+        drop(q);
+        let q2 = DiskQueue::open(dir.path(), "d1", &cfg(16, FullPolicy::Block)).unwrap();
+        assert!(
+            q2.peek_batch(1000, TEST_PEEK_BYTES).unwrap().is_empty(),
+            "acked events replayed after reopen: the cursor write outside the \
+             lock did not persist"
+        );
+    }
+
+    /// R-1/R-2: the output worker calls both of these from
+    /// `tokio::task::spawn_blocking`, which requires `Arc<DiskQueue>` to be
+    /// `Send + 'static` and both return types to be `Send`. Pin that so a
+    /// later change to `Inner` cannot silently break the call sites.
+    #[tokio::test]
+    async fn peek_batch_and_ack_are_callable_from_the_blocking_pool() {
+        let dir = tempfile::tempdir().unwrap();
+        let q = DiskQueue::open(dir.path(), "d1", &cfg(16, FullPolicy::Block)).unwrap();
+        for i in 0..4 {
+            q.push(&ev(i)).unwrap();
+        }
+
+        let qc = Arc::clone(&q);
+        let batch = tokio::task::spawn_blocking(move || qc.peek_batch(10, TEST_PEEK_BYTES))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(batch.len(), 4);
+
+        let qc = Arc::clone(&q);
+        let n = batch.len() as u64;
+        tokio::task::spawn_blocking(move || qc.ack(n))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(q.len(), 0);
     }
 }
