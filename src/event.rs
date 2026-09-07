@@ -82,6 +82,40 @@ impl Event {
         }
     }
 
+    /// Borrow a field's value as a `&str`, for callers that only need to read
+    /// it.
+    ///
+    /// `get_field` has to return an owned `Value`, so reading `message`
+    /// through it copies the entire event body — and `value_to_string` then
+    /// copies it a second time. With a `when:` condition on `message` per
+    /// output, a 4 KB event cost ~8 KB of allocate-copy-free per output
+    /// before it reached any queue.
+    ///
+    /// Covers the string-valued fields the condition DSL and the `mask`
+    /// transform are actually pointed at. Everything else — `timestamp`,
+    /// `received_at`, `severity`, `facility`, `collector_version`, and any
+    /// non-`String` entry in `fields` — returns `None`, and callers fall back
+    /// to `get_field` for those. That fallback is load-bearing: it is what
+    /// makes the borrowing fast path exactly equivalent to the owned one.
+    ///
+    /// Whenever this returns `Some`, `get_field` for the same name would also
+    /// return `Some`.
+    pub fn get_str(&self, name: &str) -> Option<&str> {
+        match name {
+            "message" => Some(self.message.as_str()),
+            "raw_message" => self.raw_message.as_deref(),
+            "hostname" => self.hostname.as_deref(),
+            "application" => self.application.as_deref(),
+            "process_id" => self.process_id.as_deref(),
+            "source" => Some(self.source.as_str()),
+            "source_type" => Some(self.source_type.as_str()),
+            other => match self.fields.get(other) {
+                Some(Value::String(s)) => Some(s.as_str()),
+                _ => None,
+            },
+        }
+    }
+
     /// Set a field by name; core fields are coerced where sensible.
     pub fn set_field(&mut self, name: &str, value: Value) {
         match name {
@@ -209,5 +243,77 @@ mod tests {
         assert_eq!(ev.raw_message.as_deref(), Some("original"));
         ev.preserve_raw("second call");
         assert_eq!(ev.raw_message.as_deref(), Some("original"));
+    }
+
+    /// R-5: `get_field` returns an owned `Value`, so every condition
+    /// evaluation on `message` deep-copied the whole event body — and
+    /// `value_to_string` then copied it again. `get_str` borrows instead.
+    #[test]
+    fn get_str_borrows_string_fields_without_copying() {
+        let mut ev = Event::new("src-1", "test", "a message body");
+        ev.hostname = Some("host-a".to_string());
+        ev.application = Some("app".to_string());
+        ev.process_id = Some("4242".to_string());
+        ev.raw_message = Some("<11>a message body".to_string());
+        ev.fields
+            .insert("env".to_string(), Value::String("prod".to_string()));
+        ev.fields
+            .insert("retries".to_string(), Value::Number(7.into()));
+        ev.severity = Some(3);
+
+        // The whole point: a borrow of the event's own buffer, not a copy.
+        assert!(
+            std::ptr::eq(ev.get_str("message").unwrap().as_ptr(), ev.message.as_ptr()),
+            "get_str must borrow the body, not clone it"
+        );
+
+        assert_eq!(ev.get_str("message"), Some("a message body"));
+        assert_eq!(ev.get_str("raw_message"), Some("<11>a message body"));
+        assert_eq!(ev.get_str("hostname"), Some("host-a"));
+        assert_eq!(ev.get_str("application"), Some("app"));
+        assert_eq!(ev.get_str("process_id"), Some("4242"));
+        assert_eq!(ev.get_str("source"), Some("src-1"));
+        assert_eq!(ev.get_str("source_type"), Some("test"));
+        assert_eq!(ev.get_str("env"), Some("prod"));
+
+        // Deliberately not covered: callers fall back to get_field for these,
+        // which is what keeps eval_condition's behaviour identical.
+        assert_eq!(ev.get_str("retries"), None, "non-string fields entry");
+        assert_eq!(ev.get_str("severity"), None, "numeric core field");
+        assert_eq!(ev.get_str("timestamp"), None, "formatted core field");
+        assert_eq!(ev.get_str("collector_version"), None);
+        assert_eq!(ev.get_str("nope"), None, "absent field");
+
+        // Absent optionals report absent, not empty.
+        let bare = Event::new("s", "t", "body");
+        assert_eq!(bare.get_str("hostname"), None);
+        assert_eq!(bare.get_str("raw_message"), None);
+        assert_eq!(bare.get_str("application"), None);
+        assert_eq!(bare.get_str("process_id"), None);
+
+        // The implication eval_condition's fast path depends on: whenever
+        // get_str answers, get_field would have answered too.
+        for name in [
+            "message",
+            "raw_message",
+            "hostname",
+            "application",
+            "process_id",
+            "source",
+            "source_type",
+            "env",
+            "retries",
+            "severity",
+            "timestamp",
+            "collector_version",
+            "nope",
+        ] {
+            if ev.get_str(name).is_some() {
+                assert!(
+                    ev.get_field(name).is_some(),
+                    "get_str answered for {name} but get_field did not"
+                );
+            }
+        }
     }
 }
