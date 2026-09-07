@@ -140,11 +140,24 @@ impl Transformer {
                     when,
                 } => {
                     if when.as_ref().is_none_or(|w| eval_condition(w, ev)) {
-                        if let Some(v) = ev.get_field(field) {
-                            if let Some(s) = value_to_string(&v) {
-                                let masked = re.replace_all(&s, replacement.as_str());
-                                ev.set_field(field, Value::String(masked.into_owned()));
-                            }
+                        // R-5: the old chain was get_field (clones the body)
+                        // -> value_to_string (clones it again) -> replace_all
+                        // (a third copy) -> set_field. `get_str` borrows the
+                        // body, so a masked string field costs one copy.
+                        // Fields `get_str` cannot borrow — numbers, bools,
+                        // non-string `fields` entries — keep the original
+                        // stringify-then-set path, including its long-standing
+                        // coercion of the masked field to a string.
+                        let masked: Option<String> = match ev.get_str(field) {
+                            Some(s) => Some(re.replace_all(s, replacement.as_str()).into_owned()),
+                            None => ev
+                                .get_field(field)
+                                .as_ref()
+                                .and_then(value_to_string)
+                                .map(|s| re.replace_all(&s, replacement.as_str()).into_owned()),
+                        };
+                        if let Some(s) = masked {
+                            ev.set_field(field, Value::String(s));
                         }
                         // `raw_message` retains the original unparsed line, so
                         // masking only `message` would leak the secret through
@@ -284,5 +297,67 @@ transforms:
             convert_value(&Value::String("yes".into()), "bool"),
             Some(Value::Bool(true))
         );
+    }
+
+    /// R-5: the mask step did get_field (clone) -> value_to_string (clone) ->
+    /// replace_all (clone) -> set_field (move): three full copies of the
+    /// message per masked event. It now borrows the body for string fields.
+    /// Non-string fields must keep working exactly as before, including the
+    /// coercion to a string that masking them has always done.
+    #[test]
+    fn mask_covers_string_and_non_string_fields() {
+        let cfg: PipelineConfig = serde_yaml::from_str(
+            r#"
+transforms:
+  - type: mask
+    field: message
+    pattern: "\\d{4}"
+    replacement: "[X]"
+  - type: mask
+    field: env
+    pattern: "prod"
+    replacement: "[ENV]"
+  - type: mask
+    field: retries
+    pattern: "7"
+    replacement: "9"
+  - type: mask
+    field: absent
+    pattern: "x"
+    replacement: "y"
+"#,
+        )
+        .unwrap();
+        let t = Transformer::compile(&cfg).unwrap();
+
+        let mut ev = Event::new("s", "test", "code 1234 here");
+        ev.fields
+            .insert("env".to_string(), Value::String("prod".to_string()));
+        ev.fields
+            .insert("retries".to_string(), Value::Number(7.into()));
+        assert!(t.apply(&mut ev));
+
+        assert_eq!(ev.message, "code [X] here", "core string field");
+        assert_eq!(
+            ev.fields["env"],
+            Value::String("[ENV]".to_string()),
+            "fields-map string entry"
+        );
+        // Unchanged behaviour: a non-string field is stringified, masked and
+        // written back as a string.
+        assert_eq!(
+            ev.fields["retries"],
+            Value::String("9".to_string()),
+            "non-string fields entry must still be masked via the owned path"
+        );
+        assert!(
+            !ev.fields.contains_key("absent"),
+            "masking a missing field must not create it"
+        );
+
+        // A pattern that does not match must leave the value byte-identical.
+        let mut untouched = Event::new("s", "test", "no digits here");
+        assert!(t.apply(&mut untouched));
+        assert_eq!(untouched.message, "no digits here");
     }
 }
