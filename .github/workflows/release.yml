@@ -1,11 +1,15 @@
 name: Release
 
 # Builds and publishes a GitHub Release when a `vX.Y.Z` tag is pushed.
-# Two artifacts: a Linux tarball (binary + install-linux.sh + service unit +
-# example config) and a Windows MSI — both cross-compiled from ubuntu-latest,
-# matching the exact recipes already documented for a manual build (see
-# docs/TESTING.md's cargo-zigbuild note and packaging/windows/build-msi.sh's
-# own header comment), so CI and a human doing this by hand take the same path.
+# Two artifacts: a Linux tarball (built on ubuntu-latest) and a Windows MSI
+# (built natively on windows-latest with WiX v3 — the same test-windows
+# already proves cargo build --release works on this exact runner image,
+# so this reuses a path this CI already trusts, rather than the
+# msitools/wixl cross-compile from Linux that packaging/windows/build-msi.sh
+# documents for a human's own machine: Ubuntu 24.04's apt-packaged msitools
+# 0.103+repack-1build3 installs cleanly but does not actually ship a `wixl`
+# binary — confirmed by running this pipeline for real — so CI does not use
+# that script at all).
 #
 # Actions are pinned to a commit SHA, not a floating version tag — a tag can
 # be repointed by the action's maintainer (or a compromised account); a SHA
@@ -63,23 +67,33 @@ jobs:
 
   build-windows-msi:
     needs: check-version
-    runs-on: ubuntu-latest
+    runs-on: windows-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable branch, resolved 2026-09-07
-        with:
-          targets: x86_64-pc-windows-gnu
       - uses: Swatinem/rust-cache@63fed3e2fecf6f7b51dc6f043341b79ef82a9ae7 # v2.9.2
-      - name: Install mingw-w64 + msitools (wixl)
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y mingw-w64 msitools
-      - name: Cross-compile Windows binary
-        run: |
-          CC_x86_64_pc_windows_gnu=x86_64-w64-mingw32-gcc \
-            cargo build --release --target x86_64-pc-windows-gnu
+      - run: cargo build --release
+      # windows-latest ships Chocolatey preinstalled; this is the standard,
+      # widely-used way to get WiX v3's candle/light onto a GH-hosted
+      # Windows runner (no apt/wixl involved at all).
+      - name: Install WiX Toolset v3
+        run: choco install wixtoolset -y --no-progress
       - name: Build MSI
-        run: ./packaging/windows/build-msi.sh
+        shell: pwsh
+        run: |
+          $wixBin = (Get-ChildItem "C:\Program Files (x86)\WiX Toolset v3*\bin" -Directory -ErrorAction Stop | Select-Object -First 1).FullName
+          $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.*)"').Matches[0].Groups[1].Value
+
+          $stage = "$env:RUNNER_TEMP\msi-stage"
+          New-Item -ItemType Directory -Force -Path "$stage\packaging\windows" | Out-Null
+          Copy-Item target\release\softnix-log-agent.exe "$stage\softnix-log-agent.exe"
+          Copy-Item packaging\windows\agent-default.yaml "$stage\packaging\windows\agent-default.yaml"
+
+          New-Item -ItemType Directory -Force -Path dist, obj | Out-Null
+          & "$wixBin\candle.exe" -nologo "-dSourceDir=$stage" packaging\windows\softnix-log-agent.wxs -o obj\
+          if ($LASTEXITCODE -ne 0) { throw "candle failed with exit code $LASTEXITCODE" }
+          & "$wixBin\light.exe" -nologo obj\softnix-log-agent.wixobj -o "dist\softnix-log-agent-$version-x64.msi"
+          if ($LASTEXITCODE -ne 0) { throw "light failed with exit code $LASTEXITCODE" }
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: windows-msi
