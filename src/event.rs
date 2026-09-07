@@ -98,6 +98,13 @@ impl Event {
     /// to `get_field` for those. That fallback is load-bearing: it is what
     /// makes the borrowing fast path exactly equivalent to the owned one.
     ///
+    /// `timestamp`, `received_at`, `severity`, `facility`, and
+    /// `collector_version` always return `None` here, even if `fields`
+    /// happens to contain a same-named `String` entry — `get_field` gives
+    /// those five names absolute priority over `fields` (see its match arms),
+    /// so `get_str` must refuse to answer for them too, or a same-named
+    /// `fields` entry could make it disagree with `get_field`.
+    ///
     /// Whenever this returns `Some`, `get_field` for the same name would also
     /// return `Some`.
     pub fn get_str(&self, name: &str) -> Option<&str> {
@@ -109,6 +116,7 @@ impl Event {
             "process_id" => self.process_id.as_deref(),
             "source" => Some(self.source.as_str()),
             "source_type" => Some(self.source_type.as_str()),
+            "timestamp" | "received_at" | "severity" | "facility" | "collector_version" => None,
             other => match self.fields.get(other) {
                 Some(Value::String(s)) => Some(s.as_str()),
                 _ => None,
@@ -314,6 +322,39 @@ mod tests {
                     "get_str answered for {name} but get_field did not"
                 );
             }
+        }
+    }
+
+    /// R-5 regression: `get_field` gives these five names absolute priority
+    /// over `fields` (see its match arms), so `get_str` must refuse to
+    /// answer for them too, even when a raw `fields` entry happens to exist
+    /// under one of these exact keys -- otherwise `get_str(n).is_some()` no
+    /// longer implies `get_field(n).is_some()`, which `eval_condition`'s fast
+    /// path (`src/pipeline/condition.rs`) depends on unconditionally. A
+    /// JSON/KV/regex parser input containing a raw "facility" or "severity"
+    /// key that doesn't cleanly map to the dedicated field produces exactly
+    /// this shadow (see `apply_known_key` in `src/pipeline/parser.rs`, which
+    /// inserts unmatched/unparseable keys straight into `fields`).
+    #[test]
+    fn get_str_never_answers_for_names_get_field_reserves_for_core_fields() {
+        let mut ev = Event::new("s", "t", "body");
+        let reserved = [
+            "timestamp",
+            "received_at",
+            "severity",
+            "facility",
+            "collector_version",
+        ];
+        for name in reserved {
+            ev.fields
+                .insert(name.to_string(), Value::String("shadow".to_string()));
+        }
+        for name in reserved {
+            assert_eq!(
+                ev.get_str(name),
+                None,
+                "{name} must stay None even when `fields` has a same-named entry"
+            );
         }
     }
 }

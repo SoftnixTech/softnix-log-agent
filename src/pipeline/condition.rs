@@ -395,4 +395,33 @@ mod tests {
             );
         }
     }
+
+    /// R-5 regression: a `fields` entry shadowing one of the five names
+    /// `get_field` reserves for core fields (severity/facility/timestamp/
+    /// received_at/collector_version) must not change `eval_condition`'s
+    /// answer -- see the corresponding test in `src/event.rs` for why this
+    /// can happen from ordinary parser input.
+    #[test]
+    fn eval_condition_ignores_a_fields_entry_that_shadows_a_reserved_core_field_name() {
+        let mut ev = Event::new("s", "t", "body");
+        ev.fields.insert(
+            "severity".to_string(),
+            Value::String("not-a-real-severity".to_string()),
+        );
+        ev.fields
+            .insert("facility".to_string(), Value::String("local0".to_string()));
+
+        // ev.severity and ev.facility are both None: get_field must say so,
+        // completely ignoring the shadowing fields entries.
+        assert!(!eval_condition(&compile("severity", "exists", None), &ev));
+        assert!(!eval_condition(&compile("facility", "exists", None), &ev));
+        assert!(!eval_condition(
+            &compile("severity", "eq", s("not-a-real-severity")),
+            &ev
+        ));
+        assert!(!eval_condition(
+            &compile("facility", "eq", s("local0")),
+            &ev
+        ));
+    }
 }
