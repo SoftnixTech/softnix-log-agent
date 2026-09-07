@@ -9,6 +9,16 @@ use tokio_util::sync::CancellationToken;
 /// (used for failover routing decisions).
 const UNHEALTHY_AFTER: u64 = 3;
 
+/// Per-batch byte budget handed to `DiskQueue::peek_batch`.
+///
+/// `retry.batch_size` bounds a batch by event *count*, which is not a memory
+/// bound: a file input can emit events up to 4 MiB each, so the default 200
+/// events could materialise ~200 MB of `Event`s here plus a second, equally
+/// large wire payload in `frame_batch`. 8 MiB is comfortably above any
+/// realistic batch of syslog-sized events and two orders of magnitude below
+/// the worst case it removes.
+const PEEK_MAX_BYTES: usize = 8 * 1024 * 1024;
+
 pub struct OutputWorker {
     id: String,
     kind_label: String,
@@ -87,7 +97,7 @@ impl OutputWorker {
                 break;
             }
 
-            let batch = match self.queue.peek_batch(self.retry.batch_size) {
+            let batch = match self.queue.peek_batch(self.retry.batch_size, PEEK_MAX_BYTES) {
                 // wait_data can report "data available" while peek_batch returns
                 // nothing (all remaining records were skipped as corrupt). Without
                 // a floor this becomes a tight loop that pins a core forever.
@@ -166,7 +176,7 @@ impl OutputWorker {
         }
 
         // Graceful shutdown: one bounded attempt to flush remaining events.
-        if let Ok(batch) = self.queue.peek_batch(self.retry.batch_size) {
+        if let Ok(batch) = self.queue.peek_batch(self.retry.batch_size, PEEK_MAX_BYTES) {
             if !batch.is_empty() {
                 let flush = self.sink.send_batch(&batch);
                 if let Ok(Ok(n)) =

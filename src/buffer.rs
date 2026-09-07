@@ -236,18 +236,39 @@ impl DiskQueue {
         }
     }
 
-    /// Read up to `max` events from the in-memory peek position.
-    pub fn peek_batch(&self, max: usize) -> Result<Vec<Event>> {
+    /// Read up to `max` events, and at most `max_bytes` of on-disk record
+    /// bytes, from the in-memory peek position.
+    ///
+    /// `max` alone is not a memory bound: event bodies are capped per event
+    /// (1 MiB per line, up to a 4 MiB unterminated read from a file input) but
+    /// not per batch, so a count-only limit let the default `batch_size: 200`
+    /// materialise ~200 MB of `Event`s in one call — and the output sink then
+    /// builds a second, equally large wire payload from it while the batch is
+    /// still alive.
+    ///
+    /// `max_bytes` counts `rec_len` (`HEADER + payload`), the same quantity
+    /// `push` adds to `inner.bytes`. A record that would take the running
+    /// total over the budget is left unconsumed for the next call.
+    ///
+    /// Invariant: **at least one event is returned whenever one is readable**
+    /// (for `max >= 1`), whatever `max_bytes` is. A single record bigger than
+    /// the budget is returned on its own rather than refused forever, which
+    /// would pin the peek offset and spin the worker's empty-batch floor.
+    pub fn peek_batch(&self, max: usize, max_bytes: usize) -> Result<Vec<Event>> {
         let mut inner = self.inner.lock().unwrap();
         // Make appended-but-buffered data visible to the reader.
         if let Some(w) = inner.writer.as_mut() {
             w.flush().ok();
         }
         let mut out = Vec::new();
+        let mut peeked_bytes: usize = 0;
+        // Set when the byte budget refuses a record, so both loops unwind
+        // without advancing `pos` past a record that was not consumed.
+        let mut budget_hit = false;
         let mut pos = inner.peek;
         let segs: Vec<u64> = inner.segments.range(pos.seg..).copied().collect();
         for seg in segs {
-            if out.len() >= max {
+            if out.len() >= max || budget_hit {
                 break;
             }
             let start = if seg == pos.seg { pos.off } else { 0 };
@@ -265,7 +286,18 @@ impl DiskQueue {
                 }
                 match read_record(&mut f, file_len)? {
                     RecordRead::Ok { payload, rec_len } => {
+                        // Stop before taking a record that would push the
+                        // batch over the byte budget — but never return an
+                        // empty batch just because the next record is
+                        // oversized, or the peek offset would never advance.
+                        if !out.is_empty()
+                            && peeked_bytes.saturating_add(rec_len as usize) > max_bytes
+                        {
+                            budget_hit = true;
+                            break;
+                        }
                         off += rec_len;
+                        peeked_bytes = peeked_bytes.saturating_add(rec_len as usize);
                         match serde_json::from_slice::<Event>(&payload) {
                             Ok(ev) => out.push(ev),
                             Err(e) => {
@@ -578,6 +610,10 @@ mod tests {
     use super::*;
     use crate::event::Event;
 
+    /// A byte budget large enough never to bind in tests that are exercising
+    /// something other than the budget itself.
+    const TEST_PEEK_BYTES: usize = 64 * 1024 * 1024;
+
     fn cfg(max_mb: u64, policy: FullPolicy) -> BufferConfig {
         BufferConfig {
             dir: None,
@@ -602,12 +638,12 @@ mod tests {
             ));
         }
         assert_eq!(q.len(), 10);
-        let batch = q.peek_batch(4).unwrap();
+        let batch = q.peek_batch(4, TEST_PEEK_BYTES).unwrap();
         assert_eq!(batch.len(), 4);
         assert_eq!(batch[0].message, "event number 0");
         q.ack(4).unwrap();
         assert_eq!(q.len(), 6);
-        let batch = q.peek_batch(100).unwrap();
+        let batch = q.peek_batch(100, TEST_PEEK_BYTES).unwrap();
         assert_eq!(batch.len(), 6);
         assert_eq!(batch[0].message, "event number 4");
     }
@@ -617,10 +653,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let q = DiskQueue::open(dir.path(), "d1", &cfg(16, FullPolicy::Block)).unwrap();
         q.push(&ev(1)).unwrap();
-        let b1 = q.peek_batch(10).unwrap();
+        let b1 = q.peek_batch(10, TEST_PEEK_BYTES).unwrap();
         assert_eq!(b1.len(), 1);
         q.reset_peek();
-        let b2 = q.peek_batch(10).unwrap();
+        let b2 = q.peek_batch(10, TEST_PEEK_BYTES).unwrap();
         assert_eq!(b2.len(), 1);
         assert_eq!(b1[0].message, b2[0].message);
     }
@@ -633,13 +669,13 @@ mod tests {
             for i in 0..5 {
                 q.push(&ev(i)).unwrap();
             }
-            q.peek_batch(2).unwrap();
+            q.peek_batch(2, TEST_PEEK_BYTES).unwrap();
             q.ack(2).unwrap();
             // 3 events remain unacked; "crash" here.
         }
         let q = DiskQueue::open(dir.path(), "d1", &cfg(16, FullPolicy::Block)).unwrap();
         assert_eq!(q.len(), 3);
-        let batch = q.peek_batch(10).unwrap();
+        let batch = q.peek_batch(10, TEST_PEEK_BYTES).unwrap();
         assert_eq!(batch.len(), 3);
         assert_eq!(batch[0].message, "event number 2");
     }
@@ -680,7 +716,7 @@ mod tests {
         assert_eq!(reported_evicted, q.dropped());
         assert!(q.bytes() <= q.max_bytes() + 2 * 64 * 1024);
         // Remaining events are still readable.
-        let batch = q.peek_batch(5).unwrap();
+        let batch = q.peek_batch(5, TEST_PEEK_BYTES).unwrap();
         assert!(!batch.is_empty());
     }
 
@@ -693,7 +729,7 @@ mod tests {
             q.push(&Event::new("t", "raw", &big)).unwrap();
         }
         assert_eq!(q.len(), 12);
-        let batch = q.peek_batch(100).unwrap();
+        let batch = q.peek_batch(100, TEST_PEEK_BYTES).unwrap();
         assert_eq!(batch.len(), 12);
         q.ack(12).unwrap();
         assert_eq!(q.len(), 0);
@@ -725,14 +761,14 @@ mod tests {
         drop(f);
 
         let q = DiskQueue::open(dir.path(), "dest", &cfg).unwrap();
-        let batch = q.peek_batch(10).unwrap();
+        let batch = q.peek_batch(10, TEST_PEEK_BYTES).unwrap();
         assert_eq!(batch.len(), 2, "must return the two intact records");
         assert_eq!(q.corrupt_records(), 1);
 
         // The critical property: peek advanced past the corrupt record, so a
         // second call cannot return an empty batch forever.
         q.ack(batch.len() as u64).unwrap();
-        assert!(q.peek_batch(10).unwrap().is_empty());
+        assert!(q.peek_batch(10, TEST_PEEK_BYTES).unwrap().is_empty());
     }
 
     #[test]
@@ -753,7 +789,7 @@ mod tests {
         ));
         assert_eq!(q.len(), 1);
 
-        let batch = q.peek_batch(10).unwrap();
+        let batch = q.peek_batch(10, TEST_PEEK_BYTES).unwrap();
         assert_eq!(
             batch.len(),
             1,
@@ -763,7 +799,7 @@ mod tests {
 
         // The offset must have advanced past the record, not stayed pinned.
         q.ack(1).unwrap();
-        assert!(q.peek_batch(10).unwrap().is_empty());
+        assert!(q.peek_batch(10, TEST_PEEK_BYTES).unwrap().is_empty());
     }
 
     #[test]
@@ -796,7 +832,7 @@ mod tests {
             q.push(&Event::new("s", "test", &format!("event {i}")))
                 .unwrap();
         }
-        let batch = q.peek_batch(10).unwrap();
+        let batch = q.peek_batch(10, TEST_PEEK_BYTES).unwrap();
         assert_eq!(batch.len(), 10);
         q.ack(10).unwrap();
 
@@ -806,7 +842,7 @@ mod tests {
         drop(q);
         let q2 = DiskQueue::open(dir.path(), "dest", &cfg).unwrap();
         assert!(
-            q2.peek_batch(10).unwrap().is_empty(),
+            q2.peek_batch(10, TEST_PEEK_BYTES).unwrap().is_empty(),
             "acked events replayed"
         );
     }
@@ -913,5 +949,80 @@ mod tests {
         );
         assert!(qdir.join("00000000000000000001.seg").exists());
         assert_eq!(q.len(), 2);
+    }
+
+    /// R-4: `peek_batch` was bounded by event count only, so with the default
+    /// batch_size 200 and file-input events up to 4 MiB each, a batch could
+    /// reach ~200 MB in RAM (and `frame_batch` another ~200 MB alongside it)
+    /// against an advertised ~12 MB footprint.
+    #[test]
+    fn peek_batch_stops_at_the_byte_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let q = DiskQueue::open(dir.path(), "d1", &cfg(64, FullPolicy::Block)).unwrap();
+        let big = "b".repeat(64 * 1024);
+        for i in 0..10 {
+            assert!(matches!(
+                q.push(&Event::new("t", "raw", &format!("{i}{big}")))
+                    .unwrap(),
+                PushOutcome::Stored { .. }
+            ));
+        }
+
+        // Each record is ~65.7 KB on disk: a 65_537-byte body, ~180 bytes of
+        // JSON envelope (two rfc3339 timestamps, source, source_type,
+        // collector_version; every Option field is skipped when None) and the
+        // 8-byte header. With a 150_000-byte budget two fit (~131.4 KB) and
+        // the third does not (~197.1 KB), leaving ~18 KB
+        // of margin on the accept side and ~47 KB on the reject side, so the
+        // exact count below does not depend on the envelope's exact size.
+        const BUDGET: usize = 150_000;
+        let first = q.peek_batch(10, BUDGET).unwrap();
+        assert!(
+            !first.is_empty() && first.len() < 10,
+            "byte budget must bind before the count budget, got {}",
+            first.len()
+        );
+        assert_eq!(first.len(), 2, "two ~66 KB records fit in 150 000 bytes");
+        assert!(first[0].message.starts_with('0'));
+        assert!(first[1].message.starts_with('1'));
+
+        // The refused record is not consumed: the next call starts there, so
+        // nothing is lost and nothing is skipped.
+        let second = q.peek_batch(10, BUDGET).unwrap();
+        assert_eq!(second.len(), 2);
+        assert!(second[0].message.starts_with('2'));
+
+        // Draining with a generous budget still yields the rest in order.
+        let rest = q.peek_batch(100, TEST_PEEK_BYTES).unwrap();
+        assert_eq!(rest.len(), 6);
+        assert!(rest[0].message.starts_with('4'));
+        assert!(rest[5].message.starts_with('9'));
+    }
+
+    /// R-4 invariant: the budget must never produce an empty batch when a
+    /// record is readable. An oversized record that was refused forever would
+    /// pin the peek offset and spin the output worker's empty-batch floor at
+    /// 10 Hz for the life of the process.
+    #[test]
+    fn peek_batch_always_returns_one_record_even_when_it_exceeds_the_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let q = DiskQueue::open(dir.path(), "d1", &cfg(64, FullPolicy::Block)).unwrap();
+        let huge = "z".repeat(2 * 1024 * 1024);
+        q.push(&Event::new("t", "raw", &huge)).unwrap();
+        q.push(&ev(1)).unwrap();
+
+        let batch = q.peek_batch(10, 1024).unwrap();
+        assert_eq!(
+            batch.len(),
+            1,
+            "a record larger than max_bytes must still be returned, alone"
+        );
+        assert_eq!(batch[0].message, huge);
+
+        // And the offset advanced past it, so the reader makes progress.
+        q.ack(1).unwrap();
+        let next = q.peek_batch(10, 1024).unwrap();
+        assert_eq!(next.len(), 1);
+        assert_eq!(next[0].message, "event number 1");
     }
 }
