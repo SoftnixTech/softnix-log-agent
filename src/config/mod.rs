@@ -11,7 +11,9 @@ pub use env::expand_env;
 pub use schema::*;
 pub use validate::validate;
 
-use anyhow::{bail, Context, Result};
+#[cfg(unix)]
+use anyhow::bail;
+use anyhow::{Context, Result};
 use std::path::Path;
 
 /// Parse and validate config text. Returns the config plus non-fatal warnings.
