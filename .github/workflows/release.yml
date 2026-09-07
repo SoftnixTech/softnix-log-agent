@@ -47,14 +47,31 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable branch, resolved 2026-09-07
+        with:
+          targets: x86_64-unknown-linux-musl
       - uses: Swatinem/rust-cache@63fed3e2fecf6f7b51dc6f043341b79ef82a9ae7 # v2.9.2
-      - run: cargo build --release
+      # Static musl build, not the runner's glibc: a binary built against
+      # ubuntu-latest's glibc 2.39 requires GLIBC_2.39 at runtime and fails
+      # with "does not run on this host" on RHEL/Rocky 8 (2.28), RHEL 9
+      # (2.34), Debian 11 (2.31) - confirmed on a real customer install of
+      # v0.1.1. musl links libc in, so one binary runs on any x86_64 Linux.
+      - run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - run: cargo build --release --target x86_64-unknown-linux-musl
+      - name: Confirm the binary is static
+        run: |
+          file target/x86_64-unknown-linux-musl/release/softnix-log-agent
+          if ldd target/x86_64-unknown-linux-musl/release/softnix-log-agent 2>&1 | grep -q 'not a dynamic executable\|statically linked'; then
+            echo "static: ok"
+          else
+            echo "::error::release binary is dynamically linked - it will not run on hosts with an older glibc"
+            exit 1
+          fi
       - name: Package
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
           STAGE="softnix-log-agent-${VERSION}-linux-x86_64"
           mkdir -p "$STAGE"
-          cp target/release/softnix-log-agent "$STAGE/"
+          cp target/x86_64-unknown-linux-musl/release/softnix-log-agent "$STAGE/"
           cp packaging/install-linux.sh "$STAGE/"
           cp packaging/softnix-log-agent.service "$STAGE/"
           cp examples/agent.yaml "$STAGE/"

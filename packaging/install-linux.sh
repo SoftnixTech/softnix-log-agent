@@ -102,8 +102,14 @@ if [ -n "$BINARY" ]; then
   step "Using prebuilt binary"
   [ -f "$BINARY" ] || fail "binary not found: $BINARY"
   [ -x "$BINARY" ] || chmod +x "$BINARY" || fail "binary is not executable: $BINARY"
-  "$BINARY" --version >/dev/null 2>&1 || fail "$BINARY does not run on this host (wrong arch or libc?)"
-  info "binary OK: $("$BINARY" --version)"
+  # Show the loader's actual complaint (e.g. "version `GLIBC_2.34' not
+  # found") instead of swallowing it - that one line is the whole diagnosis.
+  if ! PROBE="$("$BINARY" --version 2>&1)"; then
+    fail "$BINARY does not run on this host (wrong arch or libc?):
+${PROBE}
+  arch: $(uname -m)   libc: $(ldd --version 2>&1 | head -1)"
+  fi
+  info "binary OK: ${PROBE}"
 else
   step "Building from source"
   [ -f "${REPO_DIR}/Cargo.toml" ] || fail "run this script from the repository (Cargo.toml not found in ${REPO_DIR}); or pass --binary <path>"
