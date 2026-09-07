@@ -90,7 +90,12 @@ jobs:
           Copy-Item packaging\windows\agent-default.yaml "$stage\packaging\windows\agent-default.yaml"
 
           New-Item -ItemType Directory -Force -Path dist, obj | Out-Null
-          & "$wixBin\candle.exe" -nologo "-dSourceDir=$stage" packaging\windows\softnix-log-agent.wxs -o obj\
+          # -arch x64: both components are Win64="yes" but the .wxs itself
+          # never declares a platform, so light's ICE80 check fails without
+          # this ("package contains 64 bit component ... but the Template
+          # Summary Property does not contain Intel64 or x64") - wixl doesn't
+          # enforce this ICE, which is why it wasn't caught building locally.
+          & "$wixBin\candle.exe" -nologo -arch x64 "-dSourceDir=$stage" packaging\windows\softnix-log-agent.wxs -o obj\
           if ($LASTEXITCODE -ne 0) { throw "candle failed with exit code $LASTEXITCODE" }
           & "$wixBin\light.exe" -nologo obj\softnix-log-agent.wixobj -o "dist\softnix-log-agent-$version-x64.msi"
           if ($LASTEXITCODE -ne 0) { throw "light failed with exit code $LASTEXITCODE" }
