@@ -4,7 +4,7 @@ version = "0.1.1"
 edition = "2021"
 description = "Softnix Log Agent - lightweight, reliable, cross-platform log collector"
 license = "Proprietary"
-rust-version = "1.80"
+rust-version = "1.98"
 
 [lib]
 name = "softnix_log_agent"

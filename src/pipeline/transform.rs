@@ -107,17 +107,17 @@ impl Transformer {
         for step in &self.steps {
             match step {
                 CompiledStep::AddField { field, value, when } => {
-                    if when.as_ref().map_or(true, |w| eval_condition(w, ev)) {
+                    if when.as_ref().is_none_or(|w| eval_condition(w, ev)) {
                         ev.set_field(field, value.clone());
                     }
                 }
                 CompiledStep::RemoveField { field, when } => {
-                    if when.as_ref().map_or(true, |w| eval_condition(w, ev)) {
+                    if when.as_ref().is_none_or(|w| eval_condition(w, ev)) {
                         ev.remove_field(field);
                     }
                 }
                 CompiledStep::RenameField { from, to, when } => {
-                    if when.as_ref().map_or(true, |w| eval_condition(w, ev)) {
+                    if when.as_ref().is_none_or(|w| eval_condition(w, ev)) {
                         if let Some(v) = ev.get_field(from) {
                             ev.remove_field(from);
                             ev.set_field(to, v);
@@ -125,7 +125,7 @@ impl Transformer {
                     }
                 }
                 CompiledStep::Convert { field, to, when } => {
-                    if when.as_ref().map_or(true, |w| eval_condition(w, ev)) {
+                    if when.as_ref().is_none_or(|w| eval_condition(w, ev)) {
                         if let Some(v) = ev.get_field(field) {
                             if let Some(converted) = convert_value(&v, to) {
                                 ev.set_field(field, converted);
@@ -139,7 +139,7 @@ impl Transformer {
                     replacement,
                     when,
                 } => {
-                    if when.as_ref().map_or(true, |w| eval_condition(w, ev)) {
+                    if when.as_ref().is_none_or(|w| eval_condition(w, ev)) {
                         if let Some(v) = ev.get_field(field) {
                             if let Some(s) = value_to_string(&v) {
                                 let masked = re.replace_all(&s, replacement.as_str());
