@@ -49,6 +49,23 @@ const CHANNEL_BYTES: usize = 64 * 1024 * 1024;
 /// what makes this task's cross-destination isolation guarantee hold.
 const ROUTER_CAPACITY: usize = 4096;
 
+/// How often `run_router` may materialise a queue-write error message.
+///
+/// A queue that cannot be written fails for *every* event, and
+/// `Metrics::record_error` allocates a `String` and takes a
+/// `Mutex<Option<String>>` on each call — at full input rate that is the hot
+/// loop R-3 describes. Only every hundredth occurrence gets a message; the
+/// `errors` counter is still bumped for every one, so `/metrics` does not
+/// under-report. Same cadence as `route_event`'s shed log.
+const WRITE_ERROR_LOG_EVERY: u64 = 100;
+
+/// True when the `n`-th (1-based) queue-write failure should produce a
+/// message rather than just a counter bump. Pure, so the throttle is testable
+/// without a wedged disk.
+fn should_log_write_error(n: u64) -> bool {
+    n % WRITE_ERROR_LOG_EVERY == 1
+}
+
 /// The input channel's sender, wrapped with a byte-budget gate so the
 /// channel is bounded by actual memory rather than just message count (see
 /// `CHANNEL_BYTES`). Permits are counted in KB (`Semaphore::MAX_PERMITS` is
@@ -471,6 +488,13 @@ async fn run_router(
     metrics: Arc<Metrics>,
     cancel: CancellationToken,
 ) {
+    // Consecutive queue-write failures, for the message throttle below. A
+    // plain local counter, not the `Arc<AtomicU64>` `route_event` uses for
+    // its shed count: that one is also read by /metrics through
+    // EngineShared::router_shed, while this one has no reader outside this
+    // single-task loop.
+    let mut write_errors: u64 = 0;
+
     while let Some(ev) = rx.recv().await {
         let result = if block {
             queue.push_blocking(&ev, &cancel).await.map(|stored| {
@@ -496,7 +520,21 @@ async fn run_router(
                 metrics.events_dropped.fetch_add(1, Ordering::Relaxed);
             }
             Err(e) => {
-                metrics.record_error(format!("queue {} write: {e}", out.id));
+                // The event is gone: it reached neither the queue nor any
+                // counter before, so a wedged queue lost traffic completely
+                // silently while /healthz still reported ok.
+                metrics.events_dropped.fetch_add(1, Ordering::Relaxed);
+                write_errors += 1;
+                if should_log_write_error(write_errors) {
+                    metrics.record_error(format!(
+                        "queue {} write: {e} (occurrence {write_errors}; logged every {WRITE_ERROR_LOG_EVERY}th)",
+                        out.id
+                    ));
+                } else {
+                    // record_error bumps `errors` itself; keep the counter
+                    // exact on the throttled path too.
+                    metrics.errors.fetch_add(1, Ordering::Relaxed);
+                }
             }
         }
     }
@@ -1013,6 +1051,29 @@ mod tests {
             shed.load(Ordering::Relaxed),
             "the aggregate dropped counter and the per-destination shed counter \
              must agree when shedding is the only drop cause in play"
+        );
+    }
+
+    /// R-3: a failing queue hits `run_router`'s Err arm once per event, and
+    /// `Metrics::record_error` allocates a String and takes a mutex each time.
+    /// The throttle is a pure function so it can be pinned without a wedged
+    /// disk; it must match the every-100th cadence `route_event` already uses
+    /// for its shed log.
+    #[test]
+    fn queue_write_errors_are_logged_every_hundredth_occurrence() {
+        assert!(
+            should_log_write_error(1),
+            "the first failure must always produce a message"
+        );
+        for n in 2..=100 {
+            assert!(!should_log_write_error(n), "occurrence {n} must be silent");
+        }
+        assert!(should_log_write_error(101));
+        assert!(!should_log_write_error(102));
+        assert_eq!(
+            (1..=1000).filter(|&n| should_log_write_error(n)).count(),
+            10,
+            "1000 failures must produce exactly 10 messages"
         );
     }
 }
