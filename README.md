@@ -3,14 +3,14 @@
 A lightweight, reliable, cross-platform log collector agent written in Rust — in the spirit of NXLog / Fluent Bit / Vector, but optimized for simplicity, low resource usage and operational clarity.
 
 ```
-Inputs (files, syslog UDP/TCP/TLS, Windows Event Log)
-  → Parse (raw / JSON / key-value / regex / syslog)
-  → Transform (add/remove/rename/convert/mask/filter)
-  → Normalize (common event schema)
-  → Enrich (host, OS, environment, tenant, tags, …)
-  → Route (conditional, failover)
-  → Persistent disk queue (per destination, crash-safe)
-  → Outputs (syslog UDP/TCP/TLS, stdout)
+Inputs (files, syslog UDP/TCP/TLS, Windows Event Log)     # collect raw log lines from anywhere
+  → Parse (raw / JSON / key-value / regex / syslog)       # extract structured fields
+  → Transform (add/remove/rename/convert/mask/filter)     # reshape / redact per rule
+  → Normalize (common event schema)                       # every parser ends up as one Event struct
+  → Enrich (host, OS, environment, tenant, tags, …)        # attach context the source didn't carry
+  → Route (conditional, failover)                         # pick destination(s) per event
+  → Persistent disk queue (per destination, crash-safe)   # durable, at-least-once buffer
+  → Outputs (syslog UDP/TCP/TLS, stdout)                   # ship it
 ```
 
 **Measured footprint** (release build, macOS arm64): 4.6 MB binary, ~12 MB RSS, <1% CPU while ingesting 5,000 events.
@@ -24,10 +24,64 @@ Inputs (files, syslog UDP/TCP/TLS, Windows Event Log)
 - **Processing pipeline** — modular parse → transform → normalize → enrich → route stages; conditions (`eq/ne/contains/matches/gt/lt/exists`) on any field.
 - **Reliability** — per-destination persistent disk queue (CRC-checked segment files), at-least-once delivery, exponential backoff retry, configurable full-queue policy (`block` / `drop_oldest` / `drop_newest`), graceful shutdown, crash recovery.
 - **Outputs** — syslog UDP/TCP/TLS (RFC5424, RFC3164, JSON or raw; newline or octet-counting framing), stdout; multiple destinations, conditional routing, health-based failover destinations.
-- **Security** — TLS and mTLS on inputs and outputs, certificate validation by default, data masking transform, web GUI bound to localhost by default with explicit warning when exposed.
+- **Security** — TLS and mTLS on inputs and outputs, certificate validation by default, data masking transform, every web route authenticated except `/` and `/healthz` (token auto-generated into `<data_dir>/web-token` when not configured), binding beyond localhost without a token is a hard startup refusal.
 - **Web GUI** — minimal appliance-style page (single embedded HTML file, no framework): overview, inputs, outputs, buffer, config edit with validate/save/reload/rollback, recent agent logs, about.
 - **Service integration** — systemd (Linux) and Windows Service, with `install/uninstall/start/stop/restart` subcommands.
 - **Observability** — `/healthz`, Prometheus-style `/metrics`, JSON status API, in-memory ring buffer of agent logs.
+
+## Architecture
+
+```
+                ┌──────────────────────────────────────────────────────────┐
+ files ───────▶│ FileInput ──┐                                            │
+ (glob/poll)   │             │   mpsc channel    ┌─ DiskQueue A ─▶ OutputWorker A ─▶ syslog TLS
+ udp/tcp/tls ─▶│ SyslogInput ┼──────────────────▶│ Pipeline      ├─ DiskQueue B ─▶ OutputWorker B ─▶ syslog TCP
+                │             │  (bounded, 8192)  │ transform     └─ DiskQueue C ─▶ OutputWorker C ─▶ stdout
+                │             │                   │ enrich/route  │
+                └─────────────┴───────────────────┴───────────────┘
+                       ▲                ▲                 ▲
+                  StateManager      Metrics +        cursor.json +
+                  (state.json)    StatusRegistry     *.seg files
+                       │
+        ┌──────────────┴──────────────┐
+        │  main control loop          │  ◀── signals (SIGTERM/SIGHUP/Ctrl-C)
+        │  (reload / rollback)        │  ◀── ControlMsg from Web API
+        └──────────────┬──────────────┘
+                       │
+                 Web server (axum, outside the engine, survives reloads)
+```
+
+Reading the diagram, in comments:
+- **`mpsc channel (bounded, 8192)`** — bounded by **byte budget**, not message count; one oversized event can't starve it the way a message-count cap would.
+- **`Pipeline → transform → enrich/route`** — routing happens **per destination**: a `when` condition and/or `failover_for` can send the same event down 0, 1, or several of `DiskQueue A/B/C`.
+- **`DiskQueue A/B/C → OutputWorker A/B/C`** — each destination gets its **own disk queue and worker task**, so a slow or unreachable destination only ever backs up its own queue, never the pipeline or a healthy sibling.
+- **`StateManager` / `cursor.json + *.seg files`** — both are written atomically (tmp-file + rename); a restart resumes exactly where it left off, at most one un-acked batch is ever re-sent.
+- **`main control loop (reload / rollback)`** — reload **validates the new config before stopping the old engine**, and rolls back automatically if the new one fails to start.
+- **`Web server`** — lives **outside** the engine box on purpose, so the GUI stays up through a reload, even a failed one.
+
+| Component | Module | Notes |
+|---|---|---|
+| Config manager | `src/config/` | schema (`schema.rs`), `${VAR}` expansion (`env.rs`), validation (`validate.rs`) |
+| State manager | `src/state.rs` | per-file read offsets, atomic writes, retention pruning |
+| File tailer | `src/inputs/file.rs` | glob discovery + poll-based tailing, decoupled so a slow discovery pass never delays tailing |
+| Syslog receiver | `src/inputs/syslog.rs` | UDP/TCP/TLS listeners, connection cap + sender allowlist |
+| Windows Event Log input | `src/inputs/eventlog.rs` | `wevtapi`, Windows-only (`#[cfg(windows)]`) |
+| Pipeline (parse/transform/enrich) | `src/pipeline/` | one file per stage — `parser.rs`, `syslog.rs`, `condition.rs`, `transform.rs`, `enrich.rs` |
+| Routing + fan-out | `src/engine.rs` (`route_event`) | per-destination `when` condition, failover, non-blocking shed if a destination's channel is momentarily full |
+| Persistent queue | `src/buffer.rs` | segmented append-only log, CRC-checked, peek → send → ack |
+| Output manager | `src/outputs/` | a `Sink` trait (`mod.rs`) so new protocols (HTTP, Kafka, …) are a new file, not a rewrite; `syslog.rs` and `stdout.rs` are the two built-in sinks |
+| Metrics + health | `src/metrics.rs`, `/healthz`, `/metrics` | Prometheus-style counters, policy-aware health |
+| Web UI server | `src/web.rs` + `src/ui.html` | one embedded HTML file, no build step |
+| Service manager | `src/service.rs` | systemd / Windows Service glue |
+| TLS | `src/tls.rs` | rustls (ring) for both listeners and clients |
+
+**Why it's built this way, briefly:**
+- **Crash-safe by construction.** File offsets and per-destination queue cursors are both written durably (tmp-file + rename), so a crash costs at most one un-acked batch per destination — never silent data loss. See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#per-destination-persistent-queue-segmented-log).
+- **One destination going down never stalls another.** Each output has its own disk queue and its own worker task; a `try_send` shed (never a blocking send) keeps a backed-up destination from blocking the pipeline or any other destination.
+- **Reload = restart, not hot-patch.** Simpler and safer than incremental reconfiguration — the new config is validated *before* the old engine stops, and a failed start rolls back automatically while the web GUI (which lives outside the `Engine`) stays up throughout.
+- **Everything normalizes to one `Event` struct** before it reaches transform/enrich/output — so adding a new input never means teaching every downstream stage a new shape.
+
+Full design rationale (why polling over inotify, why `rand`'s CSPRNG page for the web token, the segmented-queue format, etc.) lives in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ## Installation
 
