@@ -28,6 +28,7 @@ step "Checking environment"
 [ "$(uname -s)" = "Linux" ] || fail "this installer is for Linux; see docs/INSTALL-WINDOWS.md for Windows"
 command -v curl >/dev/null 2>&1 || fail "curl is required"
 command -v tar  >/dev/null 2>&1 || fail "tar is required"
+command -v sha256sum >/dev/null 2>&1 || fail "sha256sum is required (part of GNU coreutils)"
 
 ARCH="$(uname -m)"
 case "$ARCH" in
@@ -45,11 +46,29 @@ URL="$(printf '%s' "$API_RESPONSE" \
 [ -n "$URL" ] || fail "no linux-${ASSET_ARCH} release asset found — check https://github.com/${REPO}/releases"
 info "found: ${URL}"
 
+SUMS_URL="$(printf '%s' "$API_RESPONSE" \
+  | grep -oE '"browser_download_url": *"[^"]*/SHA256SUMS"' \
+  | grep -oE 'https://[^"]*')"
+[ -n "$SUMS_URL" ] || fail "no SHA256SUMS asset in this release — refusing to install an unverifiable download"
+
 WORKDIR="$(mktemp -d)"
 trap 'rm -rf "$WORKDIR"' EXIT
 
 step "Downloading"
 curl -fsSL "$URL" -o "${WORKDIR}/release.tar.gz" || fail "download failed"
+curl -fsSL "$SUMS_URL" -o "${WORKDIR}/SHA256SUMS" || fail "download of SHA256SUMS failed"
+
+step "Verifying checksum"
+ASSET_NAME="$(basename "$URL")"
+# awk field-equality, not grep regex, so a `.` in the filename can't act as
+# a regex wildcard and match a line it shouldn't.
+EXPECTED="$(awk -v f="$ASSET_NAME" '$2 == f {print $1}' "${WORKDIR}/SHA256SUMS")"
+[ -n "$EXPECTED" ] || fail "${ASSET_NAME} is not listed in SHA256SUMS — refusing to install"
+ACTUAL="$(sha256sum "${WORKDIR}/release.tar.gz" | awk '{print $1}')"
+[ "$EXPECTED" = "$ACTUAL" ] \
+  || fail "checksum mismatch for ${ASSET_NAME} (expected ${EXPECTED}, got ${ACTUAL}) — download may be corrupted or tampered with, refusing to install"
+info "checksum OK (sha256:${ACTUAL})"
+
 tar xzf "${WORKDIR}/release.tar.gz" -C "$WORKDIR"
 
 EXTRACTED="$(find "$WORKDIR" -mindepth 1 -maxdepth 1 -type d -name 'softnix-log-agent-*')"

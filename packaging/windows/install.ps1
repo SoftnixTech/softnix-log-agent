@@ -40,9 +40,29 @@ $asset = $release.assets | Where-Object { $_.name -like "*.msi" } | Select-Objec
 if (-not $asset) { Fail "no MSI asset found in the latest release - check https://github.com/$Repo/releases" }
 Ok "found: $($asset.name)"
 
+$sumsAsset = $release.assets | Where-Object { $_.name -eq "SHA256SUMS" } | Select-Object -First 1
+if (-not $sumsAsset) { Fail "no SHA256SUMS asset in this release - refusing to install an unverifiable download" }
+
 $msiPath = Join-Path $env:TEMP $asset.name
+$sumsPath = Join-Path $env:TEMP "SHA256SUMS"
 Step "Downloading"
 Invoke-WebRequest -UseBasicParsing -Uri $asset.browser_download_url -OutFile $msiPath
+Invoke-WebRequest -UseBasicParsing -Uri $sumsAsset.browser_download_url -OutFile $sumsPath
+
+Step "Verifying checksum"
+$sumsLine = Select-String -Path $sumsPath -Pattern "  $([regex]::Escape($asset.name))$"
+if (-not $sumsLine) {
+    Remove-Item $msiPath, $sumsPath -ErrorAction SilentlyContinue
+    Fail "$($asset.name) is not listed in SHA256SUMS - refusing to install"
+}
+$expected = ($sumsLine.Line -split "\s+")[0]
+$actual = (Get-FileHash -Algorithm SHA256 -Path $msiPath).Hash.ToLower()
+Remove-Item $sumsPath -ErrorAction SilentlyContinue
+if ($expected -ne $actual) {
+    Remove-Item $msiPath -ErrorAction SilentlyContinue
+    Fail "checksum mismatch for $($asset.name) (expected $expected, got $actual) - download may be corrupted or tampered with, refusing to install"
+}
+Ok "checksum OK (sha256:$actual)"
 
 Step "Installing"
 $msiArgs = @("/i", "`"$msiPath`"", "/norestart")

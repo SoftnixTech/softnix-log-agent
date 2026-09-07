@@ -6,6 +6,11 @@ name: Release
 # matching the exact recipes already documented for a manual build (see
 # docs/TESTING.md's cargo-zigbuild note and packaging/windows/build-msi.sh's
 # own header comment), so CI and a human doing this by hand take the same path.
+#
+# Actions are pinned to a commit SHA, not a floating version tag — a tag can
+# be repointed by the action's maintainer (or a compromised account); a SHA
+# cannot. The trailing comment names the version resolved at pin time only
+# for humans re-verifying the pin, not something Actions itself reads.
 
 on:
   push:
@@ -22,7 +27,7 @@ jobs:
   check-version:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Tag must match Cargo.toml version
         run: |
           TAG="${GITHUB_REF_NAME#v}"
@@ -36,9 +41,9 @@ jobs:
     needs: check-version
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable branch, resolved 2026-09-07
+      - uses: Swatinem/rust-cache@63fed3e2fecf6f7b51dc6f043341b79ef82a9ae7 # v2.9.2
       - run: cargo build --release
       - name: Package
         run: |
@@ -50,7 +55,7 @@ jobs:
           cp packaging/softnix-log-agent.service "$STAGE/"
           cp examples/agent.yaml "$STAGE/"
           tar czf "${STAGE}.tar.gz" "$STAGE"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: linux-release
           path: softnix-log-agent-*-linux-x86_64.tar.gz
@@ -60,11 +65,11 @@ jobs:
     needs: check-version
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable branch, resolved 2026-09-07
         with:
           targets: x86_64-pc-windows-gnu
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@63fed3e2fecf6f7b51dc6f043341b79ef82a9ae7 # v2.9.2
       - name: Install mingw-w64 + msitools (wixl)
         run: |
           sudo apt-get update
@@ -75,7 +80,7 @@ jobs:
             cargo build --release --target x86_64-pc-windows-gnu
       - name: Build MSI
         run: ./packaging/windows/build-msi.sh
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: windows-msi
           path: dist/*.msi
@@ -87,9 +92,15 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           path: artifacts
+      - name: Checksum the artifacts
+        run: |
+          cd artifacts
+          sha256sum linux-release/*.tar.gz windows-msi/*.msi \
+            | sed 's#linux-release/##; s#windows-msi/##' > SHA256SUMS
+          cat SHA256SUMS
       - name: Create GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -97,5 +108,6 @@ jobs:
           gh release create "${GITHUB_REF_NAME}" \
             artifacts/linux-release/*.tar.gz \
             artifacts/windows-msi/*.msi \
+            artifacts/SHA256SUMS \
             --title "${GITHUB_REF_NAME}" \
             --generate-notes
