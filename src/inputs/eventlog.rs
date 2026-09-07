@@ -847,7 +847,21 @@ fn parse_event_xml(xml: &str) -> ParsedEvent {
                 cur = name;
             }
             Ok(Xml::Text(t)) => {
-                let text = t.unescape().map(|c| c.into_owned()).unwrap_or_default();
+                // quick-xml 0.41 split BytesText::unescape() (decode + XML
+                // entity resolution in one call) into two steps: decode()
+                // (bytes -> str) then escape::unescape() (&amp;/&lt;/... ->
+                // their characters) - same default entity resolver either
+                // way, just no longer bundled onto BytesText itself. Both
+                // steps happen inside this match arm (not chained through
+                // .and_then) so the unescaped Cow is converted to an owned
+                // String before the decoded &str it borrows from goes out
+                // of scope.
+                let text = match t.decode() {
+                    Ok(decoded) => quick_xml::escape::unescape(&decoded)
+                        .map(|c| c.into_owned())
+                        .unwrap_or_default(),
+                    Err(_) => String::new(),
+                };
                 if text.trim().is_empty() {
                     continue;
                 }

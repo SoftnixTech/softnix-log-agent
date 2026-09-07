@@ -55,6 +55,10 @@ async fn file_to_tcp_syslog_end_to_end() {
         });
     }
 
+    // `paths` is single-quoted: a Windows temp path contains backslashes,
+    // and YAML double-quoted scalars interpret `\U`/`\u` as the start of a
+    // Unicode escape - "C:\Users\..." fails to parse on Windows if quoted
+    // with `"`. Single quotes never process escapes.
     let yaml = format!(
         r#"
 agent:
@@ -62,7 +66,7 @@ agent:
 inputs:
   files:
     - id: app
-      paths: ["{glob}"]
+      paths: ['{glob}']
       poll_interval_ms: 100
       read_from_start: true
 pipeline:
@@ -258,6 +262,10 @@ async fn conditional_routing_to_multiple_destinations() {
     let (all_addr, all_data) = sink().await;
     let (err_addr, err_data) = sink().await;
 
+    // `paths` is single-quoted: a Windows temp path contains backslashes,
+    // and YAML double-quoted scalars interpret `\U`/`\u` as the start of a
+    // Unicode escape - "C:\Users\..." fails to parse on Windows if quoted
+    // with `"`. Single quotes never process escapes.
     let yaml = format!(
         r#"
 agent:
@@ -265,7 +273,7 @@ agent:
 inputs:
   files:
     - id: app
-      paths: ["{glob}"]
+      paths: ['{glob}']
       poll_interval_ms: 100
       read_from_start: true
       parser:
