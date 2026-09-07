@@ -97,17 +97,29 @@ impl OutputWorker {
                 break;
             }
 
-            let batch = match self.queue.peek_batch(self.retry.batch_size, PEEK_MAX_BYTES) {
+            // R-2: peek_batch does File::open + metadata + seek + N read_exact
+            // + N serde_json::from_slice under the queue mutex. One dispatch
+            // per batch keeps that off the runtime's two worker threads.
+            let q = std::sync::Arc::clone(&self.queue);
+            let max = self.retry.batch_size;
+            let peeked =
+                tokio::task::spawn_blocking(move || q.peek_batch(max, PEEK_MAX_BYTES)).await;
+            let batch = match peeked {
                 // wait_data can report "data available" while peek_batch returns
                 // nothing (all remaining records were skipped as corrupt). Without
                 // a floor this becomes a tight loop that pins a core forever.
-                Ok(b) if b.is_empty() => {
+                Ok(Ok(b)) if b.is_empty() => {
                     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                     continue;
                 }
-                Ok(b) => b,
-                Err(e) => {
+                Ok(Ok(b)) => b,
+                Ok(Err(e)) => {
                     metrics.record_error(format!("output {id}: queue read: {e}"));
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    continue;
+                }
+                Err(e) => {
+                    metrics.record_error(format!("output {id}: queue read task: {e}"));
                     tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                     continue;
                 }
@@ -187,7 +199,11 @@ impl OutputWorker {
         }
 
         // Graceful shutdown: one bounded attempt to flush remaining events.
-        if let Ok(batch) = self.queue.peek_batch(self.retry.batch_size, PEEK_MAX_BYTES) {
+        let q = std::sync::Arc::clone(&self.queue);
+        let max = self.retry.batch_size;
+        let final_peek =
+            tokio::task::spawn_blocking(move || q.peek_batch(max, PEEK_MAX_BYTES)).await;
+        if let Ok(Ok(batch)) = final_peek {
             if !batch.is_empty() {
                 let flush = self.sink.send_batch(&batch);
                 if let Ok(Ok(n)) =

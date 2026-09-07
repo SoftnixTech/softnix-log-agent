@@ -13,7 +13,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -33,7 +33,13 @@ struct Inner {
     segments: BTreeSet<u64>,
     write_seg: u64,
     write_off: u64,
-    writer: Option<File>,
+    /// Buffered so `push` does not issue one `write(2)` per event on the
+    /// runtime while holding the queue mutex; 8 KiB (the `BufWriter::new`
+    /// default) collapses ~40 syslog-sized records into one syscall. Every
+    /// reader that opens the write segment by path flushes this first:
+    /// `peek_batch` and `oldest_age_secs`. `roll_segment` flushes explicitly
+    /// rather than relying on `Drop`, which swallows the error.
+    writer: Option<BufWriter<File>>,
     /// Persisted (acked) read position.
     cursor: Cursor,
     /// In-memory read position of un-acked peeks.
@@ -191,7 +197,7 @@ impl DiskQueue {
                 .create(true)
                 .open(&path)
                 .with_context(|| format!("cannot open queue segment {}", path.display()))?;
-            inner.writer = Some(f);
+            inner.writer = Some(BufWriter::new(f));
         }
         // write_all can fail (ENOSPC) *after* writing part of the record. If the
         // counters advanced anyway the next push would append after a partial
@@ -203,7 +209,14 @@ impl DiskQueue {
             let torn = real_len.saturating_sub(inner.write_off);
             inner.write_off = real_len;
             inner.bytes += torn;
-            inner.writer = None;
+            // Discard the buffer *without* flushing: `real_len` above is the
+            // truth about what reached the file, and `BufWriter::drop` would
+            // otherwise retry the failed write behind our back and append
+            // bytes after we have re-based `write_off`. `into_parts` is the
+            // only way to drop a BufWriter without flushing it.
+            if let Some(w) = inner.writer.take() {
+                let _ = w.into_parts();
+            }
             roll_segment(&mut inner)?;
             return Err(e.into());
         }
@@ -433,9 +446,16 @@ impl DiskQueue {
 
     /// Age in seconds of the oldest unacked event, if any.
     pub fn oldest_age_secs(&self) -> Option<i64> {
-        let inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap();
         if inner.count == 0 {
             return None;
+        }
+        // Same read-visibility contract as `peek_batch`: this opens the write
+        // segment by path, so anything still in the writer's 8 KiB buffer has
+        // to be flushed first or a queue holding exactly one small event
+        // reports no oldest event at all.
+        if let Some(w) = inner.writer.as_mut() {
+            w.flush().ok();
         }
         let segs: Vec<u64> = inner.segments.range(inner.cursor.seg..).copied().collect();
         for seg in segs {
@@ -494,8 +514,25 @@ fn seg_path(dir: &std::path::Path, seg: u64) -> PathBuf {
 /// failure here the caller's state is untouched, so the next `push` reopens
 /// the current segment and appends to it as normal.
 fn roll_segment(inner: &mut Inner) -> Result<()> {
-    if let Some(w) = inner.writer.take() {
-        drop(w);
+    // Flush explicitly. A dropped `BufWriter` also flushes, but swallows the
+    // error — which would silently discard every record still buffered for
+    // the segment we are leaving while `write_off`, `bytes` and `count` go on
+    // claiming they exist.
+    if let Some(mut w) = inner.writer.take() {
+        if let Err(e) = w.flush() {
+            // Do not let the implicit Drop retry this flush and partially
+            // succeed after we stop tracking it: discard the buffer and
+            // re-base the write offset on what actually reached the file. The
+            // segment index is left alone, so the next `push` reopens this
+            // same segment and appends to it.
+            let _ = w.into_parts();
+            let path = seg_path(&inner.dir, inner.write_seg);
+            inner.write_off = std::fs::metadata(&path)
+                .map(|m| m.len())
+                .unwrap_or(inner.write_off);
+            return Err(anyhow::Error::new(e)
+                .context(format!("cannot flush queue segment {}", path.display())));
+        }
     }
     let next = inner.write_seg + 1;
     let path = seg_path(&inner.dir, next);
@@ -1105,6 +1142,27 @@ mod tests {
             "acked events replayed after reopen: the cursor write outside the \
              lock did not persist"
         );
+    }
+
+    /// R-2: `inner.writer` is a `BufWriter`, so up to 8 KiB of appended
+    /// records can be sitting in memory rather than in the segment file. Every
+    /// reader that opens the *write* segment by path must flush first.
+    /// `oldest_age_secs` backs `/api/buffer`'s "oldest_event_age_seconds",
+    /// which the GUI polls every 3 s; reporting null for a queue that
+    /// demonstrably holds an event is a regression.
+    #[test]
+    fn oldest_age_secs_sees_a_freshly_pushed_event() {
+        let dir = tempfile::tempdir().unwrap();
+        let q = DiskQueue::open(dir.path(), "d1", &cfg(16, FullPolicy::Block)).unwrap();
+        assert!(q.oldest_age_secs().is_none(), "empty queue has no oldest");
+        q.push(&ev(0)).unwrap();
+        assert_eq!(q.len(), 1);
+        let age = q.oldest_age_secs();
+        assert!(
+            age.is_some(),
+            "oldest_age_secs must flush the write buffer before reading the segment"
+        );
+        assert!(age.unwrap() >= 0, "age must not be negative: {age:?}");
     }
 
     /// R-1/R-2: the output worker calls both of these from
