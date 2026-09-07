@@ -488,11 +488,12 @@ async fn run_router(
     metrics: Arc<Metrics>,
     cancel: CancellationToken,
 ) {
-    // Consecutive queue-write failures, for the message throttle below. A
-    // plain local counter, not the `Arc<AtomicU64>` `route_event` uses for
-    // its shed count: that one is also read by /metrics through
-    // EngineShared::router_shed, while this one has no reader outside this
-    // single-task loop.
+    // Total queue-write failures on this router task, for the message
+    // throttle below — not reset on a success in between, same shape as
+    // `route_event`'s own shed_total below. A plain local counter, not the
+    // `Arc<AtomicU64>` `route_event` uses for its shed count: that one is
+    // also read by /metrics through EngineShared::router_shed, while this
+    // one has no reader outside this single-task loop.
     let mut write_errors: u64 = 0;
 
     while let Some(ev) = rx.recv().await {
@@ -527,7 +528,7 @@ async fn run_router(
                 write_errors += 1;
                 if should_log_write_error(write_errors) {
                     metrics.record_error(format!(
-                        "queue {} write: {e} (occurrence {write_errors}; logged every {WRITE_ERROR_LOG_EVERY}th)",
+                        "queue {} write: {e} ({write_errors} total failures on this router; logged every {WRITE_ERROR_LOG_EVERY}th)",
                         out.id
                     ));
                 } else {
