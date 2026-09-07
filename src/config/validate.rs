@@ -220,6 +220,18 @@ pub fn validate(cfg: &Config) -> Result<Vec<String>> {
         if o.retry.batch_size == 0 {
             bail!("outputs[{}]: retry.batch_size must be >= 1", o.id);
         }
+        // Upper bound, R-4: batch_size is an event count, and a batch's
+        // Vec<Event> plus the wire payload built from it both live in RAM at
+        // once. peek_batch's byte budget caps the bytes read per batch, but
+        // nothing caps the number of Events, so an absurd value still means
+        // an absurd allocation. 10_000 is 50x the default.
+        if o.retry.batch_size > 10_000 {
+            bail!(
+                "outputs[{}]: retry.batch_size must be <= 10000 (got {})",
+                o.id,
+                o.retry.batch_size
+            );
+        }
     }
 
     if cfg.buffer.max_size_mb < 1 {
@@ -555,5 +567,53 @@ outputs:
             std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600)).unwrap();
         }
         assert!(check_config_permissions(&p).is_ok());
+    }
+
+    /// R-4: `retry.batch_size` had a lower bound but no upper bound, so
+    /// `100000` was accepted and would OOM the agent on its first flush
+    /// (peek_batch's byte budget caps one batch's bytes, but nothing capped
+    /// the Vec<Event> length itself).
+    #[test]
+    fn rejects_an_absurd_batch_size() {
+        let yaml = r#"
+inputs:
+  syslog:
+    - id: rsyslog
+      protocol: udp
+      port: 5514
+outputs:
+  - id: console
+    type: stdout
+    retry:
+      batch_size: 100000
+"#;
+        let err = parse(yaml).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("console"),
+            "expected output id in error: {msg}"
+        );
+        assert!(
+            msg.contains("batch_size"),
+            "expected field name in error: {msg}"
+        );
+    }
+
+    #[test]
+    fn accepts_a_batch_size_at_the_upper_bound() {
+        let yaml = r#"
+inputs:
+  syslog:
+    - id: rsyslog
+      protocol: udp
+      port: 5514
+outputs:
+  - id: console
+    type: stdout
+    retry:
+      batch_size: 10000
+"#;
+        let (cfg, _w) = parse(yaml).unwrap();
+        assert_eq!(cfg.outputs[0].retry.batch_size, 10_000);
     }
 }
