@@ -110,8 +110,23 @@
                   Impersonate="no"
                   Return="check" />
 
+    <!-- Scheduled after InstallFiles, not CreateFolders: CreateFolders only
+         creates directories explicitly listed in the CreateFolder table.
+         AGENTDATADIR has no CreateFolder marker; its only component
+         (DefaultConfig) is a plain File, so the directory does not exist
+         until InstallFiles copies agent.yaml into it and creates the
+         directory as a side effect. Scheduling this custom action After
+         CreateFolders on a clean machine (no pre-existing directory) left
+         AGENTDATADIR (the custom action's Directory/working-directory
+         attribute) nonexistent when CreateProcess ran, which fails with
+         ERROR_PATH_NOT_FOUND and surfaces to the user as MSI error 1721
+         ("a program required for this install to complete could not be
+         run"). Confirmed empirically: manually pre-creating an empty
+         AGENTDATADIR before running the same MSI made the install succeed,
+         which only makes sense if CreateFolders was never the thing
+         creating it. -->
     <InstallExecuteSequence>
-      <Custom Action="LockDownAgentDataAcl" After="CreateFolders">NOT REMOVE</Custom>
+      <Custom Action="LockDownAgentDataAcl" After="InstallFiles">NOT REMOVE</Custom>
     </InstallExecuteSequence>
 
     <Feature Id="Complete" Title="Softnix Log Agent" Level="1">
