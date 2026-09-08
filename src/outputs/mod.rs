@@ -114,4 +114,85 @@ mod tests {
             "sink should have received all 5 events, got {got:?}"
         );
     }
+
+    struct NotifyingSink {
+        id: String,
+        notify: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait::async_trait]
+    impl Sink for NotifyingSink {
+        async fn send_batch(&mut self, events: &[Event]) -> anyhow::Result<usize> {
+            let n = events.len();
+            // Fires synchronously, inside this same poll, before this future
+            // resolves and OutputWorker::run's task continues past the
+            // `send_batch(&batch).await` call site. A task woken by this can
+            // only actually run once OutputWorker's task hits its next real
+            // yield point -- which pins the exact ordering this test checks.
+            self.notify.notify_one();
+            Ok(n)
+        }
+        fn id(&self) -> &str {
+            &self.id
+        }
+    }
+
+    /// Regression test for a race introduced when `ack` moved onto
+    /// `spawn_blocking` (R-1): `events_sent` must already reflect a
+    /// successful `send_batch` by the time the worker task's poll reaches
+    /// its next await point, not after `ack` (which only persists the
+    /// queue's internal read cursor) has also completed. An external
+    /// observer of delivery -- e.g. a test reading the far end of a real
+    /// socket -- must never be able to see the data arrive before
+    /// `events_sent` reflects it; `tests/e2e.rs`'s
+    /// `file_to_tcp_syslog_end_to_end` hit exactly this race on Windows CI,
+    /// where the two independent code paths (the socket write becoming
+    /// visible to the peer, and `events_sent` being updated after `ack`'s
+    /// blocking-pool round trip) can be observed in either order.
+    ///
+    /// This test reproduces the same ordering deterministically instead of
+    /// relying on OS-specific scheduling timing: on the current-thread
+    /// runtime `#[tokio::test]` uses here, a task woken by `notify_one()`
+    /// only actually runs once the notifying task's own poll yields, so
+    /// `yield_now` after `notified().await` advances the worker's task to
+    /// exactly the point right after `send_batch` returns -- which is
+    /// exactly the window the original bug exposed.
+    #[tokio::test]
+    async fn events_sent_reflects_delivery_before_ack_completes() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = BufferConfig::default();
+        let queue = DiskQueue::open(dir.path(), "dest", &cfg).unwrap();
+        queue.push(&Event::new("s", "test", "hello")).unwrap();
+
+        let notify = Arc::new(tokio::sync::Notify::new());
+        let sink = Box::new(NotifyingSink {
+            id: "dest".to_string(),
+            notify: notify.clone(),
+        });
+
+        let metrics = Arc::new(Metrics::default());
+        let worker = OutputWorker::with_sink("dest", sink, queue);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let handle = worker.spawn(
+            Arc::new(StatusRegistry::default()),
+            metrics.clone(),
+            cancel.clone(),
+        );
+
+        notify.notified().await;
+        tokio::task::yield_now().await;
+
+        assert_eq!(
+            metrics
+                .events_sent
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "events_sent lagged behind a successful send_batch across ack's \
+             spawn_blocking await -- an external observer of delivery could \
+             see the data arrive before this metric reflects it"
+        );
+
+        cancel.cancel();
+        let _ = handle.await;
+    }
 }

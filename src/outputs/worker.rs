@@ -140,6 +140,33 @@ impl OutputWorker {
                     // expected to equal batch.len() for every Sink in this
                     // codebase today, since DiskQueue::ack always commits the
                     // whole peeked position regardless of n.
+                    //
+                    // Update events_sent/status before ack, not after: the
+                    // destination has already received these n events the
+                    // moment send_batch returns Ok, regardless of whether
+                    // ack (which only persists the queue's own internal read
+                    // cursor) later succeeds or fails. Doing it first also
+                    // keeps a real invariant intact: nothing here awaits
+                    // between send_batch returning and this update, so any
+                    // external observer who sees the data arrive (e.g. a
+                    // test reading the far end of the socket) is guaranteed
+                    // to see events_sent already reflect it. Moving this
+                    // below `ack`'s spawn_blocking await broke that
+                    // invariant — the two are unrelated code paths racing
+                    // to run first, and a test asserting on events_sent
+                    // right after observing delivery could see 0 depending
+                    // on which one the scheduler happened to run first.
+                    metrics
+                        .events_sent
+                        .fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+                    backoff = self.retry.initial_backoff_ms;
+                    status.update_output(&id, |s| {
+                        s.events_sent += n as u64;
+                        s.healthy = true;
+                        s.connected = true;
+                        s.consecutive_failures = 0;
+                        s.last_error = None;
+                    });
                     // R-1: `ack` fsyncs the cursor twice. Do it on the
                     // blocking pool instead of parking one of the runtime's
                     // two worker threads inside fsync.
@@ -154,17 +181,6 @@ impl OutputWorker {
                             metrics.record_error(format!("output {id}: queue ack task: {e}"));
                         }
                     }
-                    metrics
-                        .events_sent
-                        .fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
-                    backoff = self.retry.initial_backoff_ms;
-                    status.update_output(&id, |s| {
-                        s.events_sent += n as u64;
-                        s.healthy = true;
-                        s.connected = true;
-                        s.consecutive_failures = 0;
-                        s.last_error = None;
-                    });
                 }
                 Err(e) => {
                     self.queue.reset_peek();
@@ -209,12 +225,16 @@ impl OutputWorker {
                 if let Ok(Ok(n)) =
                     tokio::time::timeout(std::time::Duration::from_secs(3), flush).await
                 {
-                    let q = std::sync::Arc::clone(&self.queue);
-                    let acked = n as u64;
-                    let _ = tokio::task::spawn_blocking(move || q.ack(acked)).await;
+                    // Same ordering as the main loop above: record the send
+                    // before awaiting ack, which only persists the queue's
+                    // internal cursor and races with nothing an external
+                    // observer needs events_sent to reflect promptly.
                     metrics
                         .events_sent
                         .fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+                    let q = std::sync::Arc::clone(&self.queue);
+                    let acked = n as u64;
+                    let _ = tokio::task::spawn_blocking(move || q.ack(acked)).await;
                 } else {
                     self.queue.reset_peek();
                 }
