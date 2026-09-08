@@ -6,6 +6,7 @@
 
 agent:
   data_dir: 'C:\ProgramData\Softnix\LogAgent'
+  # Agent self-log level: trace|debug|info|warn|error
   log_level: info
 
 inputs:
@@ -15,22 +16,56 @@ inputs:
         - 'C:\Logs\*.log'          # adjust to your log locations
       # exclude:
       #   - 'C:\Logs\debug-*.log'
+      # poll_interval_ms: 500        # default; how often to re-read tailed files
+      # read_from_start: false       # default: skip pre-existing content on first run
+      # source_type: windows-app     # overrides the default "file" source_type
+      # parser:
+      #   mode: raw                  # raw | json | kv | regex | syslog
+
+  # Windows Event Log channels (collected natively; Application/System are
+  # common choices, or any custom channel name):
+  # eventlog:
+  #   - id: app-events
+  #     channels: [Application]
 
   # Uncomment to receive syslog from other systems
   # (allow the port in Windows Firewall first):
   # syslog:
   #   - id: udp514
-  #     protocol: udp
+  #     protocol: udp                # udp | tcp | tls
   #     bind: 0.0.0.0
   #     port: 514
+  #     format: auto                 # auto | rfc3164 | rfc5424 | json | raw
+  #   - id: tls6514
+  #     protocol: tls
+  #     bind: 0.0.0.0
+  #     port: 6514
+  #     tls:
+  #       cert: 'C:\ProgramData\Softnix\LogAgent\tls\server.crt'
+  #       key: 'C:\ProgramData\Softnix\LogAgent\tls\server.key'
 
 pipeline:
+  # transforms:
+  #   - type: add_field
+  #     field: team
+  #     value: platform
+  #   - type: mask
+  #     field: message
+  #     pattern: '\b\d{13,16}\b'
+  #     replacement: "[REDACTED]"
+  #   - type: drop
+  #     when: { field: message, op: contains, value: "health-check" }
   enrich:
     environment: production
+    # hostname: true
+    # os_info: true
+    # agent_version: true
+    # tags: [edge]
 
 buffer:
   max_size_mb: 512
-  full_policy: block
+  segment_size_mb: 8
+  full_policy: block                # block | drop_oldest | drop_newest
 
 outputs:
   # Replace with your real destination, e.g.:
@@ -38,7 +73,17 @@ outputs:
   #   type: syslog
   #   protocol: tcp
   #   address: logserver.corp.local:514
-  #   format: rfc5424
+  #   format: rfc5424               # rfc5424 | rfc3164 | json | raw
+  #   tls:
+  #     ca: 'C:\ProgramData\Softnix\LogAgent\tls\siem-ca.crt'
+  #     cert: 'C:\ProgramData\Softnix\LogAgent\tls\agent.crt'   # mTLS client cert
+  #     key: 'C:\ProgramData\Softnix\LogAgent\tls\agent.key'
+  #   retry:
+  #     initial_backoff_ms: 500     # default
+  #     max_backoff_ms: 30000       # default
+  #     batch_size: 200             # default
+  #   failover_for: central-syslog  # use this destination only while another is unhealthy
+  #   when: { field: severity, op: lt, value: 4 }   # route only matching events here
   - id: console
     type: stdout
     format: json
@@ -47,3 +92,4 @@ web:
   enabled: true
   bind: 127.0.0.1                  # localhost only (recommended)
   port: 8080
+  # auth_token: replace-with-a-long-random-secret   # required when exposing beyond localhost
