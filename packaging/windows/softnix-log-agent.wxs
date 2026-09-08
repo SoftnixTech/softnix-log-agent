@@ -89,9 +89,22 @@
          files it reads and where it ships them, so a user-writable config is
          a privilege escalation (H-4). Break inheritance and grant only
          SYSTEM+Administrators, mirroring install-windows.ps1's equivalent
-         icacls call. -->
+         icacls call.
+
+         MSI directory properties always resolve with a trailing backslash
+         (e.g. "C:\ProgramData\Softnix\LogAgent\"), so quoting [AGENTDATADIR]
+         as "[AGENTDATADIR]" left exactly one backslash immediately before
+         the closing quote. Per the standard Windows command-line argv
+         parsing rules (CommandLineToArgvW), an ODD number of backslashes
+         before a quote escapes that quote into a literal embedded character
+         instead of closing the argument; icacls then receives a garbled
+         argument list and fails with ERROR_INVALID_NAME (123), which MSI
+         reports as error 1722.
+         The extra trailing backslash below makes it an EVEN count (2),
+         which collapses to one literal backslash in the argument and lets
+         the quote close normally. -->
     <CustomAction Id="LockDownAgentDataAcl"
-                  ExeCommand='icacls.exe "[AGENTDATADIR]" /inheritance:r /grant:r "SYSTEM:(OI)(CI)F" "Administrators:(OI)(CI)F"'
+                  ExeCommand='icacls.exe "[AGENTDATADIR]\" /inheritance:r /grant:r "SYSTEM:(OI)(CI)F" "Administrators:(OI)(CI)F"'
                   Directory="AGENTDATADIR"
                   Execute="deferred"
                   Impersonate="no"
