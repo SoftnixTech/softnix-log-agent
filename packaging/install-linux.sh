@@ -200,12 +200,21 @@ else
   if [ -n "$SRC_CONF" ] && "$BIN_DST" validate --config "$SRC_CONF" >/dev/null 2>&1; then
     install -m 600 "$SRC_CONF" "$CONF"
   else
-    # Safe minimal default that always validates.
+    # Safe minimal default that always validates. Every section below that
+    # is active (uncommented) is enough on its own to run; everything
+    # commented out documents an option this agent supports, so this file
+    # doubles as a quick-start reference without needing to go find
+    # examples/agent.yaml. Full reference: examples/agent.yaml in the
+    # source repository, or docs/CONFIGURATION.md.
     cat > "$CONF" <<EOF
 # Softnix Log Agent configuration
-# Reference for all options: examples/agent.yaml in the source repository.
+# Full reference for every option: examples/agent.yaml in the source
+# repository, or docs/CONFIGURATION.md.
+
 agent:
+  # Where state (file offsets) and the persistent queue live.
   data_dir: ${DATA_DIR}
+  # Agent self-log level: trace|debug|info|warn|error
   log_level: info
 
 inputs:
@@ -213,22 +222,79 @@ inputs:
     - id: system-logs
       paths:
         - /var/log/*.log
+      # exclude:
+      #   - /var/log/lastlog
+      #   - "**/*.gz"
+      # poll_interval_ms: 500        # default; how often to re-read tailed files
+      # read_from_start: false       # default: skip pre-existing content on first run
+      # source_type: linux-syslog    # overrides the default "file" source_type
+      # parser:
+      #   mode: raw                  # raw | json | kv | regex | syslog
+
+  # Listen for syslog directly, instead of (or alongside) tailing files.
+  # syslog:
+  #   - id: udp514
+  #     protocol: udp                # udp | tcp | tls
+  #     bind: 0.0.0.0
+  #     port: 514
+  #     format: auto                 # auto | rfc3164 | rfc5424 | json | raw
+  #   - id: tls6514
+  #     protocol: tls
+  #     bind: 0.0.0.0
+  #     port: 6514
+  #     tls:
+  #       cert: /etc/softnix-log-agent/tls/server.crt
+  #       key: /etc/softnix-log-agent/tls/server.key
+
+# pipeline:
+#   transforms:
+#     - type: add_field
+#       field: team
+#       value: platform
+#     - type: mask
+#       field: message
+#       pattern: '\b\d{13,16}\b'
+#       replacement: "[REDACTED]"
+#     - type: drop
+#       when: { field: message, op: contains, value: "health-check" }
+#   enrich:
+#     hostname: true
+#     os_info: true
+#     agent_version: true
+#     environment: production
+#     tags: [edge]
+
+# buffer:
+#   max_size_mb: 1024               # per destination, default
+#   segment_size_mb: 8              # default
+#   full_policy: block              # block | drop_oldest | drop_newest
 
 outputs:
   # Replace with your real destination, e.g. syslog over TLS:
-  #  - id: siem
-  #    type: syslog
-  #    protocol: tls
-  #    address: siem.example.com:6514
-  #    format: rfc5424
+  # - id: siem
+  #   type: syslog
+  #   protocol: tls
+  #   address: siem.example.com:6514
+  #   format: rfc5424               # rfc5424 | rfc3164 | json | raw
+  #   tls:
+  #     ca: /etc/softnix-log-agent/tls/siem-ca.crt
+  #     cert: /etc/softnix-log-agent/tls/agent.crt   # mTLS client cert
+  #     key: /etc/softnix-log-agent/tls/agent.key
+  #   retry:
+  #     initial_backoff_ms: 500     # default
+  #     max_backoff_ms: 30000       # default
+  #     batch_size: 200             # default
+  #   failover_for: siem-primary    # use this destination only while another is unhealthy
+  #   when: { field: severity, op: lt, value: 4 }   # route only matching events here
   - id: console
     type: stdout
     format: json
 
 web:
   enabled: true
-  bind: 127.0.0.1
+  bind: 127.0.0.1                  # localhost-only by default
   port: 8080
+  # auth_token: replace-with-a-long-random-secret   # required when exposing beyond localhost
 EOF
     chmod 600 "$CONF"
   fi
