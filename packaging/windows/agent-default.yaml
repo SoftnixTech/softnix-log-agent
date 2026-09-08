@@ -92,4 +92,7 @@ web:
   enabled: true
   bind: 127.0.0.1                  # localhost only (recommended)
   port: 8080
-  # auth_token: replace-with-a-long-random-secret   # required when exposing beyond localhost
+  # Required, not just recommended: if you change bind above to 0.0.0.0 (or
+  # any non-loopback address) without setting this, the agent refuses to
+  # start at all rather than expose the config API unauthenticated.
+  # auth_token: replace-with-a-long-random-secret
