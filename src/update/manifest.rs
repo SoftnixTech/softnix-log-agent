@@ -66,6 +66,73 @@ pub fn verify_manifest(bytes: &[u8], sig: &[u8]) -> Result<Manifest> {
     Ok(manifest)
 }
 
+fn parse_version(v: &str) -> Result<(u64, u64, u64)> {
+    let mut parts = v.trim().splitn(3, '.');
+    let major = parts
+        .next()
+        .context("empty version string")?
+        .parse()
+        .with_context(|| format!("invalid major version in {v:?}"))?;
+    let minor = parts
+        .next()
+        .unwrap_or("0")
+        .parse()
+        .with_context(|| format!("invalid minor version in {v:?}"))?;
+    let patch = parts
+        .next()
+        .unwrap_or("0")
+        .parse()
+        .with_context(|| format!("invalid patch version in {v:?}"))?;
+    Ok((major, minor, patch))
+}
+
+/// Rejects a manifest that is a replay (serial not strictly newer than the
+/// last one this host accepted), expired, or a downgrade — unless the
+/// downgrade is explicitly requested. Called after `verify_manifest`, never
+/// before: signature validity says nothing about freshness.
+pub fn check_freshness(
+    manifest: &Manifest,
+    highest_seen_serial: u64,
+    running_version: &str,
+    allow_downgrade: bool,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<()> {
+    if manifest.manifest_serial <= highest_seen_serial {
+        bail!(
+            "manifest_serial {} is not newer than the last accepted serial {} (possible replay)",
+            manifest.manifest_serial,
+            highest_seen_serial
+        );
+    }
+    let expires_at: chrono::DateTime<chrono::Utc> = manifest
+        .expires_at
+        .parse()
+        .with_context(|| format!("manifest expires_at {:?} is not RFC3339", manifest.expires_at))?;
+    if now > expires_at {
+        bail!("manifest expired at {}", manifest.expires_at);
+    }
+    let target = parse_version(&manifest.version)?;
+    let running = parse_version(running_version)?;
+    if !allow_downgrade && target < running {
+        bail!(
+            "manifest version {} is older than the running version {} (pass --allow-downgrade to force)",
+            manifest.version,
+            running_version
+        );
+    }
+    if let Some(min_from) = &manifest.min_upgrade_from {
+        let min_from_parsed = parse_version(min_from)?;
+        if running < min_from_parsed {
+            bail!(
+                "this release requires upgrading from at least {} first (min_upgrade_from); running version is {}",
+                min_from,
+                running_version
+            );
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -164,5 +231,63 @@ mod tests {
         // real test key into a feature-gated test build. Tracked there.
         let err = verify_manifest(&bytes, &[0u8; 64]).unwrap_err();
         assert!(err.to_string().contains("no release public keys"));
+    }
+
+    fn manifest_with(serial: u64, version: &str, expires_at: &str) -> Manifest {
+        Manifest {
+            schema_version: 1,
+            product: "softnix-log-agent".into(),
+            version: version.into(),
+            manifest_serial: serial,
+            released_at: "2026-09-09T00:00:00Z".into(),
+            expires_at: expires_at.into(),
+            min_upgrade_from: None,
+            artifacts: vec![],
+        }
+    }
+
+    fn now() -> chrono::DateTime<chrono::Utc> {
+        "2026-09-09T12:00:00Z".parse().unwrap()
+    }
+
+    #[test]
+    fn accepts_a_newer_serial_and_newer_version() {
+        let m = manifest_with(2, "0.2.0", "2027-01-01T00:00:00Z");
+        assert!(check_freshness(&m, 1, "0.1.5", false, now()).is_ok());
+    }
+
+    #[test]
+    fn rejects_a_serial_that_is_not_strictly_newer() {
+        let m = manifest_with(1, "0.2.0", "2027-01-01T00:00:00Z");
+        let err = check_freshness(&m, 1, "0.1.5", false, now()).unwrap_err();
+        assert!(err.to_string().contains("not newer"));
+    }
+
+    #[test]
+    fn rejects_an_expired_manifest() {
+        let m = manifest_with(2, "0.2.0", "2026-01-01T00:00:00Z");
+        let err = check_freshness(&m, 1, "0.1.5", false, now()).unwrap_err();
+        assert!(err.to_string().contains("expired"));
+    }
+
+    #[test]
+    fn rejects_a_downgrade_without_the_flag() {
+        let m = manifest_with(2, "0.1.0", "2027-01-01T00:00:00Z");
+        let err = check_freshness(&m, 1, "0.1.5", false, now()).unwrap_err();
+        assert!(err.to_string().contains("downgrade"));
+    }
+
+    #[test]
+    fn allows_a_downgrade_with_the_flag() {
+        let m = manifest_with(2, "0.1.0", "2027-01-01T00:00:00Z");
+        assert!(check_freshness(&m, 1, "0.1.5", true, now()).is_ok());
+    }
+
+    #[test]
+    fn rejects_skipping_below_min_upgrade_from() {
+        let mut m = manifest_with(2, "0.3.0", "2027-01-01T00:00:00Z");
+        m.min_upgrade_from = Some("0.2.0".into());
+        let err = check_freshness(&m, 1, "0.1.5", false, now()).unwrap_err();
+        assert!(err.to_string().contains("min_upgrade_from"));
     }
 }
