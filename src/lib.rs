@@ -13,5 +13,6 @@ pub mod outputs;
 pub mod pipeline;
 pub mod service;
 pub mod state;
+pub mod update;
 pub mod tls;
 pub mod web;
