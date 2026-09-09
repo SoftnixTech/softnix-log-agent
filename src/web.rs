@@ -290,7 +290,7 @@ async fn healthz(State(state): S) -> Response {
     let Some(eng) = engine.as_ref() else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({"status": "engine not running"})),
+            Json(json!({"status": "engine not running", "version": AGENT_VERSION})),
         )
             .into_response();
     };
@@ -305,14 +305,18 @@ async fn healthz(State(state): S) -> Response {
         .map(|(id, _)| id)
         .collect();
     if full.is_empty() {
-        (StatusCode::OK, Json(json!({"status": "ok"}))).into_response()
+        (
+            StatusCode::OK,
+            Json(json!({"status": "ok", "version": AGENT_VERSION})),
+        )
+            .into_response()
     } else {
         // A full queue under `block` means the pipeline is stalled and the host
         // is no longer collecting. Returning 200 here is what let this go
         // unnoticed for hours in the field.
         (
             StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({"status": "degraded", "queues_full": full})),
+            Json(json!({"status": "degraded", "queues_full": full, "version": AGENT_VERSION})),
         )
             .into_response()
     }
