@@ -1338,8 +1338,10 @@ git commit -m "feat(update): add Linux stage-and-swap with hardlink-based rollba
 - Modify: `src/main.rs` (add `Command::Upgrade`)
 
 **Interfaces:**
-- Consumes: `manifest::verify_manifest`, `manifest::check_freshness` (Task 1, 2), `watermark::Watermark` (Task 3), `verify::verify_artifact_hash`, `Manifest::artifact_for` (Task 4), `apply::preflight` (Task 7), `apply_linux::{stage_and_swap, rollback}` (Task 8), `crate::service::restart` (existing, `src/service.rs`).
-- Produces: `pub fn apply_from_local(artifact_path: &std::path::Path, config_path: &std::path::Path, data_dir: &std::path::Path, allow_downgrade: bool) -> anyhow::Result<()>`, `pub fn rollback_from_local(live_target: &std::path::Path, data_dir: &std::path::Path) -> anyhow::Result<()>`.
+- Consumes: `manifest::verify_manifest`, `manifest::check_freshness` (Task 1, 2), `watermark::Watermark` (Task 3), `verify::verify_artifact_hash`, `Manifest::artifact_for` (Task 4), `apply::preflight` (Task 7), `apply_linux::{stage_and_swap, rollback}` (Task 8, `#[cfg(target_os = "linux")]`-gated), `crate::service::restart` (existing, `src/service.rs`).
+- Produces: `pub fn apply_from_local(artifact_path: &std::path::Path, config_path: &std::path::Path, data_dir: &std::path::Path, allow_downgrade: bool, live_target: &std::path::Path) -> anyhow::Result<()>`, `pub fn rollback_from_local(live_target: &std::path::Path, data_dir: &std::path::Path) -> anyhow::Result<()>`.
+
+**Note on cross-platform compilation:** `apply_linux::{stage_and_swap, rollback}` (Task 8) are only compiled under `#[cfg(target_os = "linux")]`, but this crate is built and tested on macOS/Windows dev machines too. `apply_from_local` itself (extraction, signature/freshness/hash verification, preflight) is platform-independent and must compile everywhere, so it must NOT reference `apply_linux::*` unconditionally. Factor the actual swap/restart/health-check/rollback sequence into a `platform_swap_and_restart(extracted_binary: &Path, live_target: &Path, version: &str) -> Result<()>` helper with two arms: `#[cfg(target_os = "linux")]` (the real logic, calling `apply_linux::stage_and_swap`/`apply_linux::rollback`) and `#[cfg(not(target_os = "linux"))]` (an erroring stub: `bail!("upgrade apply ... is only implemented on Linux in this build")`), mirroring the platform-split pattern `src/service.rs` already uses. `rollback_from_local` needs the same split for the same reason (its body calls `apply_linux::rollback`).
 
 The artifact is a `.tar.gz` containing the new binary plus a bundled `manifest.json`/`manifest.json.sig` (so `--from` needs no network access at all — everything required to verify is inside the file). Extraction shells out to the system `tar` binary (present on essentially every Linux host; avoids adding `tar`/`flate2` as new Rust dependencies for a one-line extraction).
 
@@ -1607,8 +1609,9 @@ Now wire the CLI. In `src/main.rs`, add to the `Command` enum (after `ServiceRun
     /// Apply a self-contained update artifact (offline, no network access).
     Upgrade {
         /// Path to a downloaded/copied release artifact (.tar.gz on Linux).
-        #[arg(long)]
-        from: PathBuf,
+        /// Required unless --rollback is passed.
+        #[arg(long, required_unless_present = "rollback")]
+        from: Option<PathBuf>,
         /// Roll back to the previously retained version instead of applying `--from`.
         #[arg(long)]
         rollback: bool,
@@ -1628,18 +1631,19 @@ And to `main()`'s `match`:
             rollback,
             allow_downgrade,
             config,
-        }) => upgrade_cmd(&from, rollback, allow_downgrade, &config),
+        }) => upgrade_cmd(from.as_deref(), rollback, allow_downgrade, &config),
 ```
 
 Add the handler function (near `validate_cmd`):
 
 ```rust
-fn upgrade_cmd(from: &Path, rollback: bool, allow_downgrade: bool, config_path: &Path) -> Result<()> {
+fn upgrade_cmd(from: Option<&Path>, rollback: bool, allow_downgrade: bool, config_path: &Path) -> Result<()> {
     let (cfg, _warnings) = config::load(config_path).context("cannot load config for upgrade")?;
     let live_target = std::env::current_exe().context("cannot resolve the running binary's path")?;
     if rollback {
         softnix_log_agent::update::apply::rollback_from_local(&live_target, &cfg.agent.data_dir)
     } else {
+        let from = from.context("--from is required unless --rollback is passed")?;
         softnix_log_agent::update::apply::apply_from_local(
             from,
             config_path,
@@ -2009,7 +2013,7 @@ And to `main()`'s `match`:
 And change `upgrade_cmd` (Task 9) to dispatch to the Windows path when applicable — replace its body with:
 
 ```rust
-fn upgrade_cmd(from: &Path, rollback: bool, allow_downgrade: bool, config_path: &Path) -> Result<()> {
+fn upgrade_cmd(from: Option<&Path>, rollback: bool, allow_downgrade: bool, config_path: &Path) -> Result<()> {
     let (cfg, _warnings) = config::load(config_path).context("cannot load config for upgrade")?;
     let live_target = std::env::current_exe().context("cannot resolve the running binary's path")?;
 
@@ -2018,6 +2022,7 @@ fn upgrade_cmd(from: &Path, rollback: bool, allow_downgrade: bool, config_path: 
         if rollback {
             bail!("Windows rollback is not yet automated by this CLI; see docs/RELEASE-SIGNING.md's Windows rollback runbook (msiexec /x then /i)");
         }
+        let from = from.context("--from is required unless --rollback is passed")?;
         return softnix_log_agent::update::apply_windows::self_relaunch_and_apply(
             from,
             config_path,
@@ -2031,6 +2036,7 @@ fn upgrade_cmd(from: &Path, rollback: bool, allow_downgrade: bool, config_path: 
         if rollback {
             softnix_log_agent::update::apply::rollback_from_local(&live_target, &cfg.agent.data_dir)
         } else {
+            let from = from.context("--from is required unless --rollback is passed")?;
             softnix_log_agent::update::apply::apply_from_local(
                 from,
                 config_path,
@@ -2042,6 +2048,8 @@ fn upgrade_cmd(from: &Path, rollback: bool, allow_downgrade: bool, config_path: 
     }
 }
 ```
+
+(Note: `upgrade_cmd`'s `from` parameter is `Option<&Path>` here because Task 9's follow-up fix changed the CLI's `from` field to `Option<PathBuf>` with `required_unless_present = "rollback"` — see Task 9's corrected text above. Both branches must unwrap it with `.context(...)?` before use when `!rollback`.)
 
 `from` is the same `--from <path>` the CLI already accepts (Task 9) — on Windows it now means "path to the `*-update.zip` bundle," on Linux/other it still means "path to the `*.tar.gz`." `self_relaunch_and_apply`'s own verification (Step 1, above) is what actually enforces the signature/hash/freshness checks before anything is relaunched — `upgrade_cmd` itself stays a thin dispatcher.
 
@@ -2098,6 +2106,6 @@ git commit -m "docs(update): add the Windows manual verification runbook"
 ## Self-Review Notes (from writing this plan)
 
 - **Spec coverage:** every numbered constraint in the spec (`docs/superpowers/specs/2026-09-09-self-update-mechanism.md`) maps to a task: constraint 1 (no UI apply) → nothing in this plan touches `src/web.rs`/`src/ui.html`, by omission (Phase 2's job); constraint 2 (signed manifest, key not in config) → Tasks 1, 6; constraint 3 (no in-process self-replace) → Task 9's CLI-driven design, never triggered from `src/web.rs`; constraint 4 (MSI not raw swap) → Task 11; constraint 5 (rollback mirrors `try_reload`) → Tasks 8, 9, 11; constraint 6 (no separate helper binary) → Task 11's self-copy.
-- **Known gaps intentionally left open, not silently dropped:** Windows automatic rollback (Task 11 explicitly refuses `--rollback` on Windows for now, pointing at Task 12's manual runbook); Windows has no preflight-before-install equivalent to Linux's `<staged> --version`/`validate` (Task 11's doc comment on `self_relaunch_and_apply` explains why — the payload is an uninstalled `.msi`, not a directly-runnable staged binary).
+- **Known gaps intentionally left open, not silently dropped:** Windows automatic rollback (Task 11 explicitly refuses `--rollback` on Windows for now, pointing at Task 12's manual runbook); Windows has no preflight-before-install equivalent to Linux's `<staged> --version`/`validate` (Task 11's doc comment on `self_relaunch_and_apply` explains why — the payload is an uninstalled `.msi`, not a directly-runnable staged binary); **`apply_msi` (the relaunched-child side of the Windows path) performs no re-verification of its own, relying entirely on the parent process's checks before it relaunched** — the spec's own text for the Windows apply path calls for the relaunched copy to verify the staged manifest again ("never trust a decision made by a process that's about to exit"), and the shipped code deviates from that. This was caught by the plan's final whole-branch review and deliberately NOT fixed in the same pass: it is Windows-only code with no compile/test signal available on the development machine even once the unrelated `live_target` Windows compile error is fixed, the actual exposure is bounded (driving `msiexec /qn` already requires the same elevation an attacker would need to cause equivalent harm directly — not a privilege-boundary crossing), and closing it properly needs a real design change (threading the extraction directory, not just the `.msi` path, across the process boundary) rather than a small fix. Tracked as follow-up work once a real Windows CI run exists to verify a fix against, rather than shipped unverified.
 - **Packaging consistency fix made while writing this plan:** Task 6's first draft published `manifest.json`/`manifest.json.sig` as loose top-level release assets, but Task 9's offline `apply_from_local` (Linux) and Task 11's `self_relaunch_and_apply` (Windows) both need the manifest bundled *inside* the same file `--from` points at, for genuine offline operation. Task 6 was corrected to bundle the manifest into the Linux `.tar.gz` (re-packed after building) and to introduce a new Windows `*-update.zip` (msi + manifest + sig) alongside the unchanged bare `.msi` used for ordinary manual installs. The manifest's `sha256`/`size` fields describe the *inner* binary/msi payload, never the outer bundle — this is what avoids a chicken-and-egg hashing problem (the outer bundle contains the manifest, so its own hash can't be self-referential). Confirm Task 6 is implemented with this fix before starting Task 9 or Task 11 — both assume it.
 - **Type consistency check:** `apply_from_local`'s signature grew a `live_target: &Path` parameter between its first mention (Task 9's interface line) and its test (Task 9 Step 1) — confirmed both match `(artifact_path, config_path, data_dir, allow_downgrade, live_target)` in that order throughout Task 9 and Task 10's call site.
