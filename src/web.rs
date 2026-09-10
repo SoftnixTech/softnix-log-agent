@@ -48,6 +48,9 @@ pub struct AppState {
     /// same-origin — so the Host/Origin checks are skipped entirely in that
     /// mode rather than 403ing every legitimate remote-admin request.
     pub host_check_enabled: bool,
+    /// `update.check_url` from config, if the operator opted in. `None`
+    /// means this endpoint must never make a network call.
+    pub check_url: Option<String>,
 }
 
 type S = State<Arc<AppState>>;
@@ -92,6 +95,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/buffer", get(api_buffer))
         .route("/api/logs", get(api_logs))
         .route("/api/about", get(api_about))
+        .route("/api/update/status", get(api_update_status))
         .route("/api/config", get(api_config_get))
         .route("/api/config/validate", post(api_config_validate))
         .route("/api/config/save", post(api_config_save))
@@ -496,6 +500,57 @@ async fn api_about(State(state): S) -> Response {
     .into_response()
 }
 
+/// Read-only update check: never applies anything, and never makes a
+/// network call unless `update.check_url` is configured. Mirrors
+/// `upgrade_check_cmd`'s fetch/verify path so the UI banner and the CLI
+/// report the same thing.
+async fn api_update_status(State(state): S) -> Response {
+    let Some(check_url) = state.check_url.clone() else {
+        return Json(json!({
+            "configured": false,
+            "current_version": AGENT_VERSION,
+            "check_error": null,
+            "update_available": null,
+            "latest_version": null,
+        }))
+        .into_response();
+    };
+
+    let result: anyhow::Result<crate::update::manifest::Manifest> = async {
+        let manifest_bytes = crate::update::fetch::fetch_url(&check_url, 1024 * 1024).await?;
+        let sig = crate::update::fetch::fetch_url(&format!("{check_url}.sig"), 4096).await?;
+        crate::update::manifest::verify_manifest(&manifest_bytes, &sig)
+    }
+    .await;
+
+    match result {
+        Ok(manifest) => {
+            let target = manifest.version.clone();
+            // Lexicographic comparison is wrong here (e.g. "0.9" > "0.10"
+            // as strings, incorrectly) — use the real numeric comparator.
+            let newer = crate::update::manifest::parse_version(&manifest.version)
+                .and_then(|t| crate::update::manifest::parse_version(AGENT_VERSION).map(|r| t > r))
+                .unwrap_or(false);
+            Json(json!({
+                "configured": true,
+                "current_version": AGENT_VERSION,
+                "check_error": null,
+                "update_available": newer,
+                "latest_version": target,
+            }))
+            .into_response()
+        }
+        Err(e) => Json(json!({
+            "configured": true,
+            "current_version": AGENT_VERSION,
+            "check_error": format!("{e:#}"),
+            "update_available": null,
+            "latest_version": null,
+        }))
+        .into_response(),
+    }
+}
+
 async fn api_config_get(State(state): S) -> Response {
     match std::fs::read_to_string(&state.config_path) {
         Ok(text) => Json(json!({"path": state.config_path.display().to_string(), "content": text}))
@@ -618,6 +673,7 @@ mod tests {
             auth_token: token.to_string(),
             allowed_hosts: vec!["127.0.0.1:8080".to_string(), "localhost:8080".to_string()],
             host_check_enabled,
+            check_url: None,
         })
     }
 
@@ -631,7 +687,7 @@ mod tests {
         )))
     }
 
-    /// All 12 guarded routes — the 8 GET reads plus the 4 POST mutation
+    /// All 13 guarded routes — the 9 GET reads plus the 4 POST mutation
     /// endpoints (`/api/config/validate`, `/api/config/save`,
     /// `/api/config/reload`, `/api/config/rollback`) — must 401 with no
     /// Authorization header. The 4 POSTs are the most dangerous to leave
@@ -648,6 +704,7 @@ mod tests {
             "/api/buffer",
             "/api/logs",
             "/api/about",
+            "/api/update/status",
             "/api/config",
         ];
         for path in guarded_get {
@@ -854,6 +911,29 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn update_status_reports_unconfigured_when_check_url_is_unset() {
+        // `test_state` builds its `AppState` with `check_url: None` by
+        // default (Step 1 above) — no variant helper needed for this case.
+        let app = router(test_state("secret-token"));
+        let response = app
+            .oneshot(
+                Request::get("/api/update/status")
+                    .header("authorization", "Bearer secret-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = http_body_util::BodyExt::collect(response.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["configured"], false);
     }
 
     #[test]

@@ -383,6 +383,7 @@ async fn run_agent(
         auth_token: web::resolve_token(&cfg.web, &cfg.agent.data_dir)?,
         allowed_hosts,
         host_check_enabled,
+        check_url: cfg.update.check_url.clone(),
     });
 
     // Web server lives outside the engine so it survives reloads.

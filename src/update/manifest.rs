@@ -82,7 +82,7 @@ fn verify_manifest_with_keys(bytes: &[u8], sig: &[u8], keys: &[[u8; 32]]) -> Res
     Ok(manifest)
 }
 
-fn parse_version(v: &str) -> Result<(u64, u64, u64)> {
+pub(crate) fn parse_version(v: &str) -> Result<(u64, u64, u64)> {
     let mut parts = v.trim().splitn(3, '.');
     let major = parts
         .next()

@@ -362,6 +362,10 @@ function dot(ok){return`<span class="dot ${ok?"ok":"err"}"></span>`}
 const pages={
 async overview(){
   const {body:s}=await api("/api/status");
+  const {body:upd}=await api("/api/update/status");
+  const updBanner = upd.configured && upd.update_available
+    ? `<div id="updmsg" class="msg ok" role="status">Update available: v${esc(upd.current_version)} &rarr; v${esc(upd.latest_version)}. Run <code>softnix-log-agent upgrade --from &lt;downloaded-artifact&gt;</code> to apply.</div>`
+    : "";
   $("#hver").textContent="v"+(s.version||"");
   $("#hstate").innerHTML=s.running?'<span class="ok">● running</span>':'<span class="err">● engine stopped</span>';
   const running=!!s.running;
@@ -382,6 +386,7 @@ async overview(){
       :`<span class="dot err"></span><b class="err">${destHealthy} of ${destList.length}</b> destinations healthy`;
   $("#main").innerHTML=`
   ${topMsg}
+  ${updBanner}
   <h2>Health</h2>
   <p class="meta">Up <b>${fmtDur(s.uptime_seconds)}</b> &middot; ${destMeta}</p>
   <h2>Throughput</h2>
