@@ -53,9 +53,14 @@ enum Command {
     Upgrade {
         /// Path to a downloaded/copied release artifact: a `.tar.gz` on
         /// Linux, or a `*-update.zip` bundle (.msi + manifest + signature
-        /// together) on Windows. Required unless `--rollback` is passed.
-        #[arg(long, required_unless_present = "rollback")]
+        /// together) on Windows. Required unless `--check` or `--rollback`
+        /// is passed.
+        #[arg(long, required_unless_present_any = ["rollback", "check"])]
         from: Option<PathBuf>,
+        /// Check for an available update over the network (read-only,
+        /// never applies anything) and print the result.
+        #[arg(long)]
+        check: bool,
         /// Roll back to the previously retained version instead of applying
         /// `--from`. Linux-only; on Windows, use the manual runbook in
         /// docs/RELEASE-SIGNING.md instead.
@@ -108,10 +113,17 @@ fn main() -> Result<()> {
         Some(Command::ServiceRun { config }) => run_as_windows_service(config),
         Some(Command::Upgrade {
             from,
+            check,
             rollback,
             allow_downgrade,
             config,
-        }) => upgrade_cmd(from.as_deref(), rollback, allow_downgrade, &config),
+        }) => {
+            if check {
+                upgrade_check_cmd(&config)
+            } else {
+                upgrade_cmd(from.as_deref(), rollback, allow_downgrade, &config)
+            }
+        }
         #[cfg(windows)]
         Some(Command::UpgradeApply { msi }) => {
             softnix_log_agent::update::apply_windows::apply_msi(&msi)
@@ -179,6 +191,45 @@ fn upgrade_cmd(
             )
         }
     }
+}
+
+/// Read-only network check: fetches the manifest+signature over HTTPS,
+/// verifies it exactly the way a real upgrade would, and prints whether a
+/// newer version is available. Never applies anything.
+fn upgrade_check_cmd(config_path: &Path) -> Result<()> {
+    let (cfg, _warnings) = config::load(config_path).context("cannot load config")?;
+    let check_url = cfg
+        .update
+        .check_url
+        .context("update.check_url is not configured; nothing to check")?;
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    runtime.block_on(async {
+        let manifest_bytes =
+            softnix_log_agent::update::fetch::fetch_url(&check_url, 1024 * 1024).await?;
+        let sig_url = format!("{check_url}.sig");
+        let sig = softnix_log_agent::update::fetch::fetch_url(&sig_url, 4096).await?;
+        let manifest = softnix_log_agent::update::manifest::verify_manifest(&manifest_bytes, &sig)?;
+
+        let watermark = softnix_log_agent::update::watermark::Watermark::open(&cfg.agent.data_dir);
+        match softnix_log_agent::update::manifest::check_freshness(
+            &manifest,
+            watermark.highest_serial(),
+            env!("CARGO_PKG_VERSION"),
+            false,
+            chrono::Utc::now(),
+        ) {
+            Ok(()) => println!(
+                "update available: {} -> {} (run `softnix-log-agent upgrade --from <downloaded-artifact>` to apply)",
+                env!("CARGO_PKG_VERSION"),
+                manifest.version
+            ),
+            Err(_) => println!("up to date (running {})", env!("CARGO_PKG_VERSION")),
+        }
+        anyhow::Ok(())
+    })
 }
 
 fn run_foreground(config: PathBuf) -> Result<()> {
@@ -503,5 +554,23 @@ mod tests {
     fn upgrade_without_from_or_rollback_fails_to_parse() {
         let result = Cli::try_parse_from(["softnix-log-agent", "upgrade"]);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn upgrade_check_parses_without_from_or_rollback() {
+        let cli = Cli::try_parse_from(["softnix-log-agent", "upgrade", "--check"]).unwrap();
+        match cli.command {
+            Some(Command::Upgrade {
+                from,
+                check,
+                rollback,
+                ..
+            }) => {
+                assert!(from.is_none());
+                assert!(check);
+                assert!(!rollback);
+            }
+            _ => panic!("expected Command::Upgrade"),
+        }
     }
 }
