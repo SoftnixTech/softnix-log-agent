@@ -324,10 +324,19 @@ ExecStart=${BIN_DST} run --config ${CONF}
 Restart=on-failure
 RestartSec=5
 NoNewPrivileges=true
-ProtectSystem=full
+# \`full\` (protects /usr, /boot, AND /etc) would also need ReadWritePaths to
+# carve out ${CONF_DIR} again for the web UI's config-save feature to work —
+# but ReadWritePaths isn't recognized by systemd < 231 (e.g. systemd 219 on
+# CentOS/RHEL 7, still a real deployment target: confirmed directly there,
+# \`systemctl show -p ReadWritePaths\` returns nothing at all, so the
+# directive is silently ignored and /etc stays read-only regardless of
+# what's listed). \`yes\` (supported since systemd 214) only protects /usr
+# and /boot, never touches /etc at all, so there's nothing to carve back
+# out and no minimum-systemd-version problem.
+ProtectSystem=yes
 ProtectHome=read-only
 PrivateTmp=true
-ReadWritePaths=${DATA_DIR} ${CONF_DIR}
+ReadWritePaths=${DATA_DIR}
 LimitNOFILE=65536
 MemoryMax=512M
 AmbientCapabilities=CAP_NET_BIND_SERVICE

@@ -18,21 +18,6 @@ pub mod platform {
     const UNIT_PATH: &str = "/etc/systemd/system/softnix-log-agent.service";
 
     fn unit_file(exe: &str, config: &str) -> String {
-        // The web UI's config-save feature (`POST /api/config/save`) writes
-        // the config file itself, plus a `.yaml.bak` backup next to it — so
-        // the config's own directory needs write access too, not just
-        // `/var/lib/softnix-log-agent`. Without this, `ProtectSystem=full`
-        // makes every write attempt fail with EROFS ("Read-only file
-        // system"), even though the file isn't actually read-only anywhere
-        // else on the host — only inside this unit's private mount
-        // namespace. Derived from `config` (not hardcoded to the default
-        // `/etc/softnix-log-agent`) so a non-default `--config` path passed
-        // to `service install` is covered too.
-        let config_dir = std::path::Path::new(config)
-            .parent()
-            .map(|p| p.display().to_string())
-            .filter(|p| !p.is_empty())
-            .unwrap_or_else(|| ".".to_string());
         format!(
             r#"[Unit]
 Description=Softnix Log Agent
@@ -45,12 +30,24 @@ Type=simple
 ExecStart={exe} run --config {config}
 Restart=on-failure
 RestartSec=5
-# Least privilege hardening
+# Least privilege hardening.
+#
+# `full` (protects /usr, /boot, AND /etc) would also need ReadWritePaths to
+# carve out the config's directory again for the web UI's config-save
+# feature (`POST /api/config/save`, which writes the config file plus a
+# `.yaml.bak` backup next to it) to work — but ReadWritePaths isn't
+# recognized by systemd < 231 (e.g. systemd 219 on CentOS/RHEL 7, still a
+# real deployment target: confirmed directly there, `systemctl show -p
+# ReadWritePaths` returns nothing at all, so the directive is silently
+# ignored and /etc stays read-only regardless of what's listed). `yes`
+# (supported since systemd 214) only protects /usr and /boot, never touches
+# /etc at all, so there's nothing to carve back out and no minimum-systemd-
+# version problem.
 NoNewPrivileges=true
-ProtectSystem=full
+ProtectSystem=yes
 ProtectHome=read-only
 PrivateTmp=true
-ReadWritePaths=/var/lib/softnix-log-agent {config_dir}
+ReadWritePaths=/var/lib/softnix-log-agent
 LimitNOFILE=65536
 MemoryMax=512M
 
@@ -107,7 +104,7 @@ WantedBy=multi-user.target
         use super::*;
 
         #[test]
-        fn unit_file_grants_write_access_to_the_configs_own_directory() {
+        fn unit_file_grants_write_access_to_the_data_dir_only() {
             let unit = unit_file(
                 "/usr/local/bin/softnix-log-agent",
                 "/etc/softnix-log-agent/agent.yaml",
@@ -116,21 +113,8 @@ WantedBy=multi-user.target
                 .lines()
                 .find(|l| l.starts_with("ReadWritePaths="))
                 .expect("ReadWritePaths line must exist");
-            assert!(line.contains("/var/lib/softnix-log-agent"));
-            assert!(line.contains("/etc/softnix-log-agent"));
-        }
-
-        #[test]
-        fn unit_file_derives_the_write_path_from_a_non_default_config_location() {
-            // `service install --config <path>` accepts any path, not just
-            // the default - the granted directory must track whatever was
-            // actually passed, not the hardcoded default.
-            let unit = unit_file("/usr/local/bin/softnix-log-agent", "/opt/snx/agent.yaml");
-            let line = unit
-                .lines()
-                .find(|l| l.starts_with("ReadWritePaths="))
-                .expect("ReadWritePaths line must exist");
-            assert!(line.contains("/opt/snx"));
+            assert_eq!(line, "ReadWritePaths=/var/lib/softnix-log-agent");
+            assert!(unit.lines().any(|l| l == "ProtectSystem=yes"));
         }
     }
 }
