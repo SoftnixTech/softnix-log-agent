@@ -485,7 +485,7 @@ state ของ web server
 จะดาวน์โหลดและติดตั้ง artifact ที่ผ่านการตรวจสอบแล้วผ่าน HTTPS — เป็นจุดเดียวระหว่าง
 สามจุดนี้ที่แก้ไขสิ่งต่าง ๆ บนดิสก์จริง ๆ จุดที่เป็น read-only สองจุด
 (`upgrade --check` และ `GET /api/update/status`) ไม่ทำแบบนั้น สำหรับ
-deployment ในเครือข่ายที่มีข้อจำกัด ซึ่งไม่สามารถเข้าไปในเครือข่ายได้
+deployment แบบ air-gapped หรือเครือข่ายที่มีข้อจำกัด
 `upgrade --from <local-artifact>` จะติดตั้ง artifact ที่ดาวน์โหลดลงมาแล้วแบบ
 offline แทน
 
