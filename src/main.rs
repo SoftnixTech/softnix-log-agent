@@ -226,7 +226,16 @@ fn upgrade_check_cmd(config_path: &Path) -> Result<()> {
                 env!("CARGO_PKG_VERSION"),
                 manifest.version
             ),
-            Err(_) => println!("up to date (running {})", env!("CARGO_PKG_VERSION")),
+            // check_freshness fails closed for several distinct reasons
+            // (genuinely not newer, expired, anti-replay serial not
+            // increasing, downgrade denied) - surface its actual message
+            // rather than collapsing all of them to "up to date", which
+            // would falsely reassure an operator whose check_url is
+            // serving a stale/expired/misconfigured manifest.
+            Err(e) => println!(
+                "no update applied (running {}): {e:#}",
+                env!("CARGO_PKG_VERSION")
+            ),
         }
         anyhow::Ok(())
     })
