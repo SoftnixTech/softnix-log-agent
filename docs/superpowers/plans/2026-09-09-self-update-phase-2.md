@@ -325,18 +325,30 @@ git commit -m "feat(config): add update.check_url, opt-in and disabled by defaul
 **Interfaces:**
 - Consumes: `update::fetch::fetch_url`, `update::manifest::verify_manifest`, `update::manifest::check_freshness`, `update::watermark::Watermark` (all from Phase 0/1, unchanged).
 
+**Note on the actual current state (Phase 0/1's final-review fix round changed this after this plan was first drafted):** `from` is already `Option<PathBuf>` today, with `#[arg(long, required_unless_present = "rollback")]`, and `upgrade_cmd` already takes `from: Option<&Path>` and does its own `.context(...)?` unwrap internally per platform-cfg branch (this was a deliberate fix for a Critical bug where `--rollback` alone used to fail clap parsing). Do NOT reintroduce a version of `upgrade_cmd` that takes `from: &Path` directly, and do NOT pre-unwrap `from` in the match arm — that would just have to be re-done differently by Phase 3's Task 2, which already plans its own larger refactor of this exact function. This task's job is narrower: only add `check`, and only change the one clap attribute needed to keep `--check` alone parseable.
+
 - [ ] **Step 1: Add the flag and handler**
 
-In `src/main.rs`, add `check: bool` to the `Upgrade` variant:
+In `src/main.rs`, add `check: bool` to the `Upgrade` variant, and widen the existing `required_unless_present` on `from` to `required_unless_present_any` (so `upgrade --check` alone still parses — today's attribute only exempts `--rollback`):
 
 ```rust
     Upgrade {
-        #[arg(long)]
+        /// Path to a downloaded/copied release artifact: a `.tar.gz` on
+        /// Linux, or a `*-update.zip` bundle (.msi + manifest + signature
+        /// together) on Windows. Required unless `--check` or `--rollback`
+        /// is passed.
+        #[arg(long, required_unless_present_any = ["rollback", "check"])]
         from: Option<PathBuf>,
+        /// Check for an available update over the network (read-only,
+        /// never applies anything) and print the result.
         #[arg(long)]
         check: bool,
+        /// Roll back to the previously retained version instead of applying
+        /// `--from`. Linux-only; on Windows, use the manual runbook in
+        /// docs/RELEASE-SIGNING.md instead.
         #[arg(long)]
         rollback: bool,
+        /// Allow installing a version older than the one currently running.
         #[arg(long)]
         allow_downgrade: bool,
         #[arg(short, long, default_value = "agent.yaml")]
@@ -344,7 +356,7 @@ In `src/main.rs`, add `check: bool` to the `Upgrade` variant:
     },
 ```
 
-(`from` becomes `Option<PathBuf>` — Task 1 of the Phase 3 plan is what actually makes `from: None` do something other than error; for this task, `--check` is mutually exclusive with actually applying, so update the match arm to route on `check` first:)
+Update the match arm to route on `check` first, leaving `upgrade_cmd`'s own call and internal `Option<&Path>` handling completely unchanged:
 
 ```rust
         Some(Command::Upgrade {
@@ -357,10 +369,26 @@ In `src/main.rs`, add `check: bool` to the `Upgrade` variant:
             if check {
                 upgrade_check_cmd(&config)
             } else {
-                let from = from.context("--from <artifact> is required unless --check or --rollback is given (networked upgrade with no --from is Phase 3, not yet implemented)")?;
-                upgrade_cmd(&from, rollback, allow_downgrade, &config)
+                upgrade_cmd(from.as_deref(), rollback, allow_downgrade, &config)
             }
         }
+```
+
+Add a CLI-parsing test alongside the two that already exist in `src/main.rs`'s `#[cfg(test)] mod tests` (`upgrade_rollback_parses_without_from`, `upgrade_without_from_or_rollback_fails_to_parse`), proving the widened `required_unless_present_any` actually works for `--check`:
+
+```rust
+    #[test]
+    fn upgrade_check_parses_without_from_or_rollback() {
+        let cli = Cli::try_parse_from(["softnix-log-agent", "upgrade", "--check"]).unwrap();
+        match cli.command {
+            Some(Command::Upgrade { from, check, rollback, .. }) => {
+                assert!(from.is_none());
+                assert!(check);
+                assert!(!rollback);
+            }
+            _ => panic!("expected Command::Upgrade"),
+        }
+    }
 ```
 
 Add the new handler (async — needs a runtime, unlike the other CLI handlers; build a small dedicated one rather than pulling this single command into the main multi-threaded runtime):
@@ -453,6 +481,25 @@ In `src/main.rs`'s `run_agent`, add to the `AppState { ... }` literal:
         check_url: cfg.update.check_url.clone(),
 ```
 
+**`AppState` has exactly one other struct-literal construction site, and it must be updated too or the crate stops compiling:** `src/web.rs`'s test module builds every test's `AppState` through `test_state_with_host_check` (`test_state` is a thin wrapper around it) — there is no other place in the whole codebase that constructs `AppState` directly. Add `check_url: None,` to that literal:
+
+```rust
+    fn test_state_with_host_check(token: &str, host_check_enabled: bool) -> Arc<AppState> {
+        let (control, _rx) = mpsc::channel(1);
+        Arc::new(AppState {
+            engine: RwLock::new(None),
+            logs: LogBuffer::default(),
+            config_path: PathBuf::from("/nonexistent/agent.yaml"),
+            control,
+            uptime: Uptime::default(),
+            auth_token: token.to_string(),
+            allowed_hosts: vec!["127.0.0.1:8080".to_string(), "localhost:8080".to_string()],
+            host_check_enabled,
+            check_url: None,
+        })
+    }
+```
+
 - [ ] **Step 2: Add the handler and route**
 
 In `src/web.rs`, add the route (near the other `/api/*` routes):
@@ -520,17 +567,18 @@ The `newer` line above using a raw string comparison is wrong (`"0.9" > "0.10"` 
 
 - [ ] **Step 4: Write a test**
 
-Add to `src/web.rs`'s existing `#[cfg(test)] mod tests` block (it already builds a router + `tower::ServiceExt::oneshot` for similar endpoints — follow that exact existing pattern for constructing a request/response in this file rather than introducing a new test harness style):
+Add to `src/web.rs`'s existing `#[cfg(test)] mod tests` block. This file's real pattern (see `all_guarded_routes_reject_missing_auth`, `a_valid_bearer_token_is_accepted`, etc.) is `router(test_state(token))` plus a plain `Request::get(path).header("authorization", format!("Bearer {token}"))` — there is no `test_app_with` closure-style helper anywhere in this codebase; use the real pattern:
 
 ```rust
     #[tokio::test]
     async fn update_status_reports_unconfigured_when_check_url_is_unset() {
-        let (app, token) = test_app_with(|state| state.check_url = None); // see existing test helpers in this file for the exact `test_app_with`-shaped constructor already used by sibling tests; wire this the same way
+        // `test_state` builds its `AppState` with `check_url: None` by
+        // default (Step 1 above) — no variant helper needed for this case.
+        let app = router(test_state("secret-token"));
         let response = app
             .oneshot(
-                Request::builder()
-                    .uri("/api/update/status")
-                    .header("authorization", format!("Bearer {token}"))
+                Request::get("/api/update/status")
+                    .header("authorization", "Bearer secret-token")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -545,8 +593,6 @@ Add to `src/web.rs`'s existing `#[cfg(test)] mod tests` block (it already builds
         assert_eq!(json["configured"], false);
     }
 ```
-
-This test references a `test_app_with` helper that must match whatever construction helper already exists among this file's other `#[tokio::test]`s (e.g. the ones testing `/api/about` or `/api/config`) — read those first and adapt the exact helper name/signature rather than inventing a parallel one; do not duplicate `AppState` construction boilerplate across tests.
 
 - [ ] **Step 5: Run the test to verify it passes**
 

@@ -32,12 +32,14 @@
 
 ### Task 1: Resolve and download the artifact for this platform/arch
 
+**Note on test-code drift:** this task's actual shipped code has already gone through two fix rounds since this section was first drafted (closing a test-coverage gap by adding a `write_and_verify_artifact` helper + tests, then removing that helper's hash-verification entirely per the Critical note under Step 3 below). The test code blocks below are the ORIGINAL draft and no longer match what's actually in `src/update/apply.rs` — read the real current file rather than trying to reconcile these snippets line-by-line; the Critical note under Step 3 is the authoritative description of the current design.
+
 **Files:**
 - Modify: `src/update/apply.rs` (add `fetch_manifest_and_artifact`)
 
 **Interfaces:**
-- Consumes: `update::fetch::fetch_url` (Phase 2), `update::manifest::{verify_manifest, check_freshness, Manifest}` (Phase 0), `update::verify::verify_artifact_hash` (Phase 0).
-- Produces: `pub async fn fetch_manifest_and_artifact(check_url: &str, data_dir: &std::path::Path, allow_downgrade: bool, dest_dir: &std::path::Path) -> anyhow::Result<std::path::PathBuf>` — returns the path of a downloaded, hash-verified artifact file inside `dest_dir`, ready to be handed to `apply_from_local`/`self_relaunch_and_apply` exactly like a `--from` path. Does **not** itself call apply or touch the watermark — recording the watermark stays the job of whichever apply function actually succeeds (unchanged from Phase 0/1, so a fetch that downloads fine but then fails to apply doesn't fool the anti-replay check into thinking it succeeded).
+- Consumes: `update::fetch::fetch_url` (Phase 2), `update::manifest::{verify_manifest, check_freshness, Manifest}` (Phase 0).
+- Produces: `pub async fn fetch_manifest_and_artifact(check_url: &str, data_dir: &std::path::Path, allow_downgrade: bool, dest_dir: &std::path::Path) -> anyhow::Result<std::path::PathBuf>` — returns the path of a downloaded (but NOT hash-verified — see the note below Step 3's code for why not) artifact file inside `dest_dir`, ready to be handed to `apply_from_local`/`self_relaunch_and_apply` exactly like a `--from` path; those functions perform the real, authoritative hash verification themselves, against the bundle's own embedded manifest. Does **not** itself call apply or touch the watermark — recording the watermark stays the job of whichever apply function actually succeeds (unchanged from Phase 0/1, so a fetch that downloads fine but then fails to apply doesn't fool the anti-replay check into thinking it succeeded).
 
 - [ ] **Step 1: Write the failing test**
 
@@ -134,16 +136,29 @@ Add to `src/update/apply.rs`:
 ```rust
 use super::fetch::fetch_url;
 
-const CURRENT_PLATFORM: &str = std::env::consts::OS;
-const CURRENT_ARCH_FOR_FETCH: &str = std::env::consts::ARCH;
+// NOT named `CURRENT_PLATFORM` — `apply.rs` already has a `const
+// CURRENT_PLATFORM: &str = "linux"` from Phase 0/1's Task 9, hardcoded
+// because that one is only ever used by the Linux-only apply path. This
+// function is compiled and called on every platform (it's the shared fetch
+// step both the Linux and Windows CLI branches call before handing off to
+// their own platform-specific apply), so it needs the REAL runtime
+// platform string, not that hardcoded one — a second `const` with the same
+// name would be a duplicate-definition compile error, hence the different
+// name here. `CURRENT_ARCH` (already defined, `std::env::consts::ARCH`) has
+// the exact value this function needs too, so it's reused as-is below
+// rather than redefined under another name.
+const CURRENT_PLATFORM_FOR_FETCH: &str = std::env::consts::OS;
 
 /// Fetches `<check_url>` and `<check_url>.sig`, verifies and freshness-
 /// checks the manifest (Phase 0's functions, unchanged), resolves the
-/// artifact matching this host's platform/arch, downloads it (capped at
-/// the manifest's own declared size) into `dest_dir`, and verifies its
-/// hash. Returns the downloaded file's path — ready to hand to
+/// artifact matching this host's platform/arch, downloads it (capped at a
+/// fixed, generous ceiling — see `MAX_BUNDLE_DOWNLOAD_BYTES` — never at
+/// `artifact.size`, which does not describe this download; see below)
+/// into `dest_dir`. Returns the downloaded file's path — ready to hand to
 /// `apply_from_local` exactly like a `--from` path. Does not apply
-/// anything and does not touch the watermark.
+/// anything and does not touch the watermark. Deliberately does NOT
+/// hash-verify the download against `artifact.sha256` — see the note
+/// below for why that would be actively wrong, not just redundant.
 pub async fn fetch_manifest_and_artifact(
     check_url: &str,
     data_dir: &std::path::Path,
@@ -164,22 +179,37 @@ pub async fn fetch_manifest_and_artifact(
     )?;
 
     let artifact = manifest
-        .artifact_for(CURRENT_PLATFORM, CURRENT_ARCH_FOR_FETCH)
+        .artifact_for(CURRENT_PLATFORM_FOR_FETCH, CURRENT_ARCH)
         .with_context(|| {
-            format!("manifest has no artifact for {CURRENT_PLATFORM}/{CURRENT_ARCH_FOR_FETCH}")
+            format!("manifest has no artifact for {CURRENT_PLATFORM_FOR_FETCH}/{CURRENT_ARCH}")
         })?;
 
-    let bytes = fetch_url(&artifact.url, artifact.size).await?;
+    // A total-download timeout, not just fetch_url's own internal
+    // connect+headers-only one — see fetch_url's doc comment in
+    // src/update/fetch.rs, which explicitly warns that reusing it for a
+    // large, slow download "must not assume 'never hangs' without
+    // revisiting this." A release bundle can be tens of MB, unlike the
+    // tiny manifest/signature fetches this same function already makes
+    // above, so it needs its own, longer, whole-operation bound.
+    let bytes = tokio::time::timeout(
+        std::time::Duration::from_secs(300),
+        fetch_url(&artifact.url, MAX_BUNDLE_DOWNLOAD_BYTES),
+    )
+    .await
+    .context("artifact download timed out after 300s")??;
     let dest_path = dest_dir.join(&artifact.filename);
     std::fs::write(&dest_path, &bytes)
         .with_context(|| format!("cannot write downloaded artifact to {}", dest_path.display()))?;
-    verify_artifact_hash(&dest_path, &artifact.sha256)?;
 
     Ok(dest_path)
 }
 ```
 
-Note: `CURRENT_PLATFORM` here uses `std::env::consts::OS` (which yields `"linux"`, `"windows"`, `"macos"`, etc.) rather than Task 9's Linux-only `CURRENT_PLATFORM: &str = "linux"` constant — this function is compiled for every platform (it's the shared fetch path both the Linux and Windows CLI branches call before handing off to their own platform-specific apply), so it must derive the platform string at runtime/compile-time generically rather than hardcoding one OS.
+**Critical note — this is a corrected version of this task's code, fixing a bug that was in this plan's own original draft, not something a later implementer introduced:** the release pipeline (`.github/workflows/release.yml`'s "Build the update manifest" step) computes `artifacts[].sha256`/`size` from the **inner payload** — the raw extracted binary on Linux, the bare `.msi` on Windows — never from the **outer bundle** (`filename`/`url`) that `artifact.url` actually points at (the `.tar.gz`/`-update.zip`). This is deliberate and cannot be changed by a pipeline tweak: the manifest is bundled *inside* the tarball/zip after being hashed and signed, so it can never describe its own container's hash without a chicken-and-egg problem (this exact reasoning is why Task 6 of the Phase 0/1 plan bundles the manifest the way it does — see that plan's Self-Review Notes). An earlier version of this task's code called `fetch_url(&artifact.url, artifact.size)` (using the inner payload's size as this download's cap) and `verify_artifact_hash(&dest_path, &artifact.sha256)` (checking the downloaded bundle against the inner payload's hash) — both **always wrong** for a real release: the cap is smaller than the actual bundle (the download would likely hit `"response ... exceeded the N-byte cap"` before even finishing), and even if it didn't, the hash check would always fail (`"hash mismatch"`, comparing a tarball/zip against a bare-binary/msi hash). This made the entire capability this plan exists to deliver undeliverable against any real release — caught only by a final whole-branch review tracing the release pipeline's actual field semantics against this function's use of them, since no single task's review had reason to cross-check a GitHub Actions YAML file against this Rust function.
+
+The fix: add `const MAX_BUNDLE_DOWNLOAD_BYTES: u64 = 100 * 1024 * 1024;` (100 MiB — the actual release binary is roughly 5 MB as of this plan; 100 MiB gives generous headroom for a bundled MSI+manifest+signature while still bounding memory against a malicious/broken server) near `CURRENT_PLATFORM_FOR_FETCH`, with a doc comment explaining it exists purely for memory-safety, not as a trust decision. Do NOT call `verify_artifact_hash` on the downloaded bundle at all — the real, authoritative verification already happens completely independently, moments later, inside `apply_from_local`/`self_relaunch_and_apply`: both of those functions extract this exact bundle themselves, read the `manifest.json`/`.sig` bundled *inside* it, re-verify that signature, and hash-check the *inner* payload against that inner manifest's `sha256` — the correct comparison, already implemented and already reviewed in Phase 0/1, completely unaffected by this fix. Removing the fetch-layer hash check does not weaken security: it removes a check that was comparing the wrong two things and could never have passed against a real, legitimately-signed release; the actual trust boundary was always the apply layer, exactly as it already is for the offline `--from` case (a user-supplied local path also gets zero pre-verification before `apply_from_local` opens it). Update the "Consumes" line above to drop `update::verify::verify_artifact_hash` (no longer used by this task).
+
+Note: `CURRENT_PLATFORM_FOR_FETCH` uses `std::env::consts::OS` (which yields `"linux"`, `"windows"`, `"macos"`, etc.) rather than Task 9's Linux-only `CURRENT_PLATFORM: &str = "linux"` constant — this function is compiled for every platform (it's the shared fetch path both the Linux and Windows CLI branches call before handing off to their own platform-specific apply), so it must derive the platform string at runtime/compile-time generically rather than hardcoding one OS. It cannot be named `CURRENT_PLATFORM` — that name is already taken by Task 9's `const` in the same file, and Rust rejects a duplicate top-level item name even with a different value.
 
 - [ ] **Step 4: Run the test to verify it passes (in its fail-closed form)**
 
@@ -203,9 +233,47 @@ git commit -m "feat(update): fetch and verify the matching release artifact over
 **Interfaces:**
 - Consumes: `update::apply::fetch_manifest_and_artifact` (Task 1), `update::apply::apply_from_local` (Phase 0/1, unchanged), `update::apply_windows::self_relaunch_and_apply` (Phase 0/1, unchanged).
 
+**Note on the actual current state (this plan was drafted before Phase 2 shipped, and before a later Phase 0/1 fix round changed some of this file):** the `Upgrade` match arm currently in `src/main.rs` already has a `check: bool` field and an `if check { upgrade_check_cmd(&config) }` branch (Phase 2's Task 3) that this plan's own first draft had no knowledge of — do NOT drop it. Also, `apply_from_local`'s actual current signature takes a trailing `&cfg.web` argument (added by a Phase 0/1 fix round, to let a post-upgrade health check skip itself when `web.enabled` is false) that this plan's original code samples below don't show — every call to `apply_from_local` in this task must include it, or the build fails with a wrong-argument-count error.
+
+**A fourth, more consequential drift, caught only after Task 2's first implementation attempt reproduced it directly — fix this or the whole task is unreachable:** `from`'s clap attribute is currently `#[arg(long, required_unless_present_any = ["rollback", "check"])]`. That constraint predates this task and made sense when `upgrade` with no `--from` had no meaning at all (Phase 0/1) — but it means clap itself rejects a bare `softnix-log-agent upgrade --config <path>` (no `--from`, no `--rollback`, no `--check`) with "the following required arguments were not provided: --from", before the program ever reaches this task's own `upgrade_networked_cmd`. Since this task makes exactly that combination meaningful (the whole point of "networked upgrade"), the constraint must be removed entirely — `from` becomes a plain optional argument with no `required_unless_present`/`required_unless_present_any` at all:
+
+```rust
+        /// Path to a downloaded/copied release artifact: a `.tar.gz` on
+        /// Linux, or a `*-update.zip` bundle (.msi + manifest + signature
+        /// together) on Windows. If omitted (and `--check`/`--rollback`
+        /// aren't passed either), fetches and verifies the artifact over
+        /// HTTPS using `update.check_url` instead.
+        #[arg(long)]
+        from: Option<PathBuf>,
+```
+
+This also means the existing test `upgrade_without_from_or_rollback_fails_to_parse` (in `src/main.rs`'s `#[cfg(test)] mod tests`, written during Phase 0/1 when a flagless `upgrade` truly was meaningless) is now asserting the wrong thing — a bare `upgrade` must now parse successfully. Replace that test with one asserting the new, correct behavior:
+
+```rust
+    #[test]
+    fn upgrade_with_no_flags_parses_for_a_networked_apply() {
+        let cli = Cli::try_parse_from(["softnix-log-agent", "upgrade"]).unwrap();
+        match cli.command {
+            Some(Command::Upgrade {
+                from,
+                check,
+                rollback,
+                ..
+            }) => {
+                assert!(from.is_none());
+                assert!(!check);
+                assert!(!rollback);
+            }
+            _ => panic!("expected Command::Upgrade"),
+        }
+    }
+```
+
+Do this as part of Step 1 (it's the same `Command::Upgrade` definition this step already edits) — do not leave it for a later step or a follow-up.
+
 - [ ] **Step 1: Replace the `Upgrade` match arm**
 
-In `src/main.rs`, replace the arm added in Phase 2's Task 3:
+In `src/main.rs`, replace the arm added in Phase 2's Task 3 (which itself already added the `check`/`upgrade_check_cmd` branch shown below — this step's job is to add rollback-splitting and networked-apply on top of it, not to reintroduce it):
 
 ```rust
         Some(Command::Upgrade {
@@ -218,8 +286,7 @@ In `src/main.rs`, replace the arm added in Phase 2's Task 3:
             if check {
                 upgrade_check_cmd(&config)
             } else {
-                let from = from.context("--from <artifact> is required unless --check or --rollback is given (networked upgrade with no --from is Phase 3, not yet implemented)")?;
-                upgrade_cmd(&from, rollback, allow_downgrade, &config)
+                upgrade_cmd(from.as_deref(), rollback, allow_downgrade, &config)
             }
         }
 ```
@@ -247,22 +314,30 @@ with:
         }
 ```
 
-(This also cleans up a wrinkle from Phase 2's Task 3: `rollback` now routes to its own function regardless of `from`, rather than being threaded through `upgrade_cmd`'s signature — split it out here since Task 9's original `upgrade_cmd` conflated "apply a local artifact" and "roll back" behind one boolean flag, which no longer makes sense once there's also a networked apply path. Update `upgrade_cmd`'s signature accordingly, dropping the `rollback: bool` parameter it no longer needs, and move the `#[cfg(windows)] bail!(...)` / `#[cfg(not(windows))] rollback_from_local(...)` logic from Phase 0/1's Task 11 into the new `upgrade_rollback_cmd` below instead of leaving it in `upgrade_cmd`.)
+(This also cleans up a wrinkle from Phase 2's Task 3: `rollback` now routes to its own function regardless of `from`, rather than being threaded through `upgrade_cmd`'s signature — split it out here since Task 9's original `upgrade_cmd` conflated "apply a local artifact" and "roll back" behind one boolean flag, which no longer makes sense once there's also a networked apply path. Update `upgrade_cmd`'s signature accordingly, dropping the `rollback: bool` parameter it no longer needs, and move the `#[cfg(windows)] bail!(...)` / `#[cfg(not(windows))] rollback_from_local(...)` logic from Phase 0/1's Task 11 into the new `upgrade_rollback_cmd` below instead of leaving it in `upgrade_cmd`. The `check`/`upgrade_check_cmd` branch itself is untouched — carried forward exactly as Phase 2 shipped it.)
 
 Add the new handlers (near `upgrade_cmd`):
 
 ```rust
 fn upgrade_rollback_cmd(config_path: &Path) -> Result<()> {
     let (cfg, _warnings) = config::load(config_path).context("cannot load config for upgrade")?;
-    let live_target = std::env::current_exe().context("cannot resolve the running binary's path")?;
 
     #[cfg(windows)]
     {
         bail!("Windows rollback is not yet automated by this CLI; see docs/RELEASE-SIGNING.md's Windows rollback runbook (msiexec /x then /i)");
     }
 
+    // `live_target` is bound only inside this arm, not unconditionally above
+    // it: a Phase 0/1 final review found that the earlier Windows apply/
+    // rollback code bound an equivalent variable unconditionally, which is
+    // an unused-variable *compile error* under this project's CI (`-D
+    // warnings`) on the Windows arm, since only the non-Windows path ever
+    // reads it. Keep that fix's shape here rather than reintroducing the
+    // same bug.
     #[cfg(not(windows))]
     {
+        let live_target =
+            std::env::current_exe().context("cannot resolve the running binary's path")?;
         softnix_log_agent::update::apply::rollback_from_local(&live_target, &cfg.agent.data_dir)
     }
 }
@@ -306,6 +381,7 @@ fn upgrade_networked_cmd(allow_downgrade: bool, config_path: &Path) -> Result<()
                 &cfg.agent.data_dir,
                 allow_downgrade,
                 &live_target,
+                &cfg.web,
             )
         }
     })
@@ -317,7 +393,6 @@ And update `upgrade_cmd` (drop the `rollback` parameter, per the note above):
 ```rust
 fn upgrade_cmd(from: &Path, allow_downgrade: bool, config_path: &Path) -> Result<()> {
     let (cfg, _warnings) = config::load(config_path).context("cannot load config for upgrade")?;
-    let live_target = std::env::current_exe().context("cannot resolve the running binary's path")?;
 
     #[cfg(windows)]
     {
@@ -329,14 +404,21 @@ fn upgrade_cmd(from: &Path, allow_downgrade: bool, config_path: &Path) -> Result
         );
     }
 
+    // Same reasoning as `upgrade_rollback_cmd` above: `live_target` is
+    // bound only where it's read, not unconditionally, to avoid the
+    // unused-variable compile error a Phase 0/1 final review already fixed
+    // once in this file's history.
     #[cfg(not(windows))]
     {
+        let live_target =
+            std::env::current_exe().context("cannot resolve the running binary's path")?;
         softnix_log_agent::update::apply::apply_from_local(
             from,
             config_path,
             &cfg.agent.data_dir,
             allow_downgrade,
             &live_target,
+            &cfg.web,
         )
     }
 }
@@ -375,7 +457,8 @@ git commit -m "feat(update): support 'upgrade' with no --from by fetching the ve
 
 **Files:**
 - Modify: `README.md` (mention `upgrade` in the feature list)
-- Modify: `docs/CONFIGURATION.md` and `docs/CONFIGURATION.th.md` (document `update.check_url`)
+- Modify: `docs/CONFIGURATION.md` and `docs/CONFIGURATION.th.md` (correct the existing `update.check_url` section — see Step 2's note)
+- Modify: `docs/RELEASE-SIGNING.md` (correct the existing `upgrade --check` section — see Step 2's note)
 
 - [ ] **Step 1: Add a README bullet**
 
@@ -385,14 +468,16 @@ In `README.md`'s feature list (near the existing "Service integration" bullet), 
 - **Self-update** — `softnix-log-agent upgrade --from <artifact>` applies a signed, verified release in place with automatic rollback on failure; `upgrade` with no `--from` fetches it over HTTPS if `update.check_url` is configured. Fully offline by default — no network call unless explicitly opted in.
 ```
 
-- [ ] **Step 2: Document `update.check_url`**
+- [ ] **Step 2: Correct the existing `update.check_url` section — do not add a duplicate**
 
-In `docs/CONFIGURATION.md`, add a section documenting the `update:` config block, its `check_url` field, that it's unset/disabled by default, and the offline `--from` alternative for restricted-network deployments. Mirror the same content into `docs/CONFIGURATION.th.md` (Thai) — check how the existing `web:` section is documented in both files and match that structure/level of detail exactly rather than inventing a new documentation style for this one section.
+**Note on the actual current state (this plan was drafted before Phase 2's final-review fix round added this section):** `docs/CONFIGURATION.md` and `docs/CONFIGURATION.th.md` already have a `## \`update\`` section (added while documenting Phase 2's read-only check path) — do NOT add a second one. That section currently says: *"Setting `check_url` only enables two read-only surfaces: `softnix-log-agent upgrade --check` (CLI) and `GET /api/update/status` (web/API). Neither one ever downloads or applies an update."* This is now **false** — Phase 3's Task 2 made `upgrade` with no `--from` a THIRD surface `check_url` enables, and that one genuinely does download and apply an update. Find and update that paragraph (in both the English and Thai files) to something like: *"`check_url` also enables a third surface: `softnix-log-agent upgrade` with no `--from` fetches the verified artifact over HTTPS and applies it — the only surface among the three that actually changes anything on disk. The two read-only surfaces above never do."* Keep the rest of the section (the `check_url` table row, the query-string/fragment warning, the restart-required note) as-is — only this one paragraph needs correcting for accuracy, plus mention the offline `--from` alternative for restricted-network deployments if it isn't already covered elsewhere in that section.
+
+**`docs/RELEASE-SIGNING.md` has the same kind of now-stale claim, from the same earlier Phase 2 docs work.** Its `## Checking for updates without applying one` section currently ends: *"It never downloads an artifact and never applies anything — that still requires a separate `upgrade --from <downloaded-artifact>` run."* That "still requires `--from`" claim is now wrong too — `upgrade` with no `--from` also applies an update (over the network) as of this plan. Correct that sentence to something like: *"It never downloads an artifact and never applies anything — applying requires a separate `upgrade` run, either `--from <downloaded-artifact>` (offline) or with no `--from` at all (fetches and applies over HTTPS using the same `check_url`)."* Do not otherwise rewrite this section — it's still accurate about what `--check` itself does.
 
 - [ ] **Step 3: Commit**
 
 ```bash
-git add README.md docs/CONFIGURATION.md docs/CONFIGURATION.th.md
+git add README.md docs/CONFIGURATION.md docs/CONFIGURATION.th.md docs/RELEASE-SIGNING.md
 git commit -m "docs: document the upgrade CLI command and update.check_url"
 ```
 
