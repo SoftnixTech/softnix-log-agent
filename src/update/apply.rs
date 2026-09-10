@@ -584,11 +584,13 @@ mod tests {
     /// artifact has no manifest.json" (a bare file-not-found), never even
     /// reaching signature verification. Post-fix, the manifest is found and
     /// read, and the call fails for a wholly different, expected reason:
-    /// this build's `RELEASE_PUBLIC_KEYS` is intentionally empty until the
-    /// Phase 0 signing-key runbook runs (see `src/update/manifest.rs`), so
-    /// `verify_manifest` fails closed on "no release public keys". Asserting
-    /// on that specific message (and not the file-not-found one) is what
-    /// makes this a genuine regression test rather than a coincidental pass.
+    /// this fixture's `manifest.json.sig` is a fake all-zero blob, not a
+    /// real signature, so `verify_manifest` fails closed on "does not
+    /// verify against any trusted release key" (`RELEASE_PUBLIC_KEYS` now
+    /// holds a real key — see `src/update/manifest.rs` — but no fixture in
+    /// this test suite is signed by it). Asserting on that specific message
+    /// (and not the file-not-found one) is what makes this a genuine
+    /// regression test rather than a coincidental pass.
     #[test]
     fn apply_from_local_reads_manifest_out_of_a_wrapper_directory() {
         let dir = tempfile::tempdir().unwrap();
@@ -636,7 +638,7 @@ mod tests {
         .unwrap_err();
         let msg = err.to_string();
         assert!(
-            msg.contains("no release public keys"),
+            msg.contains("does not verify"),
             "expected to reach signature verification (proving manifest.json was found inside \
              the wrapper directory), got: {msg}"
         );

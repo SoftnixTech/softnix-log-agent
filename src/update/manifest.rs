@@ -4,11 +4,13 @@
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
-/// Ed25519 public keys this build trusts. Empty on purpose until Phase 0's
-/// release-engineering runbook generates the real signing key — a build
-/// with no trusted keys must refuse to verify anything (see
-/// `verify_manifest`), never silently accept.
-pub const RELEASE_PUBLIC_KEYS: &[[u8; 32]] = &[];
+/// Ed25519 public keys this build trusts. Generated per
+/// `docs/RELEASE-SIGNING.md`'s one-time runbook; the matching private key
+/// never enters this repository (see that doc for its custody).
+pub const RELEASE_PUBLIC_KEYS: &[[u8; 32]] = &[[
+    174, 221, 215, 220, 253, 209, 1, 161, 143, 123, 253, 52, 8, 166, 163, 74, 46, 155, 10, 109,
+    218, 46, 212, 94, 163, 5, 163, 203, 137, 108, 22, 95,
+]];
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct Manifest {
@@ -280,11 +282,14 @@ mod tests {
 
     #[test]
     fn verify_manifest_refuses_everything_when_no_keys_are_trusted() {
-        // RELEASE_PUBLIC_KEYS is empty in this build (Phase 0 runbook not
-        // yet run) — the public `verify_manifest` (which always uses
-        // `RELEASE_PUBLIC_KEYS`) must fail closed, not open.
+        // RELEASE_PUBLIC_KEYS now holds a real key (the Phase 0 runbook has
+        // run), so this must exercise `verify_manifest_with_keys` directly
+        // with an explicitly empty key list, rather than depending on the
+        // production const's current value — the fail-closed-on-empty-keys
+        // property this test protects is about the verification logic
+        // itself, not about which build state happens to be live right now.
         let bytes = sample_manifest_bytes();
-        let err = verify_manifest(&bytes, &[0u8; 64]).unwrap_err();
+        let err = verify_manifest_with_keys(&bytes, &[0u8; 64], &[]).unwrap_err();
         assert!(err.to_string().contains("no release public keys"));
     }
 
