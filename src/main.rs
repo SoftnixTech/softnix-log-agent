@@ -65,7 +65,10 @@ enum Command {
         config: PathBuf,
     },
     /// Internal: runs inside the self-relaunched temp copy on Windows to
-    /// drive the actual MSI install. Not intended to be run directly.
+    /// drive the actual MSI install. Not intended to be run directly:
+    /// performs zero verification of its own and trusts `--msi` completely
+    /// (verification already happened in the parent process that spawned
+    /// this one).
     #[cfg(windows)]
     #[command(hide = true)]
     UpgradeApply {

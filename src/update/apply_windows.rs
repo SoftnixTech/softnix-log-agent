@@ -74,7 +74,18 @@ pub fn self_relaunch_and_apply(
         .arg("-NoProfile")
         .arg("-Command")
         .arg(format!(
-            "Expand-Archive -Path {} -DestinationPath {} -Force",
+            // `-LiteralPath` (not `-Path`) for the source: `-Path` resolves
+            // wildcard/glob metacharacters (`*`, `?`, `[...]`) via the
+            // PowerShell provider, independently of the quoting
+            // `powershell_quote` already does for embedded `'` — a zip
+            // path containing `[` or `]` (legal in NTFS filenames, and
+            // this path is not one this code controls the naming of)
+            // could otherwise fail to resolve or resolve unexpectedly.
+            // `Expand-Archive` has no `-LiteralDestinationPath`
+            // equivalent, and the destination here is always a fresh
+            // `tempfile::tempdir()` path we generated ourselves, so
+            // `-DestinationPath` is left as-is.
+            "Expand-Archive -LiteralPath {} -DestinationPath {} -Force",
             powershell_quote(zip_path),
             powershell_quote(extract_dir.path())
         ))
@@ -128,6 +139,26 @@ pub fn self_relaunch_and_apply(
     // now, prefixed accordingly.
     let _ = config_path;
 
+    // Every verification above (`verify_manifest`, `check_freshness`,
+    // `verify_artifact_hash`) has already succeeded, so from here on keep
+    // the extraction directory around rather than letting `extract_dir`'s
+    // `Drop` delete it: the relaunched child spawned below (and, after it,
+    // `msiexec`) still needs to read the `.msi` inside it, but `spawn()`
+    // returns as soon as the child process is created — long before it
+    // has had a chance to open the file — so without this, `extract_dir`
+    // would go out of scope and synchronously delete the whole tree
+    // (including the `.msi`) within microseconds of this function
+    // returning, deterministically breaking every upgrade. Every
+    // early-return path above this point is untouched and still cleans up
+    // automatically via `Drop` — a bad/unsigned/replayed/corrupt artifact
+    // still gets its temp dir removed. This leaks one temp directory under
+    // `%TEMP%` per completed upgrade; an accepted, much smaller gap than a
+    // broken upgrade, and no cleanup mechanism is added for it here.
+    // `keep()` is `#[must_use]` (it returns the retained path); `msi_path`
+    // above is already an owned `PathBuf` independent of `extract_dir`, so
+    // there's nothing further to do with the returned path here.
+    let _ = extract_dir.keep();
+
     let current = std::env::current_exe().context("cannot resolve the running executable path")?;
     let temp_copy = std::env::temp_dir().join(format!("snx-upgrade-{}.exe", std::process::id()));
     std::fs::copy(&current, &temp_copy)
@@ -156,7 +187,12 @@ pub fn self_relaunch_and_apply(
 /// Re-verifies nothing here — verification already happened in the
 /// original process before it decided to relaunch at all; this function's
 /// only job is driving the actual MSI install and waiting for the service
-/// to come back healthy.
+/// to come back healthy. This is called from the hidden, undocumented
+/// `upgrade-apply --msi <path>` CLI subcommand, which performs zero
+/// verification of its own and unconditionally trusts whatever `.msi` path
+/// it is given — it is not meant to be invoked directly by anything other
+/// than `self_relaunch_and_apply`'s own relaunch, even though nothing stops
+/// a local operator/administrator from running it by hand.
 pub fn apply_msi(msi_path: &Path) -> Result<()> {
     let status = Command::new("msiexec")
         .arg("/i")
