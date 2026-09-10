@@ -55,7 +55,12 @@ mod tests {
     // executable, so `--version` and `validate` behave exactly as they
     // would for a genuine staged release artifact.
     fn this_binary() -> std::path::PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("target/debug/softnix-log-agent")
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join(format!(
+                "target/debug/softnix-log-agent{}",
+                std::env::consts::EXE_SUFFIX
+            ))
+            .to_path_buf()
     }
 
     #[test]
