@@ -489,6 +489,25 @@ read-only surfaces (`upgrade --check` and `GET /api/update/status`) never do.
 For air-gapped or restricted-network deployments, `upgrade --from
 <local-artifact>` applies a pre-downloaded artifact offline instead.
 
+`check_url` must be one fixed URL — the agent's fetch client deliberately
+does not follow HTTP redirects (see `src/update/fetch.rs`), so a URL like
+GitHub's own `releases/latest/download/manifest.json` alias (a `302`) will
+not work; pointing `check_url` at a specific version's manifest means
+re-editing this config on every release. To avoid that, releases also
+publish `manifest.json`/`.sig` to a permanent, non-versioned release tag
+(`latest-manifest`) whose two files the release pipeline overwrites on every
+release — point `check_url` at that tag instead of a specific version, and
+it always serves whatever was most recently released with no config changes
+needed:
+
+```yaml
+update:
+  check_url: https://github.com/SoftnixTech/softnix-log-agent/releases/download/latest-manifest/manifest.json
+```
+
+A self-hosted mirror works the same way — anything serving `manifest.json` and
+`manifest.json.sig` at a fixed URL over HTTPS:
+
 ```yaml
 update:
   check_url: https://updates.example.com/softnix-log-agent/manifest.json

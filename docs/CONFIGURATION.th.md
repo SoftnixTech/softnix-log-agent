@@ -489,6 +489,24 @@ deployment แบบ air-gapped หรือเครือข่ายที่
 `upgrade --from <local-artifact>` จะติดตั้ง artifact ที่ดาวน์โหลดลงมาแล้วแบบ
 offline แทน
 
+`check_url` ต้องเป็น URL เดียวที่ตายตัว — ฝั่ง fetch client ของ agent
+ตั้งใจไม่ follow HTTP redirect (ดู `src/update/fetch.rs`) ดังนั้น URL แบบ
+`releases/latest/download/manifest.json` ของ GitHub เอง (ซึ่งเป็น `302`)
+จะใช้ไม่ได้ — ถ้าชี้ `check_url` ไปที่ manifest ของเวอร์ชันใดเวอร์ชันหนึ่งตรงๆ
+จะต้องมาแก้ config ทุกครั้งที่มี release ใหม่ เพื่อเลี่ยงปัญหานี้ ทุก release
+จะ publish `manifest.json`/`.sig` ไปที่ release tag ที่ตายตัวและไม่ผูกกับ
+เวอร์ชันใดๆ (`latest-manifest`) เพิ่มด้วย ซึ่งไฟล์สองไฟล์นี้จะถูกเขียนทับ
+ทุกครั้งที่มี release ใหม่ — ชี้ `check_url` ไปที่ tag นี้แทนการระบุเวอร์ชัน
+ตรงๆ แล้วมันจะให้ manifest ของ release ล่าสุดเสมอโดยไม่ต้องแก้ config เลย:
+
+```yaml
+update:
+  check_url: https://github.com/SoftnixTech/softnix-log-agent/releases/download/latest-manifest/manifest.json
+```
+
+หรือจะ host เองก็ได้ ใช้หลักการเดียวกัน — แค่มีอะไรก็ได้ที่ serve
+`manifest.json` กับ `manifest.json.sig` ที่ URL ตายตัวผ่าน HTTPS:
+
 ```yaml
 update:
   check_url: https://updates.example.com/softnix-log-agent/manifest.json

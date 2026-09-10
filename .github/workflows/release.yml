@@ -229,3 +229,32 @@ jobs:
             artifacts/manifest.json.sig \
             --title "${GITHUB_REF_NAME}" \
             --generate-notes
+      - name: Refresh the stable update-feed pointer (operator convenience for update.check_url)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # `update.check_url` in agent.yaml must be one fixed URL (the agent's
+          # fetch client deliberately does not follow HTTP redirects, so
+          # GitHub's own `releases/latest/download/...` alias — a 302 — does
+          # not work here). This mirrors manifest.json/.sig to a permanent,
+          # non-versioned release tag so operators can point check_url at
+          # one URL that always serves whatever was most recently released,
+          # instead of hand-editing the version number into their config on
+          # every release. `--clobber` overwrites the assets in place; the
+          # release itself is created once (by the first run of this step)
+          # and every later run just refreshes its two files. Marked
+          # `--prerelease` so it never competes with a real version tag for
+          # the repo's "Latest release" badge.
+          if gh release view latest-manifest >/dev/null 2>&1; then
+            gh release upload latest-manifest \
+              artifacts/manifest.json \
+              artifacts/manifest.json.sig \
+              --clobber
+          else
+            gh release create latest-manifest \
+              artifacts/manifest.json \
+              artifacts/manifest.json.sig \
+              --title "Update feed (always current — not a real release)" \
+              --notes "Mirrors the manifest.json/.sig of whatever was most recently released, at a fixed URL, so \`update.check_url\` never needs hand-editing. Not a downloadable release on its own — see the versioned tag (e.g. \`${GITHUB_REF_NAME}\`) this manifest currently points at for the actual artifacts." \
+              --prerelease
+          fi
