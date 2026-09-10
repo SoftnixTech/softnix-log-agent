@@ -1,6 +1,8 @@
 //! Softnix Log Agent — lightweight, reliable, cross-platform log collector.
 
 use anyhow::{Context, Result};
+#[cfg(windows)]
+use anyhow::bail;
 use clap::{Parser, Subcommand};
 use engine::Engine;
 use logbuf::{LogBuffer, LogBufferLayer};
@@ -62,6 +64,14 @@ enum Command {
         #[arg(short, long, default_value = "agent.yaml")]
         config: PathBuf,
     },
+    /// Internal: runs inside the self-relaunched temp copy on Windows to
+    /// drive the actual MSI install. Not intended to be run directly.
+    #[cfg(windows)]
+    #[command(hide = true)]
+    UpgradeApply {
+        #[arg(long)]
+        msi: PathBuf,
+    },
 }
 
 #[derive(Subcommand)]
@@ -96,6 +106,10 @@ fn main() -> Result<()> {
             allow_downgrade,
             config,
         }) => upgrade_cmd(from.as_deref(), rollback, allow_downgrade, &config),
+        #[cfg(windows)]
+        Some(Command::UpgradeApply { msi }) => {
+            softnix_log_agent::update::apply_windows::apply_msi(&msi)
+        }
         Some(Command::Run { config }) => run_foreground(config),
         None => run_foreground(PathBuf::from("agent.yaml")),
     }
@@ -117,25 +131,38 @@ fn validate_cmd(path: &Path) -> Result<()> {
     }
 }
 
-fn upgrade_cmd(
-    from: Option<&Path>,
-    rollback: bool,
-    allow_downgrade: bool,
-    config_path: &Path,
-) -> Result<()> {
+fn upgrade_cmd(from: Option<&Path>, rollback: bool, allow_downgrade: bool, config_path: &Path) -> Result<()> {
     let (cfg, _warnings) = config::load(config_path).context("cannot load config for upgrade")?;
     let live_target = std::env::current_exe().context("cannot resolve the running binary's path")?;
-    if rollback {
-        softnix_log_agent::update::apply::rollback_from_local(&live_target, &cfg.agent.data_dir)
-    } else {
+
+    #[cfg(windows)]
+    {
+        if rollback {
+            bail!("Windows rollback is not yet automated by this CLI; see docs/RELEASE-SIGNING.md's Windows rollback runbook (msiexec /x then /i)");
+        }
         let from = from.context("--from is required unless --rollback is passed")?;
-        softnix_log_agent::update::apply::apply_from_local(
+        return softnix_log_agent::update::apply_windows::self_relaunch_and_apply(
             from,
             config_path,
             &cfg.agent.data_dir,
             allow_downgrade,
-            &live_target,
-        )
+        );
+    }
+
+    #[cfg(not(windows))]
+    {
+        if rollback {
+            softnix_log_agent::update::apply::rollback_from_local(&live_target, &cfg.agent.data_dir)
+        } else {
+            let from = from.context("--from is required unless --rollback is passed")?;
+            softnix_log_agent::update::apply::apply_from_local(
+                from,
+                config_path,
+                &cfg.agent.data_dir,
+                allow_downgrade,
+                &live_target,
+            )
+        }
     }
 }
 
