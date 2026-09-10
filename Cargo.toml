@@ -1,6 +1,6 @@
 [package]
 name = "softnix-log-agent"
-version = "0.1.6"
+version = "0.1.7"
 edition = "2021"
 description = "Softnix Log Agent - lightweight, reliable, cross-platform log collector"
 license = "Proprietary"
