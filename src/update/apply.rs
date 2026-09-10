@@ -114,9 +114,10 @@ pub fn apply_from_local(
 
     // Point of no return: everything above this line is read-only with
     // respect to `live_target`.
-    platform_swap_and_restart(&extracted_binary, live_target, &manifest.version)?;
+    let old_path = platform_swap_and_restart(&extracted_binary, live_target, &manifest.version)?;
 
     watermark.record(manifest.manifest_serial)?;
+    prune_old_versions(live_target, &old_path)?;
     println!(
         "upgraded {} -> {}",
         env!("CARGO_PKG_VERSION"),
@@ -137,7 +138,7 @@ pub fn apply_from_local(
 /// `#[cfg(...)]` arms, mirroring the same platform-split pattern
 /// `src/service.rs` already uses for install/start/stop/restart.
 #[cfg(target_os = "linux")]
-fn platform_swap_and_restart(extracted_binary: &Path, live_target: &Path, version: &str) -> Result<()> {
+fn platform_swap_and_restart(extracted_binary: &Path, live_target: &Path, version: &str) -> Result<std::path::PathBuf> {
     let old_path = super::apply_linux::stage_and_swap(extracted_binary, live_target, version)?;
 
     if let Err(e) = crate::service::restart() {
@@ -154,11 +155,11 @@ fn platform_swap_and_restart(extracted_binary: &Path, live_target: &Path, versio
         bail!("upgrade did not become healthy within the grace window; rolled back to the previous version");
     }
 
-    Ok(())
+    Ok(old_path)
 }
 
 #[cfg(not(target_os = "linux"))]
-fn platform_swap_and_restart(_extracted_binary: &Path, _live_target: &Path, _version: &str) -> Result<()> {
+fn platform_swap_and_restart(_extracted_binary: &Path, _live_target: &Path, _version: &str) -> Result<std::path::PathBuf> {
     bail!("upgrade apply (binary swap + service restart) is only implemented on Linux in this build")
 }
 
@@ -237,6 +238,33 @@ pub fn rollback_from_local(live_target: &Path, _data_dir: &Path) -> Result<()> {
 #[cfg(not(target_os = "linux"))]
 pub fn rollback_from_local(_live_target: &Path, _data_dir: &Path) -> Result<()> {
     bail!("rollback is only implemented on Linux in this build")
+}
+
+/// Removes every `<live_target>.old-*` file except `keep`. Called after a
+/// successful upgrade so retention never exceeds one previous version —
+/// an unbounded number of retained binaries is both a disk-space leak and
+/// makes `rollback_from_local`'s "exactly one candidate" invariant false.
+fn prune_old_versions(live_target: &std::path::Path, keep: &std::path::Path) -> Result<()> {
+    let parent = live_target
+        .parent()
+        .context("live_target has no parent directory")?;
+    let file_name = live_target
+        .file_name()
+        .context("live_target has no file name")?
+        .to_string_lossy();
+    let prefix = format!("{file_name}.old-");
+    for entry in std::fs::read_dir(parent)? {
+        let path = entry?.path();
+        let is_old_version = path
+            .file_name()
+            .map(|n| n.to_string_lossy().starts_with(&prefix))
+            .unwrap_or(false);
+        if is_old_version && path != keep {
+            std::fs::remove_file(&path)
+                .with_context(|| format!("cannot prune stale retained version {}", path.display()))?;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -328,5 +356,24 @@ mod tests {
         let result = apply_from_local(&tar_path, &config_path, &data_dir, false, &live);
         assert!(result.is_err());
         assert_eq!(std::fs::read(&live).unwrap(), b"original content");
+    }
+
+    #[test]
+    fn prune_old_versions_removes_every_retained_version_except_the_one_to_keep() {
+        let dir = tempfile::tempdir().unwrap();
+        let live = dir.path().join("softnix-log-agent");
+        std::fs::write(&live, b"current").unwrap();
+        let keep = dir.path().join("softnix-log-agent.old-0.1.5");
+        std::fs::write(&keep, b"kept").unwrap();
+        let stale1 = dir.path().join("softnix-log-agent.old-0.1.4");
+        std::fs::write(&stale1, b"stale").unwrap();
+        let stale2 = dir.path().join("softnix-log-agent.old-0.1.3");
+        std::fs::write(&stale2, b"stale").unwrap();
+
+        prune_old_versions(&live, &keep).unwrap();
+
+        assert!(keep.exists());
+        assert!(!stale1.exists());
+        assert!(!stale2.exists());
     }
 }
