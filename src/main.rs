@@ -187,6 +187,9 @@ fn upgrade_cmd(from: &Path, allow_downgrade: bool, config_path: &Path) -> Result
     }
 }
 
+/// Rolls back to the previously retained version instead of applying
+/// `--from`. Linux-only; on Windows this bails with a pointer to the manual
+/// runbook, since automated MSI rollback isn't implemented yet.
 fn upgrade_rollback_cmd(config_path: &Path) -> Result<()> {
     let (cfg, _warnings) = config::load(config_path).context("cannot load config for upgrade")?;
 
@@ -210,6 +213,10 @@ fn upgrade_rollback_cmd(config_path: &Path) -> Result<()> {
     }
 }
 
+/// `upgrade` with no `--from`: fetches the verified release artifact for
+/// this host's platform/arch over HTTPS (`update::apply::fetch_manifest_and_artifact`)
+/// then hands it to the exact same apply path a `--from <artifact>` run
+/// would use — no new verification, apply, or rollback logic lives here.
 fn upgrade_networked_cmd(allow_downgrade: bool, config_path: &Path) -> Result<()> {
     let (cfg, _warnings) = config::load(config_path).context("cannot load config for upgrade")?;
     let check_url = cfg.update.check_url.context(
