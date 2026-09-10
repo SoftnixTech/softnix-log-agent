@@ -120,8 +120,13 @@ fn main() -> Result<()> {
         }) => {
             if check {
                 upgrade_check_cmd(&config)
+            } else if rollback {
+                upgrade_rollback_cmd(&config)
             } else {
-                upgrade_cmd(from.as_deref(), rollback, allow_downgrade, &config)
+                match from {
+                    Some(path) => upgrade_cmd(&path, allow_downgrade, &config),
+                    None => upgrade_networked_cmd(allow_downgrade, &config),
+                }
             }
         }
         #[cfg(windows)]
@@ -149,40 +154,95 @@ fn validate_cmd(path: &Path) -> Result<()> {
     }
 }
 
-fn upgrade_cmd(
-    from: Option<&Path>,
-    rollback: bool,
-    allow_downgrade: bool,
-    config_path: &Path,
-) -> Result<()> {
+fn upgrade_cmd(from: &Path, allow_downgrade: bool, config_path: &Path) -> Result<()> {
     let (cfg, _warnings) = config::load(config_path).context("cannot load config for upgrade")?;
 
     #[cfg(windows)]
     {
-        if rollback {
-            bail!("Windows rollback is not yet automated by this CLI; see docs/RELEASE-SIGNING.md's Windows rollback runbook (msiexec /x then /i)");
-        }
-        let from = from.context("--from is required unless --rollback is passed")?;
-        softnix_log_agent::update::apply_windows::self_relaunch_and_apply(
+        return softnix_log_agent::update::apply_windows::self_relaunch_and_apply(
             from,
             config_path,
             &cfg.agent.data_dir,
             allow_downgrade,
-        )
+        );
     }
 
+    // Same reasoning as `upgrade_rollback_cmd` below: `live_target` is
+    // bound only where it's read, not unconditionally, to avoid the
+    // unused-variable compile error a Phase 0/1 final review already fixed
+    // once in this file's history.
     #[cfg(not(windows))]
     {
-        // Only the non-Windows path swaps the currently-running binary in
-        // place, so only it needs to know where that binary lives.
         let live_target =
             std::env::current_exe().context("cannot resolve the running binary's path")?;
-        if rollback {
-            softnix_log_agent::update::apply::rollback_from_local(&live_target, &cfg.agent.data_dir)
-        } else {
-            let from = from.context("--from is required unless --rollback is passed")?;
+        softnix_log_agent::update::apply::apply_from_local(
+            from,
+            config_path,
+            &cfg.agent.data_dir,
+            allow_downgrade,
+            &live_target,
+            &cfg.web,
+        )
+    }
+}
+
+fn upgrade_rollback_cmd(config_path: &Path) -> Result<()> {
+    let (cfg, _warnings) = config::load(config_path).context("cannot load config for upgrade")?;
+
+    #[cfg(windows)]
+    {
+        bail!("Windows rollback is not yet automated by this CLI; see docs/RELEASE-SIGNING.md's Windows rollback runbook (msiexec /x then /i)");
+    }
+
+    // `live_target` is bound only inside this arm, not unconditionally above
+    // it: a Phase 0/1 final review found that the earlier Windows apply/
+    // rollback code bound an equivalent variable unconditionally, which is
+    // an unused-variable *compile error* under this project's CI (`-D
+    // warnings`) on the Windows arm, since only the non-Windows path ever
+    // reads it. Keep that fix's shape here rather than reintroducing the
+    // same bug.
+    #[cfg(not(windows))]
+    {
+        let live_target =
+            std::env::current_exe().context("cannot resolve the running binary's path")?;
+        softnix_log_agent::update::apply::rollback_from_local(&live_target, &cfg.agent.data_dir)
+    }
+}
+
+fn upgrade_networked_cmd(allow_downgrade: bool, config_path: &Path) -> Result<()> {
+    let (cfg, _warnings) = config::load(config_path).context("cannot load config for upgrade")?;
+    let check_url = cfg.update.check_url.context(
+        "update.check_url is not configured; pass --from <artifact> for an offline upgrade instead",
+    )?;
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    runtime.block_on(async {
+        let dest_dir = tempfile::tempdir().context("cannot create download temp dir")?;
+        let artifact_path = softnix_log_agent::update::apply::fetch_manifest_and_artifact(
+            &check_url,
+            &cfg.agent.data_dir,
+            allow_downgrade,
+            dest_dir.path(),
+        )
+        .await?;
+
+        #[cfg(windows)]
+        {
+            softnix_log_agent::update::apply_windows::self_relaunch_and_apply(
+                &artifact_path,
+                config_path,
+                &cfg.agent.data_dir,
+                allow_downgrade,
+            )
+        }
+        #[cfg(not(windows))]
+        {
+            let live_target =
+                std::env::current_exe().context("cannot resolve the running binary's path")?;
             softnix_log_agent::update::apply::apply_from_local(
-                from,
+                &artifact_path,
                 config_path,
                 &cfg.agent.data_dir,
                 allow_downgrade,
@@ -190,7 +250,7 @@ fn upgrade_cmd(
                 &cfg.web,
             )
         }
-    }
+    })
 }
 
 /// Read-only network check: fetches the manifest+signature over HTTPS,
