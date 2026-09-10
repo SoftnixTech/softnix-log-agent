@@ -7,3 +7,5 @@ pub mod apply;
 pub mod manifest;
 pub mod watermark;
 pub mod verify;
+#[cfg(target_os = "linux")]
+pub mod apply_linux;
