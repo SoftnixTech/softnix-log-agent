@@ -50,8 +50,9 @@ enum Command {
     /// Apply a self-contained update artifact (offline, no network access).
     Upgrade {
         /// Path to a downloaded/copied release artifact (.tar.gz on Linux).
-        #[arg(long)]
-        from: PathBuf,
+        /// Required unless `--rollback` is passed.
+        #[arg(long, required_unless_present = "rollback")]
+        from: Option<PathBuf>,
         /// Roll back to the previously retained version instead of applying `--from`.
         #[arg(long)]
         rollback: bool,
@@ -94,7 +95,7 @@ fn main() -> Result<()> {
             rollback,
             allow_downgrade,
             config,
-        }) => upgrade_cmd(&from, rollback, allow_downgrade, &config),
+        }) => upgrade_cmd(from.as_deref(), rollback, allow_downgrade, &config),
         Some(Command::Run { config }) => run_foreground(config),
         None => run_foreground(PathBuf::from("agent.yaml")),
     }
@@ -116,12 +117,18 @@ fn validate_cmd(path: &Path) -> Result<()> {
     }
 }
 
-fn upgrade_cmd(from: &Path, rollback: bool, allow_downgrade: bool, config_path: &Path) -> Result<()> {
+fn upgrade_cmd(
+    from: Option<&Path>,
+    rollback: bool,
+    allow_downgrade: bool,
+    config_path: &Path,
+) -> Result<()> {
     let (cfg, _warnings) = config::load(config_path).context("cannot load config for upgrade")?;
     let live_target = std::env::current_exe().context("cannot resolve the running binary's path")?;
     if rollback {
         softnix_log_agent::update::apply::rollback_from_local(&live_target, &cfg.agent.data_dir)
     } else {
+        let from = from.context("--from is required unless --rollback is passed")?;
         softnix_log_agent::update::apply::apply_from_local(
             from,
             config_path,
@@ -431,5 +438,28 @@ async fn try_reload(
                 Err(format!("{e:#} (previous configuration restored)")),
             ))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn upgrade_rollback_parses_without_from() {
+        let cli = Cli::try_parse_from(["softnix-log-agent", "upgrade", "--rollback"]).unwrap();
+        match cli.command {
+            Some(Command::Upgrade { from, rollback, .. }) => {
+                assert!(from.is_none());
+                assert!(rollback);
+            }
+            _ => panic!("expected Command::Upgrade"),
+        }
+    }
+
+    #[test]
+    fn upgrade_without_from_or_rollback_fails_to_parse() {
+        let result = Cli::try_parse_from(["softnix-log-agent", "upgrade"]);
+        assert!(result.is_err());
     }
 }
