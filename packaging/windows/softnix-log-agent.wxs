@@ -17,7 +17,7 @@
   <Product Id="*"
            Name="Softnix Log Agent"
            Manufacturer="Softnix Technology"
-           Version="0.1.0"
+           Version="$(var.Version)"
            UpgradeCode="6f9a1c2e-3b7d-4e8a-9c5f-2d1e8a7b4c3a"
            Language="1033">
 
