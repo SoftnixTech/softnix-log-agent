@@ -49,8 +49,9 @@ and signature from `update.check_url` (see `CONFIGURATION.md`'s `update`
 section — the flag requires this to be configured, and does nothing if it
 isn't), verifies the signature exactly the way a real `upgrade --from`
 would, and prints whether a newer, acceptable version is available. It
-never downloads an artifact and never applies anything — that still
-requires a separate `upgrade --from <downloaded-artifact>` run. The same
+never downloads an artifact and never applies anything — applying requires
+a separate `upgrade` run, either `--from <downloaded-artifact>` (offline) or
+with no `--from` at all (fetches and applies over HTTPS using the same `check_url`). The same
 logic backs the web GUI/API's `GET /api/update/status`, via the shared
 `update::manifest::evaluate_check` function, so the CLI and the GUI always
 agree on whether an update is available.

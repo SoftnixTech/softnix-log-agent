@@ -482,10 +482,12 @@ requires a full agent restart to take effect: unlike most config, it is not
 covered by `Reload`/`SIGHUP` — it is read once at startup into the web
 server's state.
 
-Setting `check_url` only enables two read-only surfaces: `softnix-log-agent
-upgrade --check` (CLI) and `GET /api/update/status` (web/API). Neither one
-ever downloads or applies an update — see [`RELEASE-SIGNING.md`](RELEASE-SIGNING.md)
-for the actual `upgrade --from`/`upgrade --rollback` apply path.
+`check_url` also enables a third surface: `softnix-log-agent upgrade` with no
+`--from` fetches the verified artifact over HTTPS and applies it — the only
+surface among the three that actually changes anything on disk. The two
+read-only surfaces (`upgrade --check` and `GET /api/update/status`) never do.
+For restricted-network deployments that cannot reach the network, `upgrade --from
+<local-artifact>` applies a pre-downloaded artifact offline instead.
 
 ```yaml
 update:

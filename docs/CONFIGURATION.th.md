@@ -481,11 +481,13 @@ agent จะต่อท้าย `.sig` เข้ากับค่านี้
 `Reload`/`SIGHUP` ได้ เพราะค่านี้ถูกอ่านครั้งเดียวตอน startup เข้าไปเก็บใน
 state ของ web server
 
-การตั้งค่า `check_url` เปิดใช้งานเพียงสองจุดที่เป็น read-only เท่านั้น:
-`softnix-log-agent upgrade --check` (CLI) และ `GET /api/update/status`
-(web/API) ทั้งสองจุดนี้ไม่ดาวน์โหลดหรือติดตั้งอัปเดตใด ๆ ทั้งสิ้น — ดูขั้นตอน
-การติดตั้งจริง `upgrade --from`/`upgrade --rollback` ได้ที่
-[`RELEASE-SIGNING.md`](RELEASE-SIGNING.md)
+`check_url` ยังเปิดใช้งานจุดที่สาม: `softnix-log-agent upgrade` โดยไม่มี `--from`
+จะดาวน์โหลดและติดตั้งสิ่งประดิษฐ์ที่ verified ผ่าน HTTPS — เป็นจุดเดียวระหว่าง
+สามจุดนี้ที่แก้ไขสิ่งต่าง ๆ บนดิสก์จริง ๆ จุดที่เป็น read-only สองจุด
+(`upgrade --check` และ `GET /api/update/status`) ไม่ทำแบบนั้น สำหรับ
+deployment ในเครือข่ายที่มีข้อจำกัด ซึ่งไม่สามารถเข้าไปในเครือข่ายได้
+`upgrade --from <local-artifact>` จะติดตั้งสิ่งประดิษฐ์ที่ดาวน์โหลดลงมาแล้วแบบ
+offline แทน
 
 ```yaml
 update:

@@ -27,6 +27,7 @@ Inputs (files, syslog UDP/TCP/TLS, Windows Event Log)     # collect raw log line
 - **Security** — TLS and mTLS on inputs and outputs, certificate validation by default, data masking transform, every web route authenticated except `/` and `/healthz` (token auto-generated into `<data_dir>/web-token` when not configured), binding beyond localhost without a token is a hard startup refusal.
 - **Web GUI** — minimal appliance-style page (single embedded HTML file, no framework): overview, inputs, outputs, buffer, config edit with validate/save/reload/rollback, recent agent logs, about.
 - **Service integration** — systemd (Linux) and Windows Service, with `install/uninstall/start/stop/restart` subcommands.
+- **Self-update** — `softnix-log-agent upgrade --from <artifact>` applies a signed, verified release in place with automatic rollback on failure; `upgrade` with no `--from` fetches it over HTTPS if `update.check_url` is configured. Fully offline by default — no network call unless explicitly opted in.
 - **Observability** — `/healthz`, Prometheus-style `/metrics`, JSON status API, in-memory ring buffer of agent logs.
 
 ## Architecture
