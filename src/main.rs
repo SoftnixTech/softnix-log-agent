@@ -160,12 +160,12 @@ fn upgrade_cmd(from: &Path, allow_downgrade: bool, config_path: &Path) -> Result
 
     #[cfg(windows)]
     {
-        return softnix_log_agent::update::apply_windows::self_relaunch_and_apply(
+        softnix_log_agent::update::apply_windows::self_relaunch_and_apply(
             from,
             config_path,
             &cfg.agent.data_dir,
             allow_downgrade,
-        );
+        )
     }
 
     // Same reasoning as `upgrade_rollback_cmd` below: `live_target` is
