@@ -183,8 +183,9 @@ jobs:
         run: |
           cd artifacts
           echo "$RELEASE_SIGNING_KEY" > /tmp/release-signing-key.pem
+          # Ensure the key is always shredded, even if signing fails (bash -e exits before shred otherwise)
+          trap 'shred -u /tmp/release-signing-key.pem 2>/dev/null || true' EXIT
           openssl pkeyutl -sign -inkey /tmp/release-signing-key.pem -rawin -in manifest.json -out manifest.json.sig
-          shred -u /tmp/release-signing-key.pem
       - name: Bundle the manifest into each platform's self-update artifact
         run: |
           cd artifacts
