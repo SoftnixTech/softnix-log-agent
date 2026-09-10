@@ -53,9 +53,10 @@ enum Command {
     Upgrade {
         /// Path to a downloaded/copied release artifact: a `.tar.gz` on
         /// Linux, or a `*-update.zip` bundle (.msi + manifest + signature
-        /// together) on Windows. Required unless `--check` or `--rollback`
-        /// is passed.
-        #[arg(long, required_unless_present_any = ["rollback", "check"])]
+        /// together) on Windows. If omitted (and `--check`/`--rollback`
+        /// aren't passed either), fetches and verifies the artifact over
+        /// HTTPS using `update.check_url` instead.
+        #[arg(long)]
         from: Option<PathBuf>,
         /// Check for an available update over the network (read-only,
         /// never applies anything) and print the result.
@@ -626,9 +627,21 @@ mod tests {
     }
 
     #[test]
-    fn upgrade_without_from_or_rollback_fails_to_parse() {
-        let result = Cli::try_parse_from(["softnix-log-agent", "upgrade"]);
-        assert!(result.is_err());
+    fn upgrade_with_no_flags_parses_for_a_networked_apply() {
+        let cli = Cli::try_parse_from(["softnix-log-agent", "upgrade"]).unwrap();
+        match cli.command {
+            Some(Command::Upgrade {
+                from,
+                check,
+                rollback,
+                ..
+            }) => {
+                assert!(from.is_none());
+                assert!(!check);
+                assert!(!rollback);
+            }
+            _ => panic!("expected Command::Upgrade"),
+        }
     }
 
     #[test]
