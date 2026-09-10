@@ -47,6 +47,20 @@ enum Command {
         #[arg(short, long, default_value = "agent.yaml")]
         config: PathBuf,
     },
+    /// Apply a self-contained update artifact (offline, no network access).
+    Upgrade {
+        /// Path to a downloaded/copied release artifact (.tar.gz on Linux).
+        #[arg(long)]
+        from: PathBuf,
+        /// Roll back to the previously retained version instead of applying `--from`.
+        #[arg(long)]
+        rollback: bool,
+        /// Allow installing a version older than the one currently running.
+        #[arg(long)]
+        allow_downgrade: bool,
+        #[arg(short, long, default_value = "agent.yaml")]
+        config: PathBuf,
+    },
 }
 
 #[derive(Subcommand)]
@@ -75,6 +89,12 @@ fn main() -> Result<()> {
             ServiceAction::Restart => service::restart(),
         },
         Some(Command::ServiceRun { config }) => run_as_windows_service(config),
+        Some(Command::Upgrade {
+            from,
+            rollback,
+            allow_downgrade,
+            config,
+        }) => upgrade_cmd(&from, rollback, allow_downgrade, &config),
         Some(Command::Run { config }) => run_foreground(config),
         None => run_foreground(PathBuf::from("agent.yaml")),
     }
@@ -93,6 +113,22 @@ fn validate_cmd(path: &Path) -> Result<()> {
             eprintln!("INVALID: {e:#}");
             std::process::exit(1);
         }
+    }
+}
+
+fn upgrade_cmd(from: &Path, rollback: bool, allow_downgrade: bool, config_path: &Path) -> Result<()> {
+    let (cfg, _warnings) = config::load(config_path).context("cannot load config for upgrade")?;
+    let live_target = std::env::current_exe().context("cannot resolve the running binary's path")?;
+    if rollback {
+        softnix_log_agent::update::apply::rollback_from_local(&live_target, &cfg.agent.data_dir)
+    } else {
+        softnix_log_agent::update::apply::apply_from_local(
+            from,
+            config_path,
+            &cfg.agent.data_dir,
+            allow_downgrade,
+            &live_target,
+        )
     }
 }
 
