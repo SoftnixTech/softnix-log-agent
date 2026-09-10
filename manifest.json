@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "product": "softnix-log-agent",
+  "version": "0.1.7",
+  "manifest_serial": 11,
+  "released_at": "2026-09-10T09:21:31Z",
+  "expires_at": "2028-09-10T09:21:31Z",
+  "artifacts": [
+    {"platform": "linux", "arch": "x86_64", "filename": "softnix-log-agent-0.1.7-linux-x86_64.tar.gz", "url": "https://github.com/SoftnixTech/softnix-log-agent/releases/download/v0.1.7/softnix-log-agent-0.1.7-linux-x86_64.tar.gz", "sha256": "396bd176c73827a51efc31d51da1af5894e02ddd3b6313979cbacd4047ee4299", "size": 6148848},
+    {"platform": "windows", "arch": "x86_64", "filename": "softnix-log-agent-0.1.7-windows-x86_64-update.zip", "url": "https://github.com/SoftnixTech/softnix-log-agent/releases/download/v0.1.7/softnix-log-agent-0.1.7-windows-x86_64-update.zip", "sha256": "1eb4c3b42940501de19545e0620bcbb515caa1d595a3dffccf2cf40c4b836b85", "size": 2281472}
+  ]
+}
