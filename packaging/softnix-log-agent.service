@@ -13,7 +13,7 @@ NoNewPrivileges=true
 ProtectSystem=full
 ProtectHome=read-only
 PrivateTmp=true
-ReadWritePaths=/var/lib/softnix-log-agent
+ReadWritePaths=/var/lib/softnix-log-agent /etc/softnix-log-agent
 LimitNOFILE=65536
 MemoryMax=512M
 
