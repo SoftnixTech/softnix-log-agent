@@ -482,11 +482,11 @@ agent จะต่อท้าย `.sig` เข้ากับค่านี้
 state ของ web server
 
 `check_url` ยังเปิดใช้งานจุดที่สาม: `softnix-log-agent upgrade` โดยไม่มี `--from`
-จะดาวน์โหลดและติดตั้งสิ่งประดิษฐ์ที่ verified ผ่าน HTTPS — เป็นจุดเดียวระหว่าง
+จะดาวน์โหลดและติดตั้ง artifact ที่ผ่านการตรวจสอบแล้วผ่าน HTTPS — เป็นจุดเดียวระหว่าง
 สามจุดนี้ที่แก้ไขสิ่งต่าง ๆ บนดิสก์จริง ๆ จุดที่เป็น read-only สองจุด
 (`upgrade --check` และ `GET /api/update/status`) ไม่ทำแบบนั้น สำหรับ
 deployment ในเครือข่ายที่มีข้อจำกัด ซึ่งไม่สามารถเข้าไปในเครือข่ายได้
-`upgrade --from <local-artifact>` จะติดตั้งสิ่งประดิษฐ์ที่ดาวน์โหลดลงมาแล้วแบบ
+`upgrade --from <local-artifact>` จะติดตั้ง artifact ที่ดาวน์โหลดลงมาแล้วแบบ
 offline แทน
 
 ```yaml

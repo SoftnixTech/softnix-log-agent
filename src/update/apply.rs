@@ -27,6 +27,17 @@ const CURRENT_ARCH: &str = std::env::consts::ARCH;
 // redefined under another name.
 const CURRENT_PLATFORM_FOR_FETCH: &str = std::env::consts::OS;
 
+/// Maximum plausible size of a release bundle (tarball or update-zip) —
+/// this project's binary plus a small MSI/manifest/signature overhead
+/// (the actual release binary is roughly 5 MB as of this writing). Exists
+/// purely to bound memory against a malicious/broken server; it is NOT a
+/// trust decision and NOT derived from the manifest, because
+/// `artifact.size` describes a DIFFERENT file (see the doc comment on
+/// `fetch_manifest_and_artifact` for why). The real, authoritative
+/// verification of what gets downloaded happens independently, moments
+/// later, inside `apply_from_local`/`self_relaunch_and_apply`.
+const MAX_BUNDLE_DOWNLOAD_BYTES: u64 = 100 * 1024 * 1024;
+
 /// Runs the staged binary out-of-band, twice, *before* it ever replaces
 /// anything live:
 ///   1. `<staged> --version` — proves it can even load on this host's
@@ -185,14 +196,36 @@ pub fn apply_from_local(
 
 /// Fetches `<check_url>` and `<check_url>.sig`, verifies and freshness-
 /// checks the manifest (Phase 0's functions, unchanged), resolves the
-/// artifact matching this host's platform/arch, downloads it (capped at
-/// the manifest's own declared size) into `dest_dir`, and verifies its
-/// hash. Returns the downloaded file's path — ready to hand to
-/// `apply_from_local` exactly like a `--from` path. Does not apply
-/// anything and does not touch the watermark: recording the watermark
-/// stays the job of whichever apply function actually succeeds, so a
-/// fetch that downloads fine but then fails to apply doesn't fool the
-/// anti-replay check into thinking it succeeded.
+/// artifact matching this host's platform/arch, and downloads the release
+/// bundle it points at (the `.tar.gz`/`-update.zip`, not the inner payload
+/// — see the note below) into `dest_dir`. Returns the downloaded file's
+/// path — ready to hand to `apply_from_local` exactly like a `--from`
+/// path. Does not apply anything and does not touch the watermark:
+/// recording the watermark stays the job of whichever apply function
+/// actually succeeds, so a fetch that downloads fine but then fails to
+/// apply doesn't fool the anti-replay check into thinking it succeeded.
+///
+/// Deliberately does NOT hash-verify or size-cap this download against
+/// `artifact.sha256`/`artifact.size`. Those fields describe a DIFFERENT
+/// file than the one downloaded here: `.github/workflows/release.yml`'s
+/// "Build the update manifest" step computes them from the INNER
+/// payload — the raw extracted binary on Linux (`LINUX_SHA`/`LINUX_SIZE`),
+/// the bare `.msi` on Windows (`MSI_SHA`/`MSI_SIZE`) — while
+/// `artifact.url`/`filename` point at the OUTER bundle this function
+/// downloads. That mismatch is structural, not a pipeline bug: the
+/// manifest is signed and bundled *inside* the tarball/zip after being
+/// hashed, so it can never describe its own container's hash (a
+/// chicken-and-egg problem). Verifying the downloaded bundle's bytes
+/// against `artifact.sha256` here would therefore always fail, and
+/// capping the download at `artifact.size` would reject any real release
+/// (the bundle is always bigger than the inner payload alone). Instead
+/// this download is capped at the fixed, generous
+/// `MAX_BUNDLE_DOWNLOAD_BYTES` — a memory bound against a
+/// malicious/broken server, not a trust decision — and the real,
+/// authoritative verification happens moments later, once this bundle is
+/// extracted: `apply_from_local` hash-verifies the INNER extracted binary
+/// against the manifest's INNER-payload hash (comparing like with like),
+/// and the Windows apply path does the same for the `.msi`.
 pub async fn fetch_manifest_and_artifact(
     check_url: &str,
     data_dir: &Path,
@@ -218,21 +251,33 @@ pub async fn fetch_manifest_and_artifact(
             format!("manifest has no artifact for {CURRENT_PLATFORM_FOR_FETCH}/{CURRENT_ARCH}")
         })?;
 
-    let bytes = fetch_url(&artifact.url, artifact.size).await?;
-    write_and_verify_artifact(artifact, &bytes, dest_dir)
+    // A total-download timeout, not just fetch_url's own internal
+    // connect+headers-only one — fetch_url's own doc comment in
+    // src/update/fetch.rs explicitly warns that reusing it for a large,
+    // slow download "must not assume 'never hangs' without revisiting
+    // this." A release bundle can be tens of MB, unlike the tiny
+    // manifest/signature fetches this same function already makes above.
+    let bytes = tokio::time::timeout(
+        std::time::Duration::from_secs(300),
+        fetch_url(&artifact.url, MAX_BUNDLE_DOWNLOAD_BYTES),
+    )
+    .await
+    .context("artifact download timed out after 300s")??;
+    write_downloaded_artifact(artifact, &bytes, dest_dir)
 }
 
-/// Writes a downloaded artifact's bytes to `<dest_dir>/<artifact.filename>`
-/// and hash-verifies the written file against `artifact.sha256`. Split out
-/// of `fetch_manifest_and_artifact` so this tail — the part of that function
-/// that doesn't need any network I/O — is directly unit-testable without
-/// spinning up an HTTP server: the fetch/resolve half is exercised by
-/// `fetch_manifest_and_artifact_downloads_and_verifies_the_matching_platform`
-/// below (which only reaches the HTTPS-enforcement gate, not this far), and
-/// this write+verify half is exercised directly by
-/// `write_and_verify_artifact_accepts_a_matching_hash` and
-/// `write_and_verify_artifact_rejects_a_mismatched_hash`.
-fn write_and_verify_artifact(
+/// Writes a downloaded artifact bundle's bytes to
+/// `<dest_dir>/<artifact.filename>`. Split out of `fetch_manifest_and_artifact`
+/// so this tail — the part of that function that doesn't need any network
+/// I/O — is directly unit-testable without spinning up an HTTP server, by
+/// `write_downloaded_artifact_writes_bytes_to_the_artifacts_filename` below.
+///
+/// Deliberately does NOT hash-verify against `artifact.sha256` — see the
+/// doc comment on `fetch_manifest_and_artifact` for why that field
+/// describes a different file than the one written here. Real
+/// verification of what's downloaded happens later, after extraction, in
+/// `apply_from_local`/the Windows apply path.
+fn write_downloaded_artifact(
     artifact: &Artifact,
     bytes: &[u8],
     dest_dir: &Path,
@@ -244,7 +289,6 @@ fn write_and_verify_artifact(
             dest_path.display()
         )
     })?;
-    verify_artifact_hash(&dest_path, &artifact.sha256)?;
     Ok(dest_path)
 }
 
@@ -634,51 +678,44 @@ mod tests {
         }
     }
 
+    // Deliberately does NOT hash-verify — `write_downloaded_artifact`
+    // doesn't hash-verify at all any more (see the doc comments on it and
+    // on `fetch_manifest_and_artifact` for why: `artifact.sha256` describes
+    // the INNER payload the release pipeline hashes, not the OUTER bundle
+    // this function writes to disk, so comparing the two would be
+    // comparing unrelated files). This test's job is narrowed to match:
+    // does the write itself land the right bytes at the right path?
     #[test]
-    fn write_and_verify_artifact_accepts_a_matching_hash() {
+    fn write_downloaded_artifact_writes_bytes_to_the_artifacts_filename() {
         let dest_dir = tempfile::tempdir().unwrap();
         let bytes = b"pretend release bundle contents";
-        let sha256 = {
-            let mut ctx = ring::digest::Context::new(&ring::digest::SHA256);
-            ctx.update(bytes);
-            hex::encode(ctx.finish().as_ref())
-        };
-        let artifact = sample_artifact(sha256, bytes.len() as u64);
+        // sha256 here is never read by `write_downloaded_artifact` — any
+        // value works, which is itself part of what this test is proving.
+        let artifact = sample_artifact("unused-in-this-path", bytes.len() as u64);
 
-        let dest_path = write_and_verify_artifact(&artifact, bytes, dest_dir.path()).unwrap();
+        let dest_path = write_downloaded_artifact(&artifact, bytes, dest_dir.path()).unwrap();
 
         assert_eq!(dest_path, dest_dir.path().join("a.bin"));
         assert_eq!(std::fs::read(&dest_path).unwrap(), bytes);
     }
 
-    #[test]
-    fn write_and_verify_artifact_rejects_a_mismatched_hash() {
-        let dest_dir = tempfile::tempdir().unwrap();
-        let bytes = b"pretend release bundle contents";
-        let artifact = sample_artifact("0".repeat(64), bytes.len() as u64);
-
-        let err = write_and_verify_artifact(&artifact, bytes, dest_dir.path()).unwrap_err();
-        assert!(err.to_string().contains("hash mismatch"));
-        // The write itself still happened — `write_and_verify_artifact` only
-        // fails the *verification*, it doesn't clean up after itself; that's
-        // fine because a caller only ever trusts the returned `Ok` path.
-        assert!(dest_dir.path().join("a.bin").exists());
-    }
-
-    // Now that the write+hash-verify tail has its own direct tests above,
-    // this test's job narrows to: does `fetch_manifest_and_artifact` reject
-    // a non-`https://` `check_url` before doing anything else? It does not
-    // reach artifact resolution, download, or hash verification — those are
-    // covered by `write_and_verify_artifact_accepts_a_matching_hash` /
-    // `_rejects_a_mismatched_hash` above — nor does it reach signature
-    // verification (this build's `RELEASE_PUBLIC_KEYS` is empty regardless,
-    // per every other manifest-related test in this codebase). The local
-    // hyper server below is still spun up and still never contacted: kept
-    // as-is (rather than switched to a real HTTPS test server) because
-    // proving the HTTPS gate specifically needs a plain-HTTP URL to reject,
-    // and Phase 2's `fetch.rs` tests already cover `require_https` in
-    // isolation — this is only asserting that `fetch_manifest_and_artifact`
-    // actually calls into that gate for its own `check_url` argument.
+    // This test's job: does `fetch_manifest_and_artifact` reject a
+    // non-`https://` `check_url` before doing anything else? It does not
+    // reach artifact resolution, download, or the write-to-disk tail —
+    // that's covered by `write_downloaded_artifact_writes_bytes_to_the_artifacts_filename`
+    // above — nor does it reach signature verification (this build's
+    // `RELEASE_PUBLIC_KEYS` is empty regardless, per every other
+    // manifest-related test in this codebase). The local hyper server
+    // below is still spun up and still never contacted: kept as-is (rather
+    // than switched to a real HTTPS test server) because proving the HTTPS
+    // gate specifically needs a plain-HTTP URL to reject, and Phase 2's
+    // `fetch.rs` tests already cover `require_https` in isolation — this is
+    // only asserting that `fetch_manifest_and_artifact` actually calls into
+    // that gate for its own `check_url` argument. (This function no longer
+    // hash-verifies its download at all — see the doc comment on
+    // `fetch_manifest_and_artifact` — so "verifies" in this test's name
+    // below refers only to manifest signature/freshness verification, which
+    // this test also never reaches.)
     #[tokio::test]
     async fn fetch_manifest_and_artifact_downloads_and_verifies_the_matching_platform() {
         use std::convert::Infallible;

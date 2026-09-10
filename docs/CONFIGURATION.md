@@ -486,7 +486,7 @@ server's state.
 `--from` fetches the verified artifact over HTTPS and applies it — the only
 surface among the three that actually changes anything on disk. The two
 read-only surfaces (`upgrade --check` and `GET /api/update/status`) never do.
-For restricted-network deployments that cannot reach the network, `upgrade --from
+For air-gapped or restricted-network deployments, `upgrade --from
 <local-artifact>` applies a pre-downloaded artifact offline instead.
 
 ```yaml

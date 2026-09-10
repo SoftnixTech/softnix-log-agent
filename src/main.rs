@@ -191,10 +191,18 @@ fn upgrade_cmd(from: &Path, allow_downgrade: bool, config_path: &Path) -> Result
 /// `--from`. Linux-only; on Windows this bails with a pointer to the manual
 /// runbook, since automated MSI rollback isn't implemented yet.
 fn upgrade_rollback_cmd(config_path: &Path) -> Result<()> {
-    let (cfg, _warnings) = config::load(config_path).context("cannot load config for upgrade")?;
-
+    // `cfg` itself is bound only inside the non-Windows arm below, not
+    // unconditionally above it, for the same reason `live_target` already
+    // was: a final review found that loading `cfg` unconditionally here is
+    // an unused-variable *compile error* under this project's CI (`-D
+    // warnings`) on the Windows arm, since the Windows arm never reads it —
+    // it just bails, pointing at the manual runbook. `let _ = config_path;`
+    // below exists for the same reason: on a real Windows build only this
+    // arm survives cfg-stripping, so `config_path` would otherwise be an
+    // unused function parameter under the same lint.
     #[cfg(windows)]
     {
+        let _ = config_path;
         bail!("Windows rollback is not yet automated by this CLI; see docs/RELEASE-SIGNING.md's Windows rollback runbook (msiexec /x then /i)");
     }
 
@@ -207,6 +215,8 @@ fn upgrade_rollback_cmd(config_path: &Path) -> Result<()> {
     // same bug.
     #[cfg(not(windows))]
     {
+        let (cfg, _warnings) =
+            config::load(config_path).context("cannot load config for upgrade")?;
         let live_target =
             std::env::current_exe().context("cannot resolve the running binary's path")?;
         softnix_log_agent::update::apply::rollback_from_local(&live_target, &cfg.agent.data_dir)
