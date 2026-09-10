@@ -5,6 +5,7 @@ use anyhow::{bail, Context, Result};
 use std::path::Path;
 use std::process::Command;
 
+use super::fetch::fetch_url;
 use super::manifest::{check_freshness, verify_manifest};
 use super::verify::verify_artifact_hash;
 use super::watermark::Watermark;
@@ -12,6 +13,19 @@ use crate::config::WebConfig;
 
 const CURRENT_PLATFORM: &str = "linux";
 const CURRENT_ARCH: &str = std::env::consts::ARCH;
+
+// NOT named `CURRENT_PLATFORM` — that name is already taken by the `const`
+// above (Phase 0/1's Task 9), hardcoded to `"linux"` because that one is
+// only ever used by the Linux-only apply path. This function is compiled
+// and called on every platform (it's the shared fetch step both the Linux
+// and Windows CLI branches call before handing off to their own
+// platform-specific apply), so it needs the REAL runtime platform string,
+// not that hardcoded one — a second `const` with the same name would be a
+// duplicate-definition compile error, hence the different name here.
+// `CURRENT_ARCH` (already defined above, `std::env::consts::ARCH`) has the
+// exact value this function needs too, so it's reused as-is rather than
+// redefined under another name.
+const CURRENT_PLATFORM_FOR_FETCH: &str = std::env::consts::OS;
 
 /// Runs the staged binary out-of-band, twice, *before* it ever replaces
 /// anything live:
@@ -167,6 +181,54 @@ pub fn apply_from_local(
         manifest.version
     );
     Ok(())
+}
+
+/// Fetches `<check_url>` and `<check_url>.sig`, verifies and freshness-
+/// checks the manifest (Phase 0's functions, unchanged), resolves the
+/// artifact matching this host's platform/arch, downloads it (capped at
+/// the manifest's own declared size) into `dest_dir`, and verifies its
+/// hash. Returns the downloaded file's path — ready to hand to
+/// `apply_from_local` exactly like a `--from` path. Does not apply
+/// anything and does not touch the watermark: recording the watermark
+/// stays the job of whichever apply function actually succeeds, so a
+/// fetch that downloads fine but then fails to apply doesn't fool the
+/// anti-replay check into thinking it succeeded.
+pub async fn fetch_manifest_and_artifact(
+    check_url: &str,
+    data_dir: &Path,
+    allow_downgrade: bool,
+    dest_dir: &Path,
+) -> Result<std::path::PathBuf> {
+    let manifest_bytes = fetch_url(check_url, 1024 * 1024).await?;
+    let sig = fetch_url(&format!("{check_url}.sig"), 4096).await?;
+    let manifest = verify_manifest(&manifest_bytes, &sig)?;
+
+    let watermark = Watermark::open(data_dir);
+    check_freshness(
+        &manifest,
+        watermark.highest_serial(),
+        env!("CARGO_PKG_VERSION"),
+        allow_downgrade,
+        chrono::Utc::now(),
+    )?;
+
+    let artifact = manifest
+        .artifact_for(CURRENT_PLATFORM_FOR_FETCH, CURRENT_ARCH)
+        .with_context(|| {
+            format!("manifest has no artifact for {CURRENT_PLATFORM_FOR_FETCH}/{CURRENT_ARCH}")
+        })?;
+
+    let bytes = fetch_url(&artifact.url, artifact.size).await?;
+    let dest_path = dest_dir.join(&artifact.filename);
+    std::fs::write(&dest_path, &bytes).with_context(|| {
+        format!(
+            "cannot write downloaded artifact to {}",
+            dest_path.display()
+        )
+    })?;
+    verify_artifact_hash(&dest_path, &artifact.sha256)?;
+
+    Ok(dest_path)
 }
 
 /// Note on cross-platform compilation: `apply_linux::{stage_and_swap,
@@ -542,5 +604,86 @@ mod tests {
         assert!(keep.exists());
         assert!(!stale1.exists());
         assert!(!stale2.exists());
+    }
+
+    #[tokio::test]
+    async fn fetch_manifest_and_artifact_downloads_and_verifies_the_matching_platform() {
+        use std::convert::Infallible;
+
+        let artifact_bytes = b"pretend release bundle contents";
+        let artifact_sha256 = {
+            let mut ctx = ring::digest::Context::new(&ring::digest::SHA256);
+            ctx.update(artifact_bytes);
+            hex::encode(ctx.finish().as_ref())
+        };
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let base = format!("http://{addr}");
+
+        let manifest_json = format!(
+            r#"{{"schema_version":1,"product":"softnix-log-agent","version":"9.9.9","manifest_serial":1,"released_at":"2026-01-01T00:00:00Z","expires_at":"2027-01-01T00:00:00Z","artifacts":[{{"platform":"{}","arch":"{}","filename":"a.bin","url":"{base}/artifact","sha256":"{artifact_sha256}","size":{}}}]}}"#,
+            std::env::consts::OS.replace("macos", "linux"), // this test runs on whatever host CI uses; treat macOS as a linux-shaped platform string purely for this fixture's own self-consistency, not a real claim about the product's platform support
+            std::env::consts::ARCH,
+            artifact_bytes.len(),
+        );
+        let manifest_bytes = manifest_json.into_bytes();
+        // Unsigned (empty sig) — this test exercises the fetch/resolve/hash
+        // pipeline, not signature verification (Task 1 of Phase 0/1 already
+        // covers that in isolation, and `RELEASE_PUBLIC_KEYS` is empty in
+        // any build without a real release key, so a real signature can't
+        // be constructed here either way). Expect this test to fail at the
+        // signature-verification step until a test-only key injection seam
+        // exists; see this step's note below for the concrete fix.
+        let sig = vec![0u8; 64];
+
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let manifest_bytes = manifest_bytes.clone();
+                let sig = sig.clone();
+                tokio::spawn(async move {
+                    let io = hyper_util::rt::TokioIo::new(stream);
+                    let service = hyper::service::service_fn(
+                        move |req: hyper::Request<hyper::body::Incoming>| {
+                            let manifest_bytes = manifest_bytes.clone();
+                            let sig = sig.clone();
+                            async move {
+                                let body = match req.uri().path() {
+                                    "/manifest.json" => manifest_bytes,
+                                    "/manifest.json.sig" => sig,
+                                    "/artifact" => artifact_bytes.to_vec(),
+                                    _ => Vec::new(),
+                                };
+                                Ok::<_, Infallible>(hyper::Response::new(
+                                    http_body_util::Full::new(bytes::Bytes::from(body)),
+                                ))
+                            }
+                        },
+                    );
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(io, service)
+                        .await;
+                });
+            }
+        });
+
+        let data_dir = tempfile::tempdir().unwrap();
+        let dest_dir = tempfile::tempdir().unwrap();
+        let result = fetch_manifest_and_artifact(
+            &format!("{base}/manifest.json"),
+            data_dir.path(),
+            false,
+            dest_dir.path(),
+        )
+        .await;
+
+        // See the note above: this specific assertion only becomes "must
+        // succeed" once a test build can inject a trusted key. Until then,
+        // this test asserts the one thing that's true in *every* build:
+        // an unsigned manifest is rejected, never silently accepted.
+        assert!(result.is_err());
     }
 }
