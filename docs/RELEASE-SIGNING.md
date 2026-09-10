@@ -48,10 +48,32 @@ On a real Windows VM, with a prior version already installed as a service:
 
 1. Install the old version: `msiexec /i softnix-log-agent-0.1.5-x64.msi /qn`
 2. Confirm it's running: `Get-Service softnix-log-agent`
-3. Place the new version's `.msi` (plus its `manifest.json`/`manifest.json.sig`, in the same folder) somewhere local.
-4. Run: `softnix-log-agent upgrade --from <path-to-new.msi> --config <path>`
+3. Place the new version's `softnix-log-agent-<ver>-windows-x86_64-update.zip` release asset somewhere local — this is the bundle `self_relaunch_and_apply` actually expects (`.msi` + `manifest.json` + `manifest.json.sig` all inside one zip, at the zip's root). A bare `.msi` with loose `manifest.json`/`manifest.json.sig` files next to it does NOT work: `--from`'s very first step is `Expand-Archive` on whatever path it's given, which requires a real zip.
+4. Run: `softnix-log-agent upgrade --from <path-to-update.zip> --config <path>`
 5. Confirm the version bumped: `curl http://127.0.0.1:8080/api/about` (or check `Get-Service` restarted recently)
 6. Confirm `agent.yaml` under `%ProgramData%\Softnix\LogAgent\` still has your edits (the `DefaultConfig` component is `Permanent="yes"` — it should survive; if it doesn't, that's a real bug, not an acceptable trade-off, and blocks calling Windows upgrade production-ready).
 7. Manually test rollback: `msiexec /x <new-product-code> /qn` then `msiexec /i <old.msi> /qn`, then repeat step 6 to confirm config still survived a round trip.
 
 Until this has been run and confirmed at least once on a real Windows host, treat Windows upgrade support as unverified even though the code compiles.
+
+## Recovering from a failed Windows install
+
+`self_relaunch_and_apply` (`src/update/apply_windows.rs`) records the
+anti-replay watermark *before* spawning the relaunched copy that actually
+runs `msiexec` — it hands off to that copy and exits, so unlike the Linux
+path it has no way to wait for the install to finish and record the
+watermark only on success. If that `msiexec` step then fails (or the
+service never comes back to `Running`), the watermark has already
+advanced, so re-running `upgrade --from <same zip>` is permanently rejected
+as a replay ("manifest_serial is not newer than the last accepted serial")
+for that release. `--allow-downgrade` does **not** help here — it only
+relaxes the version comparison, not the serial/replay check.
+
+To retry the same release after such a failure: delete (or otherwise reset)
+the watermark file the agent's data directory —
+`<data_dir>\update-watermark.json` (see `src/update/watermark.rs`;
+under the default Windows packaging this is
+`C:\ProgramData\Softnix\LogAgent\update-watermark.json`) — before
+re-running `upgrade --from` with the same artifact. Confirm the failed
+install is actually in a known-good state first (step 7 above) before
+retrying.
