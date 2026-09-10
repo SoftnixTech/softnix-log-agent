@@ -234,27 +234,28 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           # `update.check_url` in agent.yaml must be one fixed URL (the agent's
-          # fetch client deliberately does not follow HTTP redirects, so
-          # GitHub's own `releases/latest/download/...` alias — a 302 — does
-          # not work here). This mirrors manifest.json/.sig to a permanent,
-          # non-versioned release tag so operators can point check_url at
-          # one URL that always serves whatever was most recently released,
-          # instead of hand-editing the version number into their config on
-          # every release. `--clobber` overwrites the assets in place; the
-          # release itself is created once (by the first run of this step)
-          # and every later run just refreshes its two files. Marked
-          # `--prerelease` so it never competes with a real version tag for
-          # the repo's "Latest release" badge.
-          if gh release view latest-manifest >/dev/null 2>&1; then
-            gh release upload latest-manifest \
-              artifacts/manifest.json \
-              artifacts/manifest.json.sig \
-              --clobber
-          else
-            gh release create latest-manifest \
-              artifacts/manifest.json \
-              artifacts/manifest.json.sig \
-              --title "Update feed (always current — not a real release)" \
-              --notes "Mirrors the manifest.json/.sig of whatever was most recently released, at a fixed URL, so \`update.check_url\` never needs hand-editing. Not a downloadable release on its own — see the versioned tag (e.g. \`${GITHUB_REF_NAME}\`) this manifest currently points at for the actual artifacts." \
-              --prerelease
-          fi
+          # fetch client deliberately does not follow HTTP redirects). This
+          # rules out GitHub Release asset URLs entirely, not just the
+          # `releases/latest/download/...` alias: EVERY `releases/download/...`
+          # URL — pinned version or not — 302s to a signed, time-limited
+          # release-assets.githubusercontent.com blob URL (confirmed directly:
+          # `curl -sI` on a real, specific-tag release asset URL, not just the
+          # "latest" one). A first version of this step tried publishing to a
+          # second GitHub Release tag for exactly this reason and hit the same
+          # wall. `raw.githubusercontent.com`, which serves a file's content
+          # directly from a git ref with a real `200` and no redirect, does not
+          # have this problem — so this step force-pushes manifest.json/.sig to
+          # a dedicated orphan branch instead, in an isolated clone (never
+          # touching this job's own checkout), and operators point check_url at
+          # that branch's raw content URL.
+          rm -rf /tmp/manifest-feed
+          git clone --depth 1 --no-checkout "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git" /tmp/manifest-feed
+          cd /tmp/manifest-feed
+          git checkout --orphan latest-manifest
+          git rm -rf . >/dev/null 2>&1 || true
+          cp "$GITHUB_WORKSPACE/artifacts/manifest.json" "$GITHUB_WORKSPACE/artifacts/manifest.json.sig" .
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add manifest.json manifest.json.sig
+          git commit -m "manifest for ${GITHUB_REF_NAME}"
+          git push --force origin latest-manifest

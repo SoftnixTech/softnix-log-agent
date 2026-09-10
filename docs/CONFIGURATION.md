@@ -490,19 +490,23 @@ For air-gapped or restricted-network deployments, `upgrade --from
 <local-artifact>` applies a pre-downloaded artifact offline instead.
 
 `check_url` must be one fixed URL — the agent's fetch client deliberately
-does not follow HTTP redirects (see `src/update/fetch.rs`), so a URL like
-GitHub's own `releases/latest/download/manifest.json` alias (a `302`) will
-not work; pointing `check_url` at a specific version's manifest means
-re-editing this config on every release. To avoid that, releases also
-publish `manifest.json`/`.sig` to a permanent, non-versioned release tag
-(`latest-manifest`) whose two files the release pipeline overwrites on every
-release — point `check_url` at that tag instead of a specific version, and
-it always serves whatever was most recently released with no config changes
-needed:
+does not follow HTTP redirects (see `src/update/fetch.rs`). This rules out
+GitHub Release asset URLs entirely: *every* `releases/download/...` URL,
+pinned to a specific version or not, `302`s to a signed,
+`release-assets.githubusercontent.com` blob URL — GitHub's own
+`releases/latest/download/...` alias has the exact same problem, it is not
+special-cased here. Pointing `check_url` at a specific version's Release
+asset would not work at all, redirect or not.
+
+To avoid that, the release pipeline instead force-pushes `manifest.json`/
+`.sig` to a dedicated orphan branch (`latest-manifest`) on every release,
+and operators point `check_url` at that branch's **raw** content URL —
+`raw.githubusercontent.com` serves a file's content directly with a `200`,
+no redirect involved:
 
 ```yaml
 update:
-  check_url: https://github.com/SoftnixTech/softnix-log-agent/releases/download/latest-manifest/manifest.json
+  check_url: https://raw.githubusercontent.com/SoftnixTech/softnix-log-agent/latest-manifest/manifest.json
 ```
 
 A self-hosted mirror works the same way — anything serving `manifest.json` and
