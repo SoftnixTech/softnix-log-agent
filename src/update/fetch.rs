@@ -23,7 +23,13 @@ pub fn require_https(url: &str) -> Result<()> {
 /// returns its body, refusing to read past `max_bytes` — a malicious or
 /// broken server sending an unbounded response must not be allowed to
 /// exhaust memory on a host that may be running this as root/LocalSystem.
-/// 10s connect+request timeout: this must never hang the CLI indefinitely.
+/// 10s timeout on connect+headers only — a server that responds promptly
+/// then drip-feeds the body slowly can still stall this call indefinitely;
+/// the byte cap bounds memory in that case, not time. Acceptable for this
+/// plan's own callers (a small, capped manifest/signature fetch), but
+/// anything that reuses this function for a large, slow download (e.g. a
+/// full release artifact) must not assume "never hangs" without revisiting
+/// this.
 pub async fn fetch_url(url: &str, max_bytes: u64) -> Result<Vec<u8>> {
     require_https(url)?;
 
