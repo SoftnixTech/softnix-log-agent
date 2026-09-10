@@ -125,6 +125,7 @@ jobs:
   publish:
     needs: [build-linux, build-windows-msi]
     runs-on: ubuntu-latest
+    environment: release-signing
     permissions:
       contents: write
     steps:
@@ -136,10 +137,82 @@ jobs:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           path: artifacts
+      - name: Build the update manifest (hashes the inner payloads, not the outer bundles)
+        run: |
+          cd artifacts
+          VERSION="${GITHUB_REF_NAME#v}"
+          LINUX_TARBALL=$(basename linux-release/*.tar.gz)
+          MSI_FILE=$(basename windows-msi/*.msi)
+
+          # Extract just the binary to hash the inner payload, per the
+          # design note above — do not hash the tarball itself.
+          mkdir -p _linux_extract
+          tar xzf "linux-release/$LINUX_TARBALL" -C _linux_extract
+          LINUX_BINARY=$(find _linux_extract -type f -name softnix-log-agent)
+          LINUX_SHA=$(sha256sum "$LINUX_BINARY" | cut -d' ' -f1)
+          LINUX_SIZE=$(stat -c%s "$LINUX_BINARY")
+
+          MSI_SHA=$(sha256sum "windows-msi/$MSI_FILE" | cut -d' ' -f1)
+          MSI_SIZE=$(stat -c%s "windows-msi/$MSI_FILE")
+
+          # Both bundle filenames are chosen here, before either bundle is
+          # actually built (next step) — deterministic names so this
+          # manifest's `url` fields match what gets uploaded later in this
+          # same job.
+          LINUX_BUNDLE="softnix-log-agent-$VERSION-linux-x86_64.tar.gz"
+          WINDOWS_BUNDLE="softnix-log-agent-$VERSION-windows-x86_64-update.zip"
+
+          cat > manifest.json <<JSON
+          {
+            "schema_version": 1,
+            "product": "softnix-log-agent",
+            "version": "$VERSION",
+            "manifest_serial": ${{ github.run_number }},
+            "released_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "expires_at": "$(date -u -d '+2 years' +%Y-%m-%dT%H:%M:%SZ)",
+            "artifacts": [
+              {"platform": "linux", "arch": "x86_64", "filename": "$LINUX_BUNDLE", "url": "https://github.com/${{ github.repository }}/releases/download/${GITHUB_REF_NAME}/$LINUX_BUNDLE", "sha256": "$LINUX_SHA", "size": $LINUX_SIZE},
+              {"platform": "windows", "arch": "x86_64", "filename": "$WINDOWS_BUNDLE", "url": "https://github.com/${{ github.repository }}/releases/download/${GITHUB_REF_NAME}/$WINDOWS_BUNDLE", "sha256": "$MSI_SHA", "size": $MSI_SIZE}
+            ]
+          }
+          JSON
+          cat manifest.json
+      - name: Sign the manifest
+        env:
+          RELEASE_SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}
+        run: |
+          cd artifacts
+          echo "$RELEASE_SIGNING_KEY" > /tmp/release-signing-key.pem
+          openssl pkeyutl -sign -inkey /tmp/release-signing-key.pem -rawin -in manifest.json -out manifest.json.sig
+          shred -u /tmp/release-signing-key.pem
+      - name: Bundle the manifest into each platform's self-update artifact
+        run: |
+          cd artifacts
+          VERSION="${GITHUB_REF_NAME#v}"
+          LINUX_TARBALL=$(basename linux-release/*.tar.gz)
+          MSI_FILE=$(basename windows-msi/*.msi)
+
+          # Linux: add manifest.json/.sig into the already-extracted
+          # staging dir from the previous step, re-tar over the same
+          # filename — this one file keeps serving both a normal manual
+          # install and `upgrade --from`.
+          STAGE_DIR=$(find _linux_extract -maxdepth 1 -mindepth 1 -type d)
+          cp manifest.json manifest.json.sig "$STAGE_DIR/"
+          rm -f "linux-release/$LINUX_TARBALL"
+          tar czf "linux-release/$LINUX_TARBALL" -C _linux_extract "$(basename "$STAGE_DIR")"
+
+          # Windows: no existing single-file container to add to, so build
+          # a new one specifically for updates. The bare .msi in
+          # windows-msi/ is left untouched and still published separately
+          # for ordinary manual installs.
+          WINDOWS_BUNDLE="softnix-log-agent-$VERSION-windows-x86_64-update.zip"
+          mkdir -p _win_bundle
+          cp "windows-msi/$MSI_FILE" manifest.json manifest.json.sig _win_bundle/
+          (cd _win_bundle && zip -j "../windows-msi/$WINDOWS_BUNDLE" "$MSI_FILE" manifest.json manifest.json.sig)
       - name: Checksum the artifacts
         run: |
           cd artifacts
-          sha256sum linux-release/*.tar.gz windows-msi/*.msi \
+          sha256sum linux-release/*.tar.gz windows-msi/*.msi windows-msi/*-update.zip \
             | sed 's#linux-release/##; s#windows-msi/##' > SHA256SUMS
           cat SHA256SUMS
       - name: Create GitHub release
@@ -149,6 +222,9 @@ jobs:
           gh release create "${GITHUB_REF_NAME}" \
             artifacts/linux-release/*.tar.gz \
             artifacts/windows-msi/*.msi \
+            artifacts/windows-msi/*-update.zip \
             artifacts/SHA256SUMS \
+            artifacts/manifest.json \
+            artifacts/manifest.json.sig \
             --title "${GITHUB_REF_NAME}" \
             --generate-notes
