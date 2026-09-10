@@ -42,6 +42,19 @@ openssl pkeyutl -sign -inkey release-signing-key.pem -rawin -in manifest.json -o
 (`-rawin`: Ed25519 is PureEdDSA, it signs the message directly — there is
 no digest algorithm to choose, unlike RSA/ECDSA signing.)
 
+## Checking for updates without applying one
+
+`softnix-log-agent upgrade --check` is read-only: it fetches the manifest
+and signature from `update.check_url` (see `CONFIGURATION.md`'s `update`
+section — the flag requires this to be configured, and does nothing if it
+isn't), verifies the signature exactly the way a real `upgrade --from`
+would, and prints whether a newer, acceptable version is available. It
+never downloads an artifact and never applies anything — that still
+requires a separate `upgrade --from <downloaded-artifact>` run. The same
+logic backs the web GUI/API's `GET /api/update/status`, via the shared
+`update::manifest::evaluate_check` function, so the CLI and the GUI always
+agree on whether an update is available.
+
 ## Manually verifying a Windows upgrade (no CI runner for this yet)
 
 On a real Windows VM, with a prior version already installed as a service:

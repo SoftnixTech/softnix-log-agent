@@ -26,6 +26,7 @@ pipeline: { … }      # transform + enrich stages
 buffer:   { … }      # per-destination disk queue
 outputs:  [ … ]      # where logs are sent
 web:      { … }      # management GUI / API
+update:   { … }      # optional self-update check
 ```
 
 ## Environment variables
@@ -462,6 +463,33 @@ web:
   bind: 127.0.0.1
   port: 8080
   # auth_token: replace-with-a-long-random-secret
+```
+
+---
+
+## `update`
+
+Opt-in, read-only self-update check.
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `check_url` | HTTPS URL | unset | Where to fetch the signed update manifest from. Unset by default: a security product must not beacon out unasked, so this agent makes **no** outbound network call related to updates unless an operator explicitly sets this. |
+
+`check_url` must be a bare HTTPS URL with no query string or fragment — the
+agent appends a literal `.sig` to it to fetch the detached signature, so a
+URL containing `?...` would produce a broken `.sig` URL. Changing this value
+requires a full agent restart to take effect: unlike most config, it is not
+covered by `Reload`/`SIGHUP` — it is read once at startup into the web
+server's state.
+
+Setting `check_url` only enables two read-only surfaces: `softnix-log-agent
+upgrade --check` (CLI) and `GET /api/update/status` (web/API). Neither one
+ever downloads or applies an update — see [`RELEASE-SIGNING.md`](RELEASE-SIGNING.md)
+for the actual `upgrade --from`/`upgrade --rollback` apply path.
+
+```yaml
+update:
+  check_url: https://updates.example.com/softnix-log-agent/manifest.json
 ```
 
 ---

@@ -26,6 +26,7 @@ pipeline: { … }      # ขั้น transform + enrich
 buffer:   { … }      # คิวบนดิสก์ต่อปลายทาง
 outputs:  [ … ]      # ส่ง log ไปที่ไหน
 web:      { … }      # GUI / API สำหรับจัดการ
+update:   { … }      # ตรวจสอบอัปเดตด้วยตนเอง (ถามก่อนใช้)
 ```
 
 ## ตัวแปรสภาพแวดล้อม (Environment variables)
@@ -461,6 +462,34 @@ web:
   bind: 127.0.0.1
   port: 8080
   # auth_token: replace-with-a-long-random-secret
+```
+
+---
+
+## `update`
+
+ตรวจสอบอัปเดตแบบไม่บังคับ (opt-in) และไม่แก้ไขอะไร (read-only)
+
+| คีย์ | ชนิด | default | คำอธิบาย |
+|---|---|---|---|
+| `check_url` | HTTPS URL | ไม่ตั้งค่า | URL สำหรับดึง manifest อัปเดตที่เซ็นลายเซ็นแล้ว ค่า default คือไม่ตั้งค่า: ผลิตภัณฑ์ด้านความปลอดภัยต้องไม่ beacon ออกไปเองโดยไม่มีใครสั่ง ดังนั้น agent จะ**ไม่**เรียกเครือข่ายใด ๆ ที่เกี่ยวกับการอัปเดต จนกว่าผู้ดูแลระบบจะตั้งค่านี้เอง |
+
+`check_url` ต้องเป็น HTTPS URL เปล่า ๆ ห้ามมี query string หรือ fragment —
+agent จะต่อท้าย `.sig` เข้ากับค่านี้ตรง ๆ เพื่อดึงลายเซ็นแบบ detached ถ้า URL
+มี `?...` อยู่แล้ว URL ของ `.sig` ที่ได้จะผิดพลาด การเปลี่ยนค่านี้ต้อง
+**restart agent ใหม่ทั้งหมด** จึงจะมีผล — ต่างจาก config ส่วนใหญ่ที่ใช้
+`Reload`/`SIGHUP` ได้ เพราะค่านี้ถูกอ่านครั้งเดียวตอน startup เข้าไปเก็บใน
+state ของ web server
+
+การตั้งค่า `check_url` เปิดใช้งานเพียงสองจุดที่เป็น read-only เท่านั้น:
+`softnix-log-agent upgrade --check` (CLI) และ `GET /api/update/status`
+(web/API) ทั้งสองจุดนี้ไม่ดาวน์โหลดหรือติดตั้งอัปเดตใด ๆ ทั้งสิ้น — ดูขั้นตอน
+การติดตั้งจริง `upgrade --from`/`upgrade --rollback` ได้ที่
+[`RELEASE-SIGNING.md`](RELEASE-SIGNING.md)
+
+```yaml
+update:
+  check_url: https://updates.example.com/softnix-log-agent/manifest.json
 ```
 
 ---

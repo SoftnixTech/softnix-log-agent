@@ -152,6 +152,59 @@ pub fn check_freshness(
     Ok(())
 }
 
+/// Outcome of comparing a fetched manifest against the running version and
+/// this host's freshness state, for a *read-only* checker (CLI `upgrade
+/// --check` / the `/api/update/status` endpoint) — never for a real apply,
+/// which must keep calling `check_freshness` directly with its own
+/// `allow_downgrade`. `check_freshness` alone answers "may this manifest be
+/// applied", not "is this newer" — collapsing those two questions into one
+/// Ok/Err is what caused the CLI to misreport its own steady state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CheckOutcome {
+    /// The manifest's version is not newer than what's running. The normal
+    /// steady state — not an error.
+    UpToDate,
+    /// The manifest's version is newer AND passes `check_freshness` — a
+    /// real update this host can apply.
+    Available { version: String },
+    /// The manifest's version is newer, but `check_freshness` rejects it
+    /// (expired, replayed, or below `min_upgrade_from`) — worth surfacing
+    /// distinctly from both `UpToDate` and `Available` rather than
+    /// collapsing into either.
+    NotAcceptable { version: String, reason: String },
+}
+
+/// Answers "is there a newer, acceptable release?" for a read-only checker.
+/// Only calls `check_freshness` (with `allow_downgrade: false`) when the
+/// manifest's version is actually newer than `running_version` — so the
+/// anti-replay/expiry/min_upgrade_from checks only ever gate the "is this
+/// acceptable to apply" question, never the "is this newer" question. That
+/// separation is what fixes the steady-state bug: a manifest for the same
+/// version currently running (regardless of its `manifest_serial`) is
+/// always `UpToDate`, never wrongly reported as an available update or a
+/// scary replay error.
+pub fn evaluate_check(
+    manifest: &Manifest,
+    highest_seen_serial: u64,
+    running_version: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<CheckOutcome> {
+    let target = parse_version(&manifest.version)?;
+    let running = parse_version(running_version)?;
+    if target <= running {
+        return Ok(CheckOutcome::UpToDate);
+    }
+    match check_freshness(manifest, highest_seen_serial, running_version, false, now) {
+        Ok(()) => Ok(CheckOutcome::Available {
+            version: manifest.version.clone(),
+        }),
+        Err(e) => Ok(CheckOutcome::NotAcceptable {
+            version: manifest.version.clone(),
+            reason: format!("{e:#}"),
+        }),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -320,5 +373,80 @@ mod tests {
         m.min_upgrade_from = Some("0.2.0".into());
         let err = check_freshness(&m, 1, "0.1.5", false, now()).unwrap_err();
         assert!(err.to_string().contains("min_upgrade_from"));
+    }
+
+    // `evaluate_check` table tests. These are the exact scenarios the final
+    // review found `upgrade_check_cmd` and `api_update_status` disagreeing
+    // on (or misreporting) before the fix: same-version-as-running was
+    // wrongly reported as "update available" (watermark 0) or a scary
+    // "possible replay" error (watermark already at that serial), because
+    // `check_freshness`'s Ok/Err was used as a stand-in for "is this newer".
+
+    #[test]
+    fn evaluate_check_same_version_watermark_zero_is_up_to_date() {
+        // The exact case that used to wrongly print
+        // "update available: 0.1.5 -> 0.1.5".
+        let m = manifest_with(7, "0.1.5", "2027-01-01T00:00:00Z");
+        let outcome = evaluate_check(&m, 0, "0.1.5", now()).unwrap();
+        assert_eq!(outcome, CheckOutcome::UpToDate);
+    }
+
+    #[test]
+    fn evaluate_check_same_version_watermark_at_manifest_serial_is_still_up_to_date() {
+        // The exact case that used to wrongly print a scary "possible
+        // replay" message for the normal steady state (a host that
+        // previously applied this exact release).
+        let m = manifest_with(7, "0.1.5", "2027-01-01T00:00:00Z");
+        let outcome = evaluate_check(&m, 7, "0.1.5", now()).unwrap();
+        assert_eq!(outcome, CheckOutcome::UpToDate);
+    }
+
+    #[test]
+    fn evaluate_check_newer_fresh_manifest_is_available() {
+        let m = manifest_with(2, "0.2.0", "2027-01-01T00:00:00Z");
+        let outcome = evaluate_check(&m, 1, "0.1.5", now()).unwrap();
+        assert_eq!(
+            outcome,
+            CheckOutcome::Available {
+                version: "0.2.0".into()
+            }
+        );
+    }
+
+    #[test]
+    fn evaluate_check_newer_but_expired_is_not_acceptable() {
+        let m = manifest_with(2, "0.2.0", "2026-01-01T00:00:00Z");
+        let outcome = evaluate_check(&m, 1, "0.1.5", now()).unwrap();
+        match outcome {
+            CheckOutcome::NotAcceptable { version, reason } => {
+                assert_eq!(version, "0.2.0");
+                assert!(reason.contains("expired"));
+            }
+            other => panic!("expected NotAcceptable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn evaluate_check_newer_but_replayed_serial_is_not_acceptable() {
+        // manifest_serial 1 is not strictly newer than the watermark (1) —
+        // a replay — even though the version itself is genuinely newer.
+        let m = manifest_with(1, "0.2.0", "2027-01-01T00:00:00Z");
+        let outcome = evaluate_check(&m, 1, "0.1.5", now()).unwrap();
+        match outcome {
+            CheckOutcome::NotAcceptable { version, reason } => {
+                assert_eq!(version, "0.2.0");
+                assert!(reason.contains("not newer"));
+            }
+            other => panic!("expected NotAcceptable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn evaluate_check_older_version_than_running_is_up_to_date() {
+        // A stale/misconfigured check_url serving an old manifest is not
+        // something to report as "you need to upgrade".
+        let m = manifest_with(9, "0.1.0", "2027-01-01T00:00:00Z");
+        let outcome = evaluate_check(&m, 1, "0.1.5", now()).unwrap();
+        assert_eq!(outcome, CheckOutcome::UpToDate);
     }
 }

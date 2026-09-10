@@ -51,6 +51,9 @@ pub struct AppState {
     /// `update.check_url` from config, if the operator opted in. `None`
     /// means this endpoint must never make a network call.
     pub check_url: Option<String>,
+    /// `cfg.agent.data_dir` — needed by `/api/update/status` to open the
+    /// same `Watermark` a real `upgrade` would consult, so the two agree.
+    pub data_dir: std::path::PathBuf,
 }
 
 type S = State<Arc<AppState>>;
@@ -525,20 +528,56 @@ async fn api_update_status(State(state): S) -> Response {
 
     match result {
         Ok(manifest) => {
-            let target = manifest.version.clone();
-            // Lexicographic comparison is wrong here (e.g. "0.9" > "0.10"
-            // as strings, incorrectly) — use the real numeric comparator.
-            let newer = crate::update::manifest::parse_version(&manifest.version)
-                .and_then(|t| crate::update::manifest::parse_version(AGENT_VERSION).map(|r| t > r))
-                .unwrap_or(false);
-            Json(json!({
-                "configured": true,
-                "current_version": AGENT_VERSION,
-                "check_error": null,
-                "update_available": newer,
-                "latest_version": target,
-            }))
-            .into_response()
+            // Shared with `upgrade --check` (`evaluate_check` in
+            // `update::manifest`) so the CLI and this endpoint can never
+            // disagree about whether an update is available — see that
+            // function's doc comment for why a bare `parse_version`
+            // comparison (the old approach here) was wrong: it ignored
+            // `check_freshness` entirely (anti-replay/expiry/
+            // min_upgrade_from), so a newer-but-unacceptable manifest would
+            // show as available here while the CLI correctly refused it.
+            let watermark = crate::update::watermark::Watermark::open(&state.data_dir);
+            match crate::update::manifest::evaluate_check(
+                &manifest,
+                watermark.highest_serial(),
+                AGENT_VERSION,
+                chrono::Utc::now(),
+            ) {
+                Ok(crate::update::manifest::CheckOutcome::UpToDate) => Json(json!({
+                    "configured": true,
+                    "current_version": AGENT_VERSION,
+                    "check_error": null,
+                    "update_available": false,
+                    "latest_version": null,
+                }))
+                .into_response(),
+                Ok(crate::update::manifest::CheckOutcome::Available { version }) => Json(json!({
+                    "configured": true,
+                    "current_version": AGENT_VERSION,
+                    "check_error": null,
+                    "update_available": true,
+                    "latest_version": version,
+                }))
+                .into_response(),
+                Ok(crate::update::manifest::CheckOutcome::NotAcceptable { version, reason }) => {
+                    Json(json!({
+                        "configured": true,
+                        "current_version": AGENT_VERSION,
+                        "check_error": reason,
+                        "update_available": false,
+                        "latest_version": version,
+                    }))
+                    .into_response()
+                }
+                Err(e) => Json(json!({
+                    "configured": true,
+                    "current_version": AGENT_VERSION,
+                    "check_error": format!("{e:#}"),
+                    "update_available": null,
+                    "latest_version": null,
+                }))
+                .into_response(),
+            }
         }
         Err(e) => Json(json!({
             "configured": true,
@@ -674,6 +713,7 @@ mod tests {
             allowed_hosts: vec!["127.0.0.1:8080".to_string(), "localhost:8080".to_string()],
             host_check_enabled,
             check_url: None,
+            data_dir: PathBuf::from("/nonexistent/data"),
         })
     }
 

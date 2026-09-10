@@ -365,6 +365,8 @@ async overview(){
   const {body:upd}=await api("/api/update/status");
   const updBanner = upd.configured && upd.update_available
     ? `<div id="updmsg" class="msg ok" role="status">Update available: v${esc(upd.current_version)} &rarr; v${esc(upd.latest_version)}. Run <code>softnix-log-agent upgrade --from &lt;downloaded-artifact&gt;</code> to apply.</div>`
+    : upd.configured && upd.check_error
+    ? `<div id="updmsg" class="msg warn" role="status">Update check failed: ${esc(upd.check_error)}</div>`
     : "";
   $("#hver").textContent="v"+(s.version||"");
   $("#hstate").innerHTML=s.running?'<span class="ok">● running</span>':'<span class="err">● engine stopped</span>';

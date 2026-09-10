@@ -138,3 +138,9 @@ web:
   bind: 127.0.0.1                  # localhost-only by default
   port: 8080
   # auth_token: replace-with-a-long-random-secret   # required when exposing beyond localhost; see docs/CONFIGURATION.md for sourcing it from an env var
+
+# Opt-in, read-only self-update check. Unset by default — a security
+# product must not beacon out unasked. Enables `upgrade --check` and
+# `GET /api/update/status`; neither downloads or applies an update.
+# update:
+#   check_url: https://updates.example.com/softnix-log-agent/manifest.json

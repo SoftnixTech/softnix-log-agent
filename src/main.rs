@@ -214,28 +214,32 @@ fn upgrade_check_cmd(config_path: &Path) -> Result<()> {
         let manifest = softnix_log_agent::update::manifest::verify_manifest(&manifest_bytes, &sig)?;
 
         let watermark = softnix_log_agent::update::watermark::Watermark::open(&cfg.agent.data_dir);
-        match softnix_log_agent::update::manifest::check_freshness(
+        // `evaluate_check` is the single shared function also used by
+        // `/api/update/status` — it separates "is this newer" from "is this
+        // acceptable", which a bare `check_freshness` Ok/Err cannot: a
+        // same-version manifest is always UpToDate regardless of its
+        // manifest_serial (never a false "update available" or a false
+        // "possible replay" for the normal steady state).
+        match softnix_log_agent::update::manifest::evaluate_check(
             &manifest,
             watermark.highest_serial(),
             env!("CARGO_PKG_VERSION"),
-            false,
             chrono::Utc::now(),
-        ) {
-            Ok(()) => println!(
-                "update available: {} -> {} (run `softnix-log-agent upgrade --from <downloaded-artifact>` to apply)",
-                env!("CARGO_PKG_VERSION"),
-                manifest.version
-            ),
-            // check_freshness fails closed for several distinct reasons
-            // (genuinely not newer, expired, anti-replay serial not
-            // increasing, downgrade denied) - surface its actual message
-            // rather than collapsing all of them to "up to date", which
-            // would falsely reassure an operator whose check_url is
-            // serving a stale/expired/misconfigured manifest.
-            Err(e) => println!(
-                "no update applied (running {}): {e:#}",
-                env!("CARGO_PKG_VERSION")
-            ),
+        )? {
+            softnix_log_agent::update::manifest::CheckOutcome::UpToDate => {
+                println!("up to date (running {})", env!("CARGO_PKG_VERSION"))
+            }
+            softnix_log_agent::update::manifest::CheckOutcome::Available { version } => {
+                println!(
+                    "update available: {} -> {version} (run `softnix-log-agent upgrade --from <downloaded-artifact>` to apply)",
+                    env!("CARGO_PKG_VERSION")
+                )
+            }
+            softnix_log_agent::update::manifest::CheckOutcome::NotAcceptable { version, reason } => {
+                println!(
+                    "a newer version ({version}) exists but this host cannot accept it: {reason}"
+                )
+            }
         }
         anyhow::Ok(())
     })
@@ -384,6 +388,7 @@ async fn run_agent(
         allowed_hosts,
         host_check_enabled,
         check_url: cfg.update.check_url.clone(),
+        data_dir: cfg.agent.data_dir.clone(),
     });
 
     // Web server lives outside the engine so it survives reloads.
