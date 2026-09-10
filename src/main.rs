@@ -1,8 +1,8 @@
 //! Softnix Log Agent — lightweight, reliable, cross-platform log collector.
 
-use anyhow::{Context, Result};
 #[cfg(windows)]
 use anyhow::bail;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use engine::Engine;
 use logbuf::{LogBuffer, LogBufferLayer};
@@ -51,11 +51,14 @@ enum Command {
     },
     /// Apply a self-contained update artifact (offline, no network access).
     Upgrade {
-        /// Path to a downloaded/copied release artifact (.tar.gz on Linux).
-        /// Required unless `--rollback` is passed.
+        /// Path to a downloaded/copied release artifact: a `.tar.gz` on
+        /// Linux, or a `*-update.zip` bundle (.msi + manifest + signature
+        /// together) on Windows. Required unless `--rollback` is passed.
         #[arg(long, required_unless_present = "rollback")]
         from: Option<PathBuf>,
-        /// Roll back to the previously retained version instead of applying `--from`.
+        /// Roll back to the previously retained version instead of applying
+        /// `--from`. Linux-only; on Windows, use the manual runbook in
+        /// docs/RELEASE-SIGNING.md instead.
         #[arg(long)]
         rollback: bool,
         /// Allow installing a version older than the one currently running.
@@ -134,9 +137,13 @@ fn validate_cmd(path: &Path) -> Result<()> {
     }
 }
 
-fn upgrade_cmd(from: Option<&Path>, rollback: bool, allow_downgrade: bool, config_path: &Path) -> Result<()> {
+fn upgrade_cmd(
+    from: Option<&Path>,
+    rollback: bool,
+    allow_downgrade: bool,
+    config_path: &Path,
+) -> Result<()> {
     let (cfg, _warnings) = config::load(config_path).context("cannot load config for upgrade")?;
-    let live_target = std::env::current_exe().context("cannot resolve the running binary's path")?;
 
     #[cfg(windows)]
     {
@@ -144,16 +151,20 @@ fn upgrade_cmd(from: Option<&Path>, rollback: bool, allow_downgrade: bool, confi
             bail!("Windows rollback is not yet automated by this CLI; see docs/RELEASE-SIGNING.md's Windows rollback runbook (msiexec /x then /i)");
         }
         let from = from.context("--from is required unless --rollback is passed")?;
-        return softnix_log_agent::update::apply_windows::self_relaunch_and_apply(
+        softnix_log_agent::update::apply_windows::self_relaunch_and_apply(
             from,
             config_path,
             &cfg.agent.data_dir,
             allow_downgrade,
-        );
+        )
     }
 
     #[cfg(not(windows))]
     {
+        // Only the non-Windows path swaps the currently-running binary in
+        // place, so only it needs to know where that binary lives.
+        let live_target =
+            std::env::current_exe().context("cannot resolve the running binary's path")?;
         if rollback {
             softnix_log_agent::update::apply::rollback_from_local(&live_target, &cfg.agent.data_dir)
         } else {
@@ -164,6 +175,7 @@ fn upgrade_cmd(from: Option<&Path>, rollback: bool, allow_downgrade: bool, confi
                 &cfg.agent.data_dir,
                 allow_downgrade,
                 &live_target,
+                &cfg.web,
             )
         }
     }

@@ -49,8 +49,8 @@ pub fn verify_artifact_hash(path: &Path, expected_hex: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::manifest::Manifest;
+    use super::*;
 
     fn sample_manifest() -> Manifest {
         Manifest {
@@ -85,8 +85,14 @@ mod tests {
     #[test]
     fn finds_the_matching_platform_and_arch() {
         let m = sample_manifest();
-        assert_eq!(m.artifact_for("linux", "x86_64").unwrap().filename, "a.tar.gz");
-        assert_eq!(m.artifact_for("windows", "x86_64").unwrap().filename, "a.msi");
+        assert_eq!(
+            m.artifact_for("linux", "x86_64").unwrap().filename,
+            "a.tar.gz"
+        );
+        assert_eq!(
+            m.artifact_for("windows", "x86_64").unwrap().filename,
+            "a.msi"
+        );
     }
 
     #[test]
@@ -110,7 +116,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("f.bin");
         std::fs::write(&path, b"hello world").unwrap();
-        let err = verify_artifact_hash(&path, "0000000000000000000000000000000000000000000000000000000000000000").unwrap_err();
+        let err = verify_artifact_hash(
+            &path,
+            "0000000000000000000000000000000000000000000000000000000000000000",
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("hash mismatch"));
     }
 

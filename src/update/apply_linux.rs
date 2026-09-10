@@ -16,11 +16,7 @@ use std::path::{Path, PathBuf};
 /// then atomically renames the staged file onto `live_target`.
 ///
 /// Returns the path of the retained previous binary.
-pub fn stage_and_swap(
-    new_binary: &Path,
-    live_target: &Path,
-    version: &str,
-) -> Result<PathBuf> {
+pub fn stage_and_swap(new_binary: &Path, live_target: &Path, version: &str) -> Result<PathBuf> {
     let parent = live_target
         .parent()
         .context("live_target has no parent directory")?;

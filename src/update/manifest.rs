@@ -37,11 +37,28 @@ pub struct Artifact {
 /// `bytes`, against every key in `RELEASE_PUBLIC_KEYS`, then parses and
 /// sanity-checks the manifest. Never trust a manifest that hasn't been
 /// through this function.
+///
+/// Thin wrapper around `verify_manifest_with_keys` so tests can exercise
+/// the real verification body against a real test keypair instead of the
+/// (intentionally empty until the Phase 0 signing-key runbook runs)
+/// `RELEASE_PUBLIC_KEYS` — see that function and the `tests` module below.
 pub fn verify_manifest(bytes: &[u8], sig: &[u8]) -> Result<Manifest> {
-    if RELEASE_PUBLIC_KEYS.is_empty() {
+    verify_manifest_with_keys(bytes, sig, RELEASE_PUBLIC_KEYS)
+}
+
+/// The actual signature/schema/product verification logic, parameterized
+/// over the trusted-key list. `verify_manifest` is the only non-test
+/// caller, and always passes `RELEASE_PUBLIC_KEYS` — this split exists
+/// purely so `#[cfg(test)]` code below can call this directly with a real
+/// generated-for-tests keypair, exercising the exact same code every real
+/// caller runs instead of re-implementing/bypassing it (as every prior test
+/// in this module did, by either relying on `RELEASE_PUBLIC_KEYS` staying
+/// empty, or calling `ring`'s verify directly).
+fn verify_manifest_with_keys(bytes: &[u8], sig: &[u8], keys: &[[u8; 32]]) -> Result<Manifest> {
+    if keys.is_empty() {
         bail!("no release public keys compiled into this build; refusing to verify any manifest");
     }
-    let verified = RELEASE_PUBLIC_KEYS.iter().any(|pk| {
+    let verified = keys.iter().any(|pk| {
         ring::signature::UnparsedPublicKey::new(&ring::signature::ED25519, pk)
             .verify(bytes, sig)
             .is_ok()
@@ -49,8 +66,7 @@ pub fn verify_manifest(bytes: &[u8], sig: &[u8]) -> Result<Manifest> {
     if !verified {
         bail!("manifest signature does not verify against any trusted release key");
     }
-    let manifest: Manifest =
-        serde_json::from_slice(bytes).context("manifest is not valid JSON")?;
+    let manifest: Manifest = serde_json::from_slice(bytes).context("manifest is not valid JSON")?;
     if manifest.schema_version != 1 {
         bail!(
             "unsupported manifest schema_version {} (this build understands schema_version 1)",
@@ -104,10 +120,13 @@ pub fn check_freshness(
             highest_seen_serial
         );
     }
-    let expires_at: chrono::DateTime<chrono::Utc> = manifest
-        .expires_at
-        .parse()
-        .with_context(|| format!("manifest expires_at {:?} is not RFC3339", manifest.expires_at))?;
+    let expires_at: chrono::DateTime<chrono::Utc> =
+        manifest.expires_at.parse().with_context(|| {
+            format!(
+                "manifest expires_at {:?} is not RFC3339",
+                manifest.expires_at
+            )
+        })?;
     if now > expires_at {
         bail!("manifest expired at {}", manifest.expires_at);
     }
@@ -175,14 +194,13 @@ mod tests {
         let bytes = sample_manifest_bytes();
         let sig = keypair.sign(&bytes);
 
-        // Can't mutate the real `RELEASE_PUBLIC_KEYS` const from a test, so
-        // this test exercises the verification logic directly rather than
-        // through `verify_manifest`. See Step 4 for why `verify_manifest`
-        // stays a thin wrapper around a testable inner function.
-        let ok = ring::signature::UnparsedPublicKey::new(&ring::signature::ED25519, &pubkey)
-            .verify(&bytes, sig.as_ref())
-            .is_ok();
-        assert!(ok);
+        // Exercises the real body every caller runs (`verify_manifest_with_keys`,
+        // which `verify_manifest` is a thin wrapper around), against a real
+        // test keypair — not `RELEASE_PUBLIC_KEYS`, which stays empty until
+        // the Phase 0 signing-key runbook runs, and not a bypass straight to
+        // `ring`'s verify.
+        let manifest = verify_manifest_with_keys(&bytes, sig.as_ref(), &[pubkey]).unwrap();
+        assert_eq!(manifest.version, "0.2.0");
     }
 
     #[test]
@@ -192,10 +210,8 @@ mod tests {
         let sig = keypair.sign(&bytes);
         bytes.push(b' '); // tamper after signing
 
-        let ok = ring::signature::UnparsedPublicKey::new(&ring::signature::ED25519, &pubkey)
-            .verify(&bytes, sig.as_ref())
-            .is_ok();
-        assert!(!ok);
+        let err = verify_manifest_with_keys(&bytes, sig.as_ref(), &[pubkey]).unwrap_err();
+        assert!(err.to_string().contains("does not verify"));
     }
 
     #[test]
@@ -205,32 +221,47 @@ mod tests {
         let bytes = sample_manifest_bytes();
         let sig = keypair.sign(&bytes);
 
-        let ok = ring::signature::UnparsedPublicKey::new(&ring::signature::ED25519, &other_pubkey)
-            .verify(&bytes, sig.as_ref())
-            .is_ok();
-        assert!(!ok);
+        let err = verify_manifest_with_keys(&bytes, sig.as_ref(), &[other_pubkey]).unwrap_err();
+        assert!(err.to_string().contains("does not verify"));
     }
 
     #[test]
     fn verify_manifest_refuses_everything_when_no_keys_are_trusted() {
         // RELEASE_PUBLIC_KEYS is empty in this build (Phase 0 runbook not
-        // yet run) — verify_manifest must fail closed, not open.
+        // yet run) — the public `verify_manifest` (which always uses
+        // `RELEASE_PUBLIC_KEYS`) must fail closed, not open.
         let bytes = sample_manifest_bytes();
         let err = verify_manifest(&bytes, &[0u8; 64]).unwrap_err();
         assert!(err.to_string().contains("no release public keys"));
     }
 
     #[test]
-    fn verify_manifest_rejects_wrong_product() {
+    fn verify_manifest_with_keys_rejects_wrong_schema_version() {
+        let (keypair, pubkey) = test_keypair();
+        let mut m: serde_json::Value = serde_json::from_slice(&sample_manifest_bytes()).unwrap();
+        m["schema_version"] = serde_json::Value::from(2);
+        let bytes = serde_json::to_vec(&m).unwrap();
+        let sig = keypair.sign(&bytes);
+
+        let err = verify_manifest_with_keys(&bytes, sig.as_ref(), &[pubkey]).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("unsupported manifest schema_version"));
+    }
+
+    #[test]
+    fn verify_manifest_with_keys_rejects_wrong_product() {
+        let (keypair, pubkey) = test_keypair();
         let mut m: serde_json::Value = serde_json::from_slice(&sample_manifest_bytes()).unwrap();
         m["product"] = serde_json::Value::String("some-other-agent".into());
         let bytes = serde_json::to_vec(&m).unwrap();
-        // Signature check happens first and this build trusts no keys, so
-        // this exercises the same fail-closed path as the test above by
-        // design — the product check is proven correct once Task 6 wires a
-        // real test key into a feature-gated test build. Tracked there.
-        let err = verify_manifest(&bytes, &[0u8; 64]).unwrap_err();
-        assert!(err.to_string().contains("no release public keys"));
+        let sig = keypair.sign(&bytes);
+
+        // A correctly-signed manifest for the wrong product must still be
+        // rejected — signature validity says nothing about which product
+        // the manifest claims to be for.
+        let err = verify_manifest_with_keys(&bytes, sig.as_ref(), &[pubkey]).unwrap_err();
+        assert!(err.to_string().contains("not softnix-log-agent"));
     }
 
     fn manifest_with(serial: u64, version: &str, expires_at: &str) -> Manifest {

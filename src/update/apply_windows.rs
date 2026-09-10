@@ -112,7 +112,9 @@ pub fn self_relaunch_and_apply(
 
     let artifact = manifest
         .artifact_for(CURRENT_PLATFORM, CURRENT_ARCH)
-        .with_context(|| format!("manifest has no artifact for {CURRENT_PLATFORM}/{CURRENT_ARCH}"))?;
+        .with_context(|| {
+            format!("manifest has no artifact for {CURRENT_PLATFORM}/{CURRENT_ARCH}")
+        })?;
     let msi_files: Vec<_> = std::fs::read_dir(extract_dir.path())?
         .filter_map(|e| e.ok())
         .map(|e| e.path())
@@ -161,8 +163,13 @@ pub fn self_relaunch_and_apply(
 
     let current = std::env::current_exe().context("cannot resolve the running executable path")?;
     let temp_copy = std::env::temp_dir().join(format!("snx-upgrade-{}.exe", std::process::id()));
-    std::fs::copy(&current, &temp_copy)
-        .with_context(|| format!("cannot copy {} to {}", current.display(), temp_copy.display()))?;
+    std::fs::copy(&current, &temp_copy).with_context(|| {
+        format!(
+            "cannot copy {} to {}",
+            current.display(),
+            temp_copy.display()
+        )
+    })?;
 
     // Record the watermark before relaunching, not after: this process is
     // about to hand off to a copy of itself and exit, so it cannot wait
@@ -221,10 +228,9 @@ fn wait_for_service_running() -> bool {
 
     for _ in 0..30 {
         std::thread::sleep(std::time::Duration::from_secs(2));
-        let Ok(manager) = ServiceManager::local_computer(
-            None::<&str>,
-            ServiceManagerAccess::CONNECT,
-        ) else {
+        let Ok(manager) =
+            ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
+        else {
             continue;
         };
         let Ok(service) = manager.open_service(

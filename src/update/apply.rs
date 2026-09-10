@@ -8,6 +8,7 @@ use std::process::Command;
 use super::manifest::{check_freshness, verify_manifest};
 use super::verify::verify_artifact_hash;
 use super::watermark::Watermark;
+use crate::config::WebConfig;
 
 const CURRENT_PLATFORM: &str = "linux";
 const CURRENT_ARCH: &str = std::env::consts::ARCH;
@@ -22,6 +23,7 @@ const CURRENT_ARCH: &str = std::env::consts::ARCH;
 ///      version still accepts the configuration this host is actually
 ///      running, mirroring `try_reload`'s "validate the new config before
 ///      stopping the old engine" (`src/main.rs:350-399`).
+///
 /// Either failing aborts the whole upgrade with nothing changed.
 pub fn preflight(staged_binary: &Path, live_config: &Path) -> Result<()> {
     let version_check = Command::new(staged_binary)
@@ -53,20 +55,59 @@ pub fn preflight(staged_binary: &Path, live_config: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Resolves the actual root directory to read `manifest.json` /
+/// `manifest.json.sig` / the platform binary from, tolerating both shapes
+/// a release tarball can have:
+///   - a flat archive, with those files directly at the tar root (what
+///     this module's own fixture-building tests produce, and a fine shape
+///     to keep supporting);
+///   - an archive with a single top-level wrapper directory, e.g.
+///     `softnix-log-agent-<ver>-linux-x86_64/manifest.json` — what
+///     `.github/workflows/release.yml`'s `tar czf "$STAGE.tar.gz" "$STAGE"`
+///     actually produces, since `$STAGE` is a directory name, not `.`.
+///
+/// If `extract_dir` contains exactly one entry and that entry is a
+/// directory, that directory is the root; otherwise `extract_dir` itself
+/// is the root.
+fn resolve_extraction_root(extract_dir: &Path) -> Result<std::path::PathBuf> {
+    let mut entries: Vec<std::path::PathBuf> = std::fs::read_dir(extract_dir)
+        .with_context(|| {
+            format!(
+                "cannot list extracted contents of {}",
+                extract_dir.display()
+            )
+        })?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .collect();
+    if entries.len() == 1 && entries[0].is_dir() {
+        Ok(entries.remove(0))
+    } else {
+        Ok(extract_dir.to_path_buf())
+    }
+}
+
 /// Extracts `manifest.json` + `manifest.json.sig` + the platform binary
-/// from `artifact_path` (a `.tar.gz`) into a fresh temp directory, verifies
-/// the manifest's signature and freshness, verifies the extracted binary's
-/// hash against the manifest, preflights it against `config_path`, then —
-/// only after every one of those checks passes — swaps it onto
-/// `live_target` and restarts the service. Everything up to the swap is
-/// read-only with respect to `live_target`; a failure at any check leaves
-/// it completely untouched.
+/// from `artifact_path` (a `.tar.gz`, either flat or with a single
+/// top-level wrapper directory — see `resolve_extraction_root`) into a
+/// fresh temp directory, verifies the manifest's signature and freshness,
+/// verifies the extracted binary's hash against the manifest, preflights
+/// it against `config_path`, then — only after every one of those checks
+/// passes — swaps it onto `live_target` and restarts the service.
+/// Everything up to the swap is read-only with respect to `live_target`; a
+/// failure at any check leaves it completely untouched.
+///
+/// `web` is the loaded config's web section, threaded through to
+/// `platform_swap_and_restart`'s post-swap health check: when
+/// `web.enabled` is `false` there is no `/healthz` endpoint to poll at all,
+/// so the health check must be skipped rather than treated as a failure.
 pub fn apply_from_local(
     artifact_path: &Path,
     config_path: &Path,
     data_dir: &Path,
     allow_downgrade: bool,
     live_target: &Path,
+    web: &WebConfig,
 ) -> Result<()> {
     // `Watermark::open` (unlike `StateManager::open`) does not create
     // `data_dir` for us — do it here so a fresh install (agent never
@@ -86,10 +127,11 @@ pub fn apply_from_local(
     if !status.success() {
         bail!("tar extraction of {} failed", artifact_path.display());
     }
+    let root = resolve_extraction_root(extract_dir.path())?;
 
-    let manifest_bytes = std::fs::read(extract_dir.path().join("manifest.json"))
+    let manifest_bytes = std::fs::read(root.join("manifest.json"))
         .context("update artifact has no manifest.json")?;
-    let sig = std::fs::read(extract_dir.path().join("manifest.json.sig"))
+    let sig = std::fs::read(root.join("manifest.json.sig"))
         .context("update artifact has no manifest.json.sig")?;
     let manifest = verify_manifest(&manifest_bytes, &sig)?;
 
@@ -107,14 +149,15 @@ pub fn apply_from_local(
         .with_context(|| {
             format!("manifest has no artifact for {CURRENT_PLATFORM}/{CURRENT_ARCH}")
         })?;
-    let extracted_binary = extract_dir.path().join("softnix-log-agent");
+    let extracted_binary = root.join("softnix-log-agent");
     verify_artifact_hash(&extracted_binary, &artifact.sha256)?;
 
     preflight(&extracted_binary, config_path)?;
 
     // Point of no return: everything above this line is read-only with
     // respect to `live_target`.
-    let old_path = platform_swap_and_restart(&extracted_binary, live_target, &manifest.version)?;
+    let old_path =
+        platform_swap_and_restart(&extracted_binary, live_target, &manifest.version, web)?;
 
     watermark.record(manifest.manifest_serial)?;
     prune_old_versions(live_target, &old_path)?;
@@ -138,7 +181,12 @@ pub fn apply_from_local(
 /// `#[cfg(...)]` arms, mirroring the same platform-split pattern
 /// `src/service.rs` already uses for install/start/stop/restart.
 #[cfg(target_os = "linux")]
-fn platform_swap_and_restart(extracted_binary: &Path, live_target: &Path, version: &str) -> Result<std::path::PathBuf> {
+fn platform_swap_and_restart(
+    extracted_binary: &Path,
+    live_target: &Path,
+    version: &str,
+    web: &WebConfig,
+) -> Result<std::path::PathBuf> {
     let old_path = super::apply_linux::stage_and_swap(extracted_binary, live_target, version)?;
 
     if let Err(e) = crate::service::restart() {
@@ -148,7 +196,7 @@ fn platform_swap_and_restart(extracted_binary: &Path, live_target: &Path, versio
         bail!("upgrade failed to restart the service; rolled back to the previous version");
     }
 
-    if !wait_for_healthy() {
+    if !wait_for_healthy(web) {
         tracing::error!("new version did not become healthy; rolling back");
         super::apply_linux::rollback(live_target, &old_path)?;
         crate::service::restart().context("rollback restart failed")?;
@@ -159,19 +207,43 @@ fn platform_swap_and_restart(extracted_binary: &Path, live_target: &Path, versio
 }
 
 #[cfg(not(target_os = "linux"))]
-fn platform_swap_and_restart(_extracted_binary: &Path, _live_target: &Path, _version: &str) -> Result<std::path::PathBuf> {
-    bail!("upgrade apply (binary swap + service restart) is only implemented on Linux in this build")
+fn platform_swap_and_restart(
+    _extracted_binary: &Path,
+    _live_target: &Path,
+    _version: &str,
+    _web: &WebConfig,
+) -> Result<std::path::PathBuf> {
+    bail!(
+        "upgrade apply (binary swap + service restart) is only implemented on Linux in this build"
+    )
 }
 
 /// Polls the local, unauthenticated `/healthz` for up to 60s, requiring 3
-/// consecutive 200s before declaring the new version healthy. Reading
-/// `web.port`/`web.bind` from the live config would be more precise, but
-/// `/healthz` binds to whatever the config on disk (now the *new* config,
-/// unchanged by this upgrade) says — 127.0.0.1 is this project's default
-/// and the common case; a non-default bind/port is a known limitation of
-/// this first cut, tracked for Phase 1 hardening rather than blocking it.
+/// consecutive 200s before declaring the new version healthy. When
+/// `web.enabled` is `false` there is no `/healthz` endpoint running at all
+/// (the web server itself never starts — see `run_agent` in `src/main.rs`),
+/// so treating a timeout as "unhealthy" in that case would falsely roll
+/// back a genuinely successful upgrade; skip the check entirely instead and
+/// say so. When enabled, the URL is built from the *actual* configured
+/// `web.bind`/`web.port` — `/healthz` binds to whatever the config on disk
+/// (now the *new* config, unchanged by this upgrade) says, which need not
+/// be this project's `127.0.0.1:8080` default.
 #[cfg(target_os = "linux")]
-fn wait_for_healthy() -> bool {
+fn wait_for_healthy(web: &WebConfig) -> bool {
+    if !web.enabled {
+        println!("web server is disabled (web.enabled: false); skipping post-upgrade health check");
+        return true;
+    }
+
+    // `web.bind` is validated (see `config::validate`) as a bare IP
+    // address, IPv4 or IPv6 — an IPv6 address needs `[...]` brackets to be
+    // a valid URL host, unlike IPv4/hostnames, so bracket it only when it
+    // actually parses as one.
+    let host = match web.bind.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V6(v6)) => format!("[{v6}]"),
+        _ => web.bind.clone(),
+    };
+    let url = format!("http://{host}:{}/healthz", web.port);
     let mut consecutive_ok = 0;
     for _ in 0..30 {
         std::thread::sleep(std::time::Duration::from_secs(2));
@@ -179,7 +251,7 @@ fn wait_for_healthy() -> bool {
             .arg("-sf")
             .arg("-o")
             .arg("/dev/null")
-            .arg("http://127.0.0.1:8080/healthz")
+            .arg(&url)
             .status()
             .map(|s| s.success())
             .unwrap_or(false);
@@ -225,7 +297,10 @@ pub fn rollback_from_local(live_target: &Path, _data_dir: &Path) -> Result<()> {
         })
         .collect();
     match candidates.len() {
-        0 => bail!("no retained previous version found next to {}", live_target.display()),
+        0 => bail!(
+            "no retained previous version found next to {}",
+            live_target.display()
+        ),
         1 => {
             super::apply_linux::rollback(live_target, &candidates.remove(0))?;
             crate::service::restart().context("rollback restart failed")?;
@@ -260,8 +335,9 @@ fn prune_old_versions(live_target: &std::path::Path, keep: &std::path::Path) -> 
             .map(|n| n.to_string_lossy().starts_with(&prefix))
             .unwrap_or(false);
         if is_old_version && path != keep {
-            std::fs::remove_file(&path)
-                .with_context(|| format!("cannot prune stale retained version {}", path.display()))?;
+            std::fs::remove_file(&path).with_context(|| {
+                format!("cannot prune stale retained version {}", path.display())
+            })?;
         }
     }
     Ok(())
@@ -307,7 +383,9 @@ mod tests {
         std::fs::write(&config_path, "this: is not: valid: yaml: at all:\n").unwrap();
 
         let err = preflight(&this_binary(), &config_path).unwrap_err();
-        assert!(err.to_string().contains("rejects the current configuration"));
+        assert!(err
+            .to_string()
+            .contains("rejects the current configuration"));
     }
 
     #[test]
@@ -330,6 +408,11 @@ mod tests {
         let data_dir = dir.path().join("data");
         std::fs::create_dir_all(&data_dir).unwrap();
 
+        // Flat archive shape: manifest.json / manifest.json.sig /
+        // softnix-log-agent directly at the tar root, no wrapper directory.
+        // Still a valid shape `resolve_extraction_root` supports; the CI's
+        // actual (wrapper-directory) shape is covered separately by
+        // `apply_from_local_reads_manifest_out_of_a_wrapper_directory` below.
         let stage = dir.path().join("stage");
         std::fs::create_dir_all(&stage).unwrap();
         std::fs::write(
@@ -353,8 +436,92 @@ mod tests {
             .unwrap();
         assert!(status.success());
 
-        let result = apply_from_local(&tar_path, &config_path, &data_dir, false, &live);
+        let result = apply_from_local(
+            &tar_path,
+            &config_path,
+            &data_dir,
+            false,
+            &live,
+            &WebConfig::default(),
+        );
         assert!(result.is_err());
+        assert_eq!(std::fs::read(&live).unwrap(), b"original content");
+    }
+
+    /// Regression test for the Critical finding that the release tarball CI
+    /// actually produces has a top-level wrapper directory (`tar czf
+    /// "$STAGE.tar.gz" "$STAGE"`, `$STAGE` a directory) — `manifest.json`
+    /// etc. end up one level *below* the tar root, not at it. This fixture
+    /// reproduces that exact shape (confirmed by directly running the same
+    /// `tar czf`/`tar xzf` invocations against a real wrapper directory) and
+    /// asserts `apply_from_local` still finds and reads the manifest out of
+    /// it. Before `resolve_extraction_root` existed, `apply_from_local`
+    /// tried to read `<tmp>/manifest.json` directly against this fixture,
+    /// which does not exist one level up — that attempt fails with "update
+    /// artifact has no manifest.json" (a bare file-not-found), never even
+    /// reaching signature verification. Post-fix, the manifest is found and
+    /// read, and the call fails for a wholly different, expected reason:
+    /// this build's `RELEASE_PUBLIC_KEYS` is intentionally empty until the
+    /// Phase 0 signing-key runbook runs (see `src/update/manifest.rs`), so
+    /// `verify_manifest` fails closed on "no release public keys". Asserting
+    /// on that specific message (and not the file-not-found one) is what
+    /// makes this a genuine regression test rather than a coincidental pass.
+    #[test]
+    fn apply_from_local_reads_manifest_out_of_a_wrapper_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let live = dir.path().join("softnix-log-agent");
+        std::fs::write(&live, b"original content").unwrap();
+        let config_path = dir.path().join("agent.yaml");
+        std::fs::write(&config_path, "web:\n  enabled: false\n").unwrap();
+        let data_dir = dir.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+
+        // Matches release.yml's `STAGE="softnix-log-agent-<ver>-linux-x86_64"`
+        // + `mkdir -p "$STAGE"` + `tar czf "${STAGE}.tar.gz" "$STAGE"`: the
+        // parent of `wrapper` here stands in for the CI job's working
+        // directory, and `wrapper`'s name is the tar's sole top-level entry.
+        let staging_root = dir.path().join("staging_root");
+        let wrapper = staging_root.join("softnix-log-agent-0.2.0-linux-x86_64");
+        std::fs::create_dir_all(&wrapper).unwrap();
+        std::fs::write(
+            wrapper.join("manifest.json"),
+            br#"{"schema_version":1,"product":"softnix-log-agent","version":"0.2.0","manifest_serial":0,"released_at":"2026-01-01T00:00:00Z","expires_at":"2027-01-01T00:00:00Z","artifacts":[]}"#,
+        )
+        .unwrap();
+        std::fs::write(wrapper.join("manifest.json.sig"), [0u8; 64]).unwrap();
+        std::fs::write(wrapper.join("softnix-log-agent"), b"pretend-new-binary").unwrap();
+
+        let tar_path = dir.path().join("release.tar.gz");
+        let status = std::process::Command::new("tar")
+            .arg("czf")
+            .arg(&tar_path)
+            .arg("-C")
+            .arg(&staging_root)
+            .arg("softnix-log-agent-0.2.0-linux-x86_64")
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        let err = apply_from_local(
+            &tar_path,
+            &config_path,
+            &data_dir,
+            false,
+            &live,
+            &WebConfig::default(),
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("no release public keys"),
+            "expected to reach signature verification (proving manifest.json was found inside \
+             the wrapper directory), got: {msg}"
+        );
+        assert!(
+            !msg.contains("has no manifest.json"),
+            "manifest.json lookup failed — apply_from_local did not resolve into the wrapper \
+             directory: {msg}"
+        );
         assert_eq!(std::fs::read(&live).unwrap(), b"original content");
     }
 

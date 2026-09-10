@@ -4,10 +4,10 @@
 //! full design and the constraints every function here must uphold.
 
 pub mod apply;
-pub mod manifest;
-pub mod watermark;
-pub mod verify;
 #[cfg(target_os = "linux")]
 pub mod apply_linux;
 #[cfg(windows)]
 pub mod apply_windows;
+pub mod manifest;
+pub mod verify;
+pub mod watermark;
