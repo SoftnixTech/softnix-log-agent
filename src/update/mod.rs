@@ -8,6 +8,7 @@ pub mod apply;
 pub mod apply_linux;
 #[cfg(windows)]
 pub mod apply_windows;
+pub mod fetch;
 pub mod manifest;
 pub mod verify;
 pub mod watermark;

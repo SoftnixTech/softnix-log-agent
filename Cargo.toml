@@ -43,6 +43,11 @@ async-trait = "0.1"
 ring = "0.17"
 hex = "0.4"
 tempfile = "3"
+hyper-rustls = { version = "0.27", default-features = false, features = ["ring", "http1", "tls12", "webpki-roots"] }
+hyper-util = { version = "0.1", features = ["client", "client-legacy", "tokio"] }
+http-body-util = "0.1"
+hyper = { version = "1", features = ["client", "http1"] }
+bytes = "1"
 
 [target.'cfg(windows)'.dependencies]
 windows-service = "0.7"
@@ -56,7 +61,7 @@ windows = { version = "0.58", features = [
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
-http-body-util = "0.1"
+hyper = { version = "1", features = ["server"] }
 
 [profile.release]
 opt-level = "s"
