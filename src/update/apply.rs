@@ -6,7 +6,7 @@ use std::path::Path;
 use std::process::Command;
 
 use super::fetch::fetch_url;
-use super::manifest::{check_freshness, verify_manifest};
+use super::manifest::{check_freshness, verify_manifest, Artifact};
 use super::verify::verify_artifact_hash;
 use super::watermark::Watermark;
 use crate::config::WebConfig;
@@ -219,15 +219,32 @@ pub async fn fetch_manifest_and_artifact(
         })?;
 
     let bytes = fetch_url(&artifact.url, artifact.size).await?;
+    write_and_verify_artifact(artifact, &bytes, dest_dir)
+}
+
+/// Writes a downloaded artifact's bytes to `<dest_dir>/<artifact.filename>`
+/// and hash-verifies the written file against `artifact.sha256`. Split out
+/// of `fetch_manifest_and_artifact` so this tail — the part of that function
+/// that doesn't need any network I/O — is directly unit-testable without
+/// spinning up an HTTP server: the fetch/resolve half is exercised by
+/// `fetch_manifest_and_artifact_downloads_and_verifies_the_matching_platform`
+/// below (which only reaches the HTTPS-enforcement gate, not this far), and
+/// this write+verify half is exercised directly by
+/// `write_and_verify_artifact_accepts_a_matching_hash` and
+/// `write_and_verify_artifact_rejects_a_mismatched_hash`.
+fn write_and_verify_artifact(
+    artifact: &Artifact,
+    bytes: &[u8],
+    dest_dir: &Path,
+) -> Result<std::path::PathBuf> {
     let dest_path = dest_dir.join(&artifact.filename);
-    std::fs::write(&dest_path, &bytes).with_context(|| {
+    std::fs::write(&dest_path, bytes).with_context(|| {
         format!(
             "cannot write downloaded artifact to {}",
             dest_path.display()
         )
     })?;
     verify_artifact_hash(&dest_path, &artifact.sha256)?;
-
     Ok(dest_path)
 }
 
@@ -606,6 +623,62 @@ mod tests {
         assert!(!stale2.exists());
     }
 
+    fn sample_artifact(sha256: impl Into<String>, size: u64) -> Artifact {
+        Artifact {
+            platform: "linux".into(),
+            arch: "x86_64".into(),
+            filename: "a.bin".into(),
+            url: "https://example.invalid/a.bin".into(),
+            sha256: sha256.into(),
+            size,
+        }
+    }
+
+    #[test]
+    fn write_and_verify_artifact_accepts_a_matching_hash() {
+        let dest_dir = tempfile::tempdir().unwrap();
+        let bytes = b"pretend release bundle contents";
+        let sha256 = {
+            let mut ctx = ring::digest::Context::new(&ring::digest::SHA256);
+            ctx.update(bytes);
+            hex::encode(ctx.finish().as_ref())
+        };
+        let artifact = sample_artifact(sha256, bytes.len() as u64);
+
+        let dest_path = write_and_verify_artifact(&artifact, bytes, dest_dir.path()).unwrap();
+
+        assert_eq!(dest_path, dest_dir.path().join("a.bin"));
+        assert_eq!(std::fs::read(&dest_path).unwrap(), bytes);
+    }
+
+    #[test]
+    fn write_and_verify_artifact_rejects_a_mismatched_hash() {
+        let dest_dir = tempfile::tempdir().unwrap();
+        let bytes = b"pretend release bundle contents";
+        let artifact = sample_artifact("0".repeat(64), bytes.len() as u64);
+
+        let err = write_and_verify_artifact(&artifact, bytes, dest_dir.path()).unwrap_err();
+        assert!(err.to_string().contains("hash mismatch"));
+        // The write itself still happened — `write_and_verify_artifact` only
+        // fails the *verification*, it doesn't clean up after itself; that's
+        // fine because a caller only ever trusts the returned `Ok` path.
+        assert!(dest_dir.path().join("a.bin").exists());
+    }
+
+    // Now that the write+hash-verify tail has its own direct tests above,
+    // this test's job narrows to: does `fetch_manifest_and_artifact` reject
+    // a non-`https://` `check_url` before doing anything else? It does not
+    // reach artifact resolution, download, or hash verification — those are
+    // covered by `write_and_verify_artifact_accepts_a_matching_hash` /
+    // `_rejects_a_mismatched_hash` above — nor does it reach signature
+    // verification (this build's `RELEASE_PUBLIC_KEYS` is empty regardless,
+    // per every other manifest-related test in this codebase). The local
+    // hyper server below is still spun up and still never contacted: kept
+    // as-is (rather than switched to a real HTTPS test server) because
+    // proving the HTTPS gate specifically needs a plain-HTTP URL to reject,
+    // and Phase 2's `fetch.rs` tests already cover `require_https` in
+    // isolation — this is only asserting that `fetch_manifest_and_artifact`
+    // actually calls into that gate for its own `check_url` argument.
     #[tokio::test]
     async fn fetch_manifest_and_artifact_downloads_and_verifies_the_matching_platform() {
         use std::convert::Infallible;
