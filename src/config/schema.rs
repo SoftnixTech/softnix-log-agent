@@ -21,6 +21,8 @@ pub struct Config {
     pub outputs: Vec<OutputConfig>,
     #[serde(default)]
     pub web: WebConfig,
+    #[serde(default)]
+    pub update: UpdateConfig,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -541,6 +543,16 @@ pub struct OutputConfig {
     pub full_policy: Option<FullPolicy>,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct UpdateConfig {
+    /// HTTPS URL to fetch the signed update manifest from. Unset by
+    /// default: this agent makes no outbound network call related to
+    /// updates unless an operator explicitly configures this.
+    #[serde(default)]
+    pub check_url: Option<String>,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct WebConfig {
@@ -597,5 +609,21 @@ mod tests {
     #[test]
     fn rejects_unknown_fields() {
         assert!(crate::config::parse("agent:\n  bogus_key: 1\n").is_err());
+    }
+
+    #[test]
+    fn update_check_url_defaults_to_none() {
+        let cfg = Config::default();
+        assert_eq!(cfg.update.check_url, None);
+    }
+
+    #[test]
+    fn update_check_url_can_be_set() {
+        let yaml = "update:\n  check_url: https://updates.example.invalid/manifest.json\n";
+        let cfg: Config = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(
+            cfg.update.check_url.as_deref(),
+            Some("https://updates.example.invalid/manifest.json")
+        );
     }
 }
