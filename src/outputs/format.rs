@@ -42,10 +42,25 @@ pub fn format_event(ev: &Event, format: OutputFormat) -> String {
         OutputFormat::Rfc3164 => {
             let pri = pri_of(ev);
             let ts = ev.timestamp.format("%b %e %H:%M:%S");
-            let host = ev.hostname.as_deref().unwrap_or("-");
-            let tag = ev.application.as_deref().unwrap_or("softnix");
-            match &ev.process_id {
-                Some(pid) => format!("<{pri}>{ts} {host} {tag}[{pid}]: {}", ev.message),
+            let host = ev
+                .hostname
+                .as_deref()
+                .map_or(Cow::Borrowed("-"), |h| header_token(h, HOSTNAME_MAX));
+            // RFC 3164 has no structured data: the original value cannot be
+            // kept on this wire (documented; use rfc5424 or json for that).
+            // TAG length is deliberately not capped at RFC 3164's 32, which
+            // would truncate common names like Microsoft-Windows-Security-Auditing.
+            let tag = ev
+                .application
+                .as_deref()
+                .map_or(Cow::Borrowed("softnix"), |a| {
+                    sanitize_token(a, usize::MAX, RFC3164_TAG_DELIMS)
+                });
+            match ev.process_id.as_deref() {
+                Some(pid) => {
+                    let pid = sanitize_token(pid, PROCID_MAX, RFC3164_TAG_DELIMS);
+                    format!("<{pri}>{ts} {host} {tag}[{pid}]: {}", ev.message)
+                }
                 None => format!("<{pri}>{ts} {host} {tag}: {}", ev.message),
             }
         }
@@ -154,6 +169,10 @@ fn sd_escape(s: &str) -> String {
 const HOSTNAME_MAX: usize = 255;
 const APP_NAME_MAX: usize = 48;
 const PROCID_MAX: usize = 128;
+
+/// Characters that delimit PID and CONTENT in an RFC 3164 `TAG[PID]:`, so
+/// they must not appear inside either.
+const RFC3164_TAG_DELIMS: &[char] = &['[', ']', ':'];
 
 /// Make `raw` a valid RFC 5424 header token (PRINTUSASCII = %d33-126, at most
 /// `max` octets) or the NILVALUE "-". Returns `Cow::Borrowed(raw)` when `raw`
@@ -631,5 +650,54 @@ mod tests {
             assert_eq!(back.hostname.as_deref(), Some("WIN-SRV01"), "{line:?}");
             assert_eq!(back.message, "the message", "{line:?}");
         }
+    }
+
+    #[test]
+    fn rfc3164_sanitizes_tag_pid_and_host() {
+        let mut ev = fixed_event(Some("Service Control Manager"), "msg");
+        let line = format_event(&ev, OutputFormat::Rfc3164);
+        assert!(
+            line.ends_with(" WIN-SRV01 Service_Control_Manager[4321]: msg"),
+            "{line}"
+        );
+
+        ev.application = Some("Foo:Bar[x]".into()); // delimiters inside TAG
+        ev.process_id = Some("12]34".into());
+        ev.hostname = Some("my host".into());
+        let line = format_event(&ev, OutputFormat::Rfc3164);
+        assert!(line.ends_with(" my_host Foo_Bar_x_[12_34]: msg"), "{line}");
+
+        // TAG is deliberately not capped at 32 (would truncate common names).
+        ev.application = Some("Microsoft-Windows-Security-Auditing".into());
+        ev.process_id = None;
+        let line = format_event(&ev, OutputFormat::Rfc3164);
+        assert!(
+            line.ends_with(" Microsoft-Windows-Security-Auditing: msg"),
+            "{line}"
+        );
+    }
+
+    #[test]
+    fn rfc3164_round_trips_through_our_parser() {
+        use crate::config::SyslogFormat;
+        let ev = fixed_event(Some("Service Control Manager"), "the message");
+        let line = format_event(&ev, OutputFormat::Rfc3164);
+        let mut back = Event::new("rx", "syslog", "");
+        crate::pipeline::parse_syslog_into(&mut back, &line, SyslogFormat::Rfc3164);
+        assert_eq!(back.hostname.as_deref(), Some("WIN-SRV01"), "{line:?}");
+        assert_eq!(
+            back.application.as_deref(),
+            Some("Service_Control_Manager"),
+            "{line:?}"
+        );
+        assert_eq!(back.process_id.as_deref(), Some("4321"), "{line:?}");
+        assert_eq!(back.message, "the message", "{line:?}");
+    }
+
+    #[test]
+    fn rfc3164_valid_values_are_byte_identical() {
+        // Same pinning idea as the RFC 5424 test: valid names do not change.
+        let line = format_event(&fixed_event(Some("EventLog"), "msg"), OutputFormat::Rfc3164);
+        assert_eq!(line, "<14>Nov 10 08:58:07 WIN-SRV01 EventLog[4321]: msg");
     }
 }
