@@ -1,6 +1,7 @@
 use crate::config::OutputFormat;
 use crate::event::{severity_name, Event};
 use chrono::SecondsFormat;
+use std::borrow::Cow;
 
 /// Render an event in the configured wire format.
 pub fn format_event(ev: &Event, format: OutputFormat) -> String {
@@ -91,6 +92,62 @@ fn sd_escape(s: &str) -> String {
     out
 }
 
+/// RFC 5424 §6 header field limits, in octets.
+#[cfg_attr(not(test), allow(dead_code))]
+const HOSTNAME_MAX: usize = 255;
+#[cfg_attr(not(test), allow(dead_code))]
+const APP_NAME_MAX: usize = 48;
+#[cfg_attr(not(test), allow(dead_code))]
+const PROCID_MAX: usize = 128;
+
+/// Make `raw` a valid RFC 5424 header token (PRINTUSASCII = %d33-126, at most
+/// `max` octets) or the NILVALUE "-". Returns `Cow::Borrowed(raw)` when `raw`
+/// is already valid, so valid values reach the wire byte-identical.
+///
+/// Windows provider names such as "Service Control Manager" contain spaces;
+/// interpolated verbatim they shift every following header field (see
+/// docs/superpowers/specs/2026-11-10-syslog-header-sanitization.md).
+#[cfg_attr(not(test), allow(dead_code))]
+fn header_token(raw: &str, max: usize) -> Cow<'_, str> {
+    sanitize_token(raw, max, &[])
+}
+
+/// `header_token`, plus `extra` characters that must also be replaced (the
+/// RFC 3164 TAG uses '[', ']' and ':' as PID / CONTENT delimiters).
+///
+/// Order: trim -> replace each run of disallowed chars with one '_' -> cap at
+/// `max` octets -> empty or only '_' left => "-". An input that is already
+/// valid is returned untouched, even if it is all '_'.
+#[cfg_attr(not(test), allow(dead_code))]
+fn sanitize_token<'a>(raw: &'a str, max: usize, extra: &[char]) -> Cow<'a, str> {
+    let allowed = |c: char| ('\x21'..='\x7e').contains(&c) && !extra.contains(&c);
+    if !raw.is_empty() && raw.len() <= max && raw.chars().all(allowed) {
+        return Cow::Borrowed(raw);
+    }
+    let trimmed = raw.trim();
+    let mut out = String::with_capacity(trimmed.len().min(max));
+    let mut last_replaced = false;
+    for c in trimmed.chars() {
+        if out.len() >= max {
+            break;
+        }
+        if allowed(c) {
+            out.push(c);
+            last_replaced = false;
+        } else if !last_replaced {
+            out.push('_');
+            last_replaced = true;
+        }
+    }
+    // Every pushed char is ASCII, so `out.len()` counts characters too.
+    debug_assert!(out.len() <= max && out.is_ascii());
+    if out.bytes().all(|b| b == b'_') {
+        // Also covers the empty case: nothing meaningful survived.
+        return Cow::Borrowed("-");
+    }
+    Cow::Owned(out)
+}
+
 fn pri_of(ev: &Event) -> u8 {
     let facility = ev.facility.unwrap_or(1); // user-level
     let severity = ev.severity.unwrap_or(6); // info
@@ -175,5 +232,81 @@ mod tests {
         let line = format_event(&ev, OutputFormat::Json);
         let back: Event = serde_json::from_str(&line).unwrap();
         assert_eq!(back.message, "data");
+    }
+
+    #[test]
+    fn header_token_table() {
+        // Spec "Expected APP-NAME values" table, row for row.
+        let a48 = "A".repeat(48);
+        let b48 = "B".repeat(48);
+        let b49 = "B".repeat(49);
+        let cases: &[(&str, &str)] = &[
+            (
+                "Microsoft-Windows-Security-Auditing",
+                "Microsoft-Windows-Security-Auditing",
+            ),
+            ("Service Control Manager", "Service_Control_Manager"),
+            ("Application Error", "Application_Error"),
+            (
+                "Microsoft-Windows-User Profiles Service",
+                "Microsoft-Windows-User_Profiles_Service",
+            ),
+            (
+                "Microsoft-Windows-Windows Firewall With Advanced Security",
+                "Microsoft-Windows-Windows_Firewall_With_Advanced",
+            ),
+            (" LeadingSpace", "LeadingSpace"),
+            ("TrailingSpace ", "TrailingSpace"),
+            ("Double  Space", "Double_Space"),
+            ("Tab\tSeparated", "Tab_Separated"),
+            ("ระบบ บันทึก", "-"),
+            (&a48, &a48),
+            (&b49, &b48),
+            ("", "-"),
+            ("-", "-"),
+            ("Odd\"Name]x", "Odd\"Name]x"),
+        ];
+        for (input, want) in cases {
+            assert_eq!(header_token(input, APP_NAME_MAX), *want, "input {input:?}");
+        }
+    }
+
+    #[test]
+    fn header_token_borrows_valid_input_unchanged() {
+        // Goal 3: valid values come back as the same borrowed slice, which is
+        // what lets format_event detect "unchanged" and stay byte-identical.
+        // Plan R-1: a value made only of '_' is valid and stays as-is.
+        for s in [
+            "nginx",
+            "Microsoft-Windows-Kernel-General",
+            "-",
+            "___",
+            "Odd\"Name]x",
+        ] {
+            assert!(
+                matches!(header_token(s, APP_NAME_MAX), Cow::Borrowed(b) if b == s),
+                "{s:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn sanitize_token_extra_chars_and_caps() {
+        let delims = ['[', ']', ':'];
+        assert_eq!(
+            sanitize_token("Foo:Bar[1]", usize::MAX, &delims),
+            "Foo_Bar_1_"
+        );
+        assert_eq!(sanitize_token("ok", usize::MAX, &delims), "ok");
+        // A run of replaced chars collapses; pre-existing '_' are kept.
+        assert_eq!(header_token("a \t\n b", APP_NAME_MAX), "a_b");
+        assert_eq!(header_token("a_ b", APP_NAME_MAX), "a__b");
+        // A changed value that sanitizes to only '_' becomes NILVALUE.
+        assert_eq!(header_token("_ _", APP_NAME_MAX), "-");
+        // Non-ASCII runs collapse too; valid PRINTUSASCII ('"', ']') is kept.
+        assert_eq!(header_token("ระบบ \"x\" ]", APP_NAME_MAX), "_\"x\"_]");
+        // Truncation is by octets; the result is ASCII, so never mid-char.
+        assert_eq!(header_token(&"x".repeat(300), HOSTNAME_MAX).len(), 255);
+        assert_eq!(header_token(&"7".repeat(200), PROCID_MAX).len(), 128);
     }
 }
