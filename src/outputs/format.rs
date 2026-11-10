@@ -11,10 +11,32 @@ pub fn format_event(ev: &Event, format: OutputFormat) -> String {
         OutputFormat::Rfc5424 => {
             let pri = pri_of(ev);
             let ts = ev.timestamp.to_rfc3339_opts(SecondsFormat::Millis, true);
-            let host = ev.hostname.as_deref().unwrap_or("-");
-            let app = ev.application.as_deref().unwrap_or("softnix-log-agent");
-            let pid = ev.process_id.as_deref().unwrap_or("-");
-            let sd = rfc5424_structured_data(ev);
+            // Originals of header values that had to be sanitized; re-emitted
+            // as SD-PARAMs so nothing is lost. Empty (no allocation) unless
+            // something changed.
+            let mut preserved = Vec::new();
+            let host = rfc5424_header_field(
+                ev.hostname.as_deref(),
+                HOSTNAME_MAX,
+                "-",
+                "hostname",
+                &mut preserved,
+            );
+            let app = rfc5424_header_field(
+                ev.application.as_deref(),
+                APP_NAME_MAX,
+                "softnix-log-agent",
+                "application",
+                &mut preserved,
+            );
+            let pid = rfc5424_header_field(
+                ev.process_id.as_deref(),
+                PROCID_MAX,
+                "-",
+                "process_id",
+                &mut preserved,
+            );
+            let sd = rfc5424_structured_data(ev, &preserved);
             format!("<{pri}>1 {ts} {host} {app} {pid} - {sd} {}", ev.message)
         }
         OutputFormat::Rfc3164 => {
@@ -34,8 +56,20 @@ pub fn format_event(ev: &Event, format: OutputFormat) -> String {
 /// (enrichment, parsed attributes, etc.). Returns the NILVALUE `-` when there
 /// is nothing to emit. Without this, enriched fields such as
 /// `environment=production` are silently dropped on the rfc5424 wire format.
-fn rfc5424_structured_data(ev: &Event) -> String {
+///
+/// `preserved` holds `(param, original)` pairs for header values that
+/// `header_token` had to change; they are emitted first so the exact value
+/// stays recoverable from the line.
+fn rfc5424_structured_data(ev: &Event, preserved: &[(&str, &str)]) -> String {
     let mut params = String::new();
+    for (name, original) in preserved {
+        // A field of the same name that would itself be emitted wins, so a
+        // PARAM-NAME never appears twice.
+        if ev.fields.get(*name).and_then(value_to_param).is_some() {
+            continue;
+        }
+        push_sd_param(&mut params, name, original);
+    }
     for (key, val) in &ev.fields {
         // `structured_data` holds the original raw SD text from a parsed
         // rfc5424 input; re-wrapping it as a param would be malformed, skip it.
@@ -53,17 +87,41 @@ fn rfc5424_structured_data(ev: &Event) -> String {
         {
             continue;
         }
-        params.push(' ');
-        params.push_str(key);
-        params.push_str("=\"");
-        params.push_str(&sd_escape(&value));
-        params.push('"');
+        push_sd_param(&mut params, key, &value);
     }
     if params.is_empty() {
         "-".to_string()
     } else {
         format!("[softnix@32473{params}]")
     }
+}
+
+fn push_sd_param(params: &mut String, name: &str, value: &str) {
+    params.push(' ');
+    params.push_str(name);
+    params.push_str("=\"");
+    params.push_str(&sd_escape(value));
+    params.push('"');
+}
+
+/// Sanitize one RFC 5424 header field. `None` renders as `default`; a value
+/// that had to change (and was not empty, so there is something to recover)
+/// is recorded in `preserved` under the SD-PARAM name `param`.
+fn rfc5424_header_field<'a>(
+    value: Option<&'a str>,
+    max: usize,
+    default: &'static str,
+    param: &'static str,
+    preserved: &mut Vec<(&'static str, &'a str)>,
+) -> Cow<'a, str> {
+    let Some(raw) = value else {
+        return Cow::Borrowed(default);
+    };
+    let token = header_token(raw, max);
+    if token != raw && !raw.is_empty() {
+        preserved.push((param, raw));
+    }
+    token
 }
 
 /// Render a field value as an SD PARAM-VALUE string. Scalars become their
@@ -93,11 +151,8 @@ fn sd_escape(s: &str) -> String {
 }
 
 /// RFC 5424 §6 header field limits, in octets.
-#[cfg_attr(not(test), allow(dead_code))]
 const HOSTNAME_MAX: usize = 255;
-#[cfg_attr(not(test), allow(dead_code))]
 const APP_NAME_MAX: usize = 48;
-#[cfg_attr(not(test), allow(dead_code))]
 const PROCID_MAX: usize = 128;
 
 /// Make `raw` a valid RFC 5424 header token (PRINTUSASCII = %d33-126, at most
@@ -107,7 +162,6 @@ const PROCID_MAX: usize = 128;
 /// Windows provider names such as "Service Control Manager" contain spaces;
 /// interpolated verbatim they shift every following header field (see
 /// docs/superpowers/specs/2026-11-10-syslog-header-sanitization.md).
-#[cfg_attr(not(test), allow(dead_code))]
 fn header_token(raw: &str, max: usize) -> Cow<'_, str> {
     sanitize_token(raw, max, &[])
 }
@@ -118,7 +172,6 @@ fn header_token(raw: &str, max: usize) -> Cow<'_, str> {
 /// Order: trim -> replace each run of disallowed chars with one '_' -> cap at
 /// `max` octets -> empty or only '_' left => "-". An input that is already
 /// valid is returned untouched, even if it is all '_'.
-#[cfg_attr(not(test), allow(dead_code))]
 fn sanitize_token<'a>(raw: &'a str, max: usize, extra: &[char]) -> Cow<'a, str> {
     let allowed = |c: char| ('\x21'..='\x7e').contains(&c) && !extra.contains(&c);
     if !raw.is_empty() && raw.len() <= max && raw.chars().all(allowed) {
@@ -308,5 +361,275 @@ mod tests {
         // Truncation is by octets; the result is ASCII, so never mid-char.
         assert_eq!(header_token(&"x".repeat(300), HOSTNAME_MAX).len(), 255);
         assert_eq!(header_token(&"7".repeat(200), PROCID_MAX).len(), 128);
+    }
+
+    fn fixed_event(app: Option<&str>, msg: &str) -> Event {
+        let mut ev = Event::new("s", "eventlog", msg);
+        ev.timestamp = chrono::DateTime::parse_from_rfc3339("2026-11-10T08:58:07.110Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        ev.hostname = Some("WIN-SRV01".into());
+        ev.application = app.map(str::to_string);
+        ev.process_id = Some("4321".into());
+        ev.severity = Some(6);
+        ev.fields
+            .insert("channel".into(), serde_json::Value::from("System"));
+        ev.fields
+            .insert("event_id".into(), serde_json::Value::from(7036));
+        ev
+    }
+
+    #[test]
+    fn rfc5424_valid_values_are_byte_identical() {
+        // Goal 3. These strings are what the pre-fix formatter produces; they
+        // must not change. ev.fields is a BTreeMap, so params are key-sorted.
+        for app in [
+            "Microsoft-Windows-Security-Auditing",
+            "Microsoft-Windows-Kernel-General",
+            "Microsoft-Windows-Sysmon",
+            "EventLog",
+            "VSS",
+        ] {
+            let line = format_event(&fixed_event(Some(app), "msg"), OutputFormat::Rfc5424);
+            assert_eq!(
+                line,
+                format!(
+                    "<14>1 2026-11-10T08:58:07.110Z WIN-SRV01 {app} 4321 - \
+                     [softnix@32473 channel=\"System\" event_id=\"7036\"] msg"
+                )
+            );
+        }
+        let line = format_event(&fixed_event(None, "msg"), OutputFormat::Rfc5424);
+        assert!(
+            line.contains(" WIN-SRV01 softnix-log-agent 4321 - ["),
+            "{line}"
+        );
+    }
+
+    #[test]
+    fn rfc5424_sanitizes_provider_with_spaces() {
+        let ev = fixed_event(
+            Some("Service Control Manager"),
+            "The service entered the running state.",
+        );
+        assert_eq!(
+            format_event(&ev, OutputFormat::Rfc5424),
+            "<14>1 2026-11-10T08:58:07.110Z WIN-SRV01 Service_Control_Manager 4321 - \
+             [softnix@32473 application=\"Service Control Manager\" channel=\"System\" \
+             event_id=\"7036\"] The service entered the running state."
+        );
+    }
+
+    #[test]
+    fn rfc5424_preserved_param_creates_sd_element() {
+        // No custom fields: the SD would have been "-"; the preserved original
+        // must still get an element.
+        let mut ev = Event::new("s", "eventlog", "msg");
+        ev.application = Some("Application Error".into());
+        let line = format_event(&ev, OutputFormat::Rfc5424);
+        assert!(
+            line.ends_with(
+                " - Application_Error - - [softnix@32473 application=\"Application Error\"] msg"
+            ),
+            "{line}"
+        );
+    }
+
+    #[test]
+    fn rfc5424_preserved_param_is_escaped_and_utf8() {
+        let mut ev = fixed_event(Some("ระบบ \"x\" ]"), "msg");
+        ev.fields.clear();
+        let line = format_event(&ev, OutputFormat::Rfc5424);
+        assert!(line.contains(" WIN-SRV01 _\"x\"_] 4321 - "), "{line}");
+        assert!(
+            line.contains(r#"[softnix@32473 application="ระบบ \"x\" \]"] msg"#),
+            "{line}"
+        );
+    }
+
+    #[test]
+    fn rfc5424_preserved_param_yields_to_existing_field() {
+        // An emitted field with the same name wins; exactly one param.
+        let mut ev = fixed_event(Some("Service Control Manager"), "msg");
+        ev.fields
+            .insert("application".into(), serde_json::Value::from("from-field"));
+        let line = format_event(&ev, OutputFormat::Rfc5424);
+        assert_eq!(line.matches("application=").count(), 1, "{line}");
+        assert!(line.contains("application=\"from-field\""), "{line}");
+        // ...but a null field (which emits nothing) does not suppress it.
+        ev.fields
+            .insert("application".into(), serde_json::Value::Null);
+        let line = format_event(&ev, OutputFormat::Rfc5424);
+        assert_eq!(line.matches("application=").count(), 1, "{line}");
+        assert!(
+            line.contains("application=\"Service Control Manager\""),
+            "{line}"
+        );
+    }
+
+    #[test]
+    fn rfc5424_sanitizes_hostname_and_procid() {
+        let mut ev = fixed_event(Some("VSS"), "msg");
+        ev.hostname = Some("my host".into());
+        ev.process_id = Some("12 34".into());
+        let line = format_event(&ev, OutputFormat::Rfc5424);
+        assert!(
+            line.contains(
+                " my_host VSS 12_34 - [softnix@32473 hostname=\"my host\" \
+                 process_id=\"12 34\" channel="
+            ),
+            "{line}"
+        );
+    }
+
+    #[test]
+    fn rfc5424_empty_application_is_nilvalue_without_param() {
+        // Some("") -> "-" and nothing to preserve.
+        let line = format_event(&fixed_event(Some(""), "msg"), OutputFormat::Rfc5424);
+        assert!(
+            line.contains(" WIN-SRV01 - 4321 - [softnix@32473 channel="),
+            "{line}"
+        );
+        assert!(!line.contains("application="), "{line}");
+    }
+
+    /// Byte length of a well-formed RFC 5424 STRUCTURED-DATA at the start of
+    /// `s` (NILVALUE or 1*SD-ELEMENT), or None if malformed.
+    fn sd_len(s: &str) -> Option<usize> {
+        if s.starts_with('-') {
+            return Some(1);
+        }
+        let b = s.as_bytes();
+        let sd_name = |i: &mut usize| -> bool {
+            let start = *i;
+            while *i < b.len()
+                && (0x21..=0x7e).contains(&b[*i])
+                && !matches!(b[*i], b'=' | b' ' | b']' | b'"')
+            {
+                *i += 1;
+            }
+            (1..=32).contains(&(*i - start))
+        };
+        if b.first() != Some(&b'[') {
+            return None;
+        }
+        let mut i = 0;
+        while b.get(i) == Some(&b'[') {
+            i += 1;
+            if !sd_name(&mut i) {
+                return None;
+            }
+            while b.get(i) == Some(&b' ') {
+                i += 1;
+                if !sd_name(&mut i) || b.get(i) != Some(&b'=') || b.get(i + 1) != Some(&b'"') {
+                    return None;
+                }
+                i += 2;
+                loop {
+                    match *b.get(i)? {
+                        b'\\' => i += 2,
+                        b'"' => {
+                            i += 1;
+                            break;
+                        }
+                        b']' => return None, // must be escaped inside PARAM-VALUE
+                        _ => i += 1,
+                    }
+                }
+            }
+            if b.get(i) != Some(&b']') {
+                return None;
+            }
+            i += 1;
+        }
+        Some(i)
+    }
+
+    /// Strict RFC 5424 §6 header check; returns (HOSTNAME, APP-NAME, PROCID, MSG).
+    fn strict_rfc5424(line: &str) -> (String, String, String, String) {
+        let rest = line.strip_prefix('<').unwrap_or_else(|| panic!("{line:?}"));
+        let (pri, rest) = rest.split_once(">1 ").unwrap_or_else(|| panic!("{line:?}"));
+        assert!(
+            !pri.is_empty() && pri.len() <= 3 && pri.bytes().all(|c| c.is_ascii_digit()),
+            "{line:?}"
+        );
+        let mut parts = rest.splitn(6, ' ');
+        let mut next = || {
+            parts
+                .next()
+                .unwrap_or_else(|| panic!("short header: {line:?}"))
+        };
+        let (_ts, host, app, procid, msgid, tail) =
+            (next(), next(), next(), next(), next(), next());
+        for (tok, max) in [(host, 255), (app, 48), (procid, 128), (msgid, 32)] {
+            assert!(
+                tok == "-"
+                    || (!tok.is_empty()
+                        && tok.len() <= max
+                        && tok.bytes().all(|c| (0x21..=0x7e).contains(&c))),
+                "bad header token {tok:?} in {line:?}"
+            );
+        }
+        let n = sd_len(tail).unwrap_or_else(|| panic!("malformed SD in {line:?}"));
+        let msg = tail[n..]
+            .strip_prefix(' ')
+            .unwrap_or_else(|| panic!("no SP before MSG: {line:?}"));
+        (host.into(), app.into(), procid.into(), msg.into())
+    }
+
+    #[test]
+    fn rfc5424_header_is_valid_for_any_input() {
+        use rand::{rngs::StdRng, Rng, SeedableRng};
+        const ALPHABET: &[char] = &[
+            'a', 'Z', '0', '-', '_', '.', '"', ']', '[', '\\', '=', ':', ' ', '\t', '\n', '\r',
+            '\u{0}', '\u{7f}', '\u{a0}', '\u{3000}', 'ร', 'ะ', 'บ', '中', '文', 'é', '🙂',
+        ];
+        let random_string = |rng: &mut StdRng| -> String {
+            let len = rng.gen_range(0..=80);
+            (0..len)
+                .map(|_| ALPHABET[rng.gen_range(0..ALPHABET.len())])
+                .collect()
+        };
+        let mut rng = StdRng::seed_from_u64(0x5EED_5424);
+        for _ in 0..2000 {
+            let app = random_string(&mut rng);
+            let host = random_string(&mut rng);
+            let pid = random_string(&mut rng);
+            let mut ev = fixed_event(Some(&app), "msg");
+            ev.hostname = Some(host.clone());
+            ev.process_id = Some(pid.clone());
+            let line = format_event(&ev, OutputFormat::Rfc5424);
+            let (h, a, p, msg) = strict_rfc5424(&line);
+            assert_eq!(a, header_token(&app, APP_NAME_MAX), "{line:?}");
+            assert_eq!(h, header_token(&host, HOSTNAME_MAX), "{line:?}");
+            assert_eq!(p, header_token(&pid, PROCID_MAX), "{line:?}");
+            assert_eq!(msg, "msg", "{line:?}");
+        }
+    }
+
+    #[test]
+    fn rfc5424_round_trips_through_our_parser() {
+        use crate::config::SyslogFormat;
+        for app in [
+            "Service Control Manager",
+            "Application Error",
+            "Microsoft-Windows-Windows Firewall With Advanced Security",
+            "Tab\tSeparated",
+            "ระบบ บันทึก",
+            "Microsoft-Windows-Security-Auditing",
+        ] {
+            let line = format_event(
+                &fixed_event(Some(app), "the message"),
+                OutputFormat::Rfc5424,
+            );
+            let mut back = Event::new("rx", "syslog", "");
+            crate::pipeline::parse_syslog_into(&mut back, &line, SyslogFormat::Rfc5424);
+            let want = header_token(app, APP_NAME_MAX);
+            let want = (want != "-").then(|| want.into_owned());
+            assert_eq!(back.application, want, "{line:?}");
+            assert_eq!(back.process_id.as_deref(), Some("4321"), "{line:?}");
+            assert_eq!(back.hostname.as_deref(), Some("WIN-SRV01"), "{line:?}");
+            assert_eq!(back.message, "the message", "{line:?}");
+        }
     }
 }
