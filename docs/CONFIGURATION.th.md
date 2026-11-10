@@ -201,7 +201,9 @@ inputs:
   เก็บไว้ใน `raw_message` เฉพาะเมื่อตั้งค่า `keep_raw_message: true` เท่านั้น
 - การ map field: `Level` → `severity`, `Provider` → `application`,
   `Computer` → `hostname` พร้อม `event_id`, `channel`, `record_id`, `keywords`
-  และแต่ละรายการใน `EventData` เป็น `data_<Name>`
+  และแต่ละรายการใน `EventData` เป็น `data_<Name>` ชื่อ provider ที่มีเว้นวรรค
+  จะถูกแปลงเฉพาะบน syslog wire — ดูหมายเหตุเรื่อง format/transport ในหัวข้อ
+  [`outputs`](#outputs)
 - การอ่าน channel **`Security`** ต้องมีสิทธิ์สูง — Windows Service รันเป็น
   LocalSystem ซึ่งเพียงพอแล้ว
 
@@ -406,6 +408,15 @@ list ของปลายทาง แต่ละ event จะถูก route 
 **หมายเหตุเรื่อง format/transport:**
 
 - output `rfc5424` แนบ field enrich/custom ในส่วน STRUCTURED-DATA
+- field ใน header ถูกทำให้ปลอดภัยสำหรับ wire: ใน output `rfc5424` และ `rfc3164`
+  อักขระที่ไม่ใช่ ASCII ที่พิมพ์ได้ (เว้นวรรค, tab, อักขระที่ไม่ใช่ ASCII) ใน
+  `hostname`, `application` หรือ `process_id` จะถูกแทนด้วย `_` (ติดกันหลายตัว
+  เหลือตัวเดียว) และตัดความยาวตามที่ RFC กำหนด (APP-NAME 48, HOSTNAME 255,
+  PROCID 128) เช่น provider `Service Control Manager` ถูกส่งเป็น APP-NAME
+  `Service_Control_Manager` ใน `rfc5424` ค่าเดิมถูกเก็บไว้ใน STRUCTURED-DATA
+  (`application="Service Control Manager"` และ `hostname` / `process_id`
+  แบบเดียวกัน) ส่วน `rfc3164` ไม่มีที่เก็บ ค่าที่ถูกต้องอยู่แล้วส่งออกไปตามเดิม
+  output `json`, เงื่อนไข `when:` และ routing เห็นค่าเดิมเสมอ
 - `json` ส่ง event เต็มรวมถึง `raw_message`
 - UDP ส่งหนึ่ง event ต่อหนึ่ง datagram event ที่ใหญ่เกิน ~64 KB จะถูก drop
   (นับใน `events_dropped`) เพื่อไม่ให้ไปอุดคิว

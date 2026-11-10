@@ -1,8 +1,10 @@
 # Syslog header-field sanitization (Windows provider names with spaces) — design spec
 
-Status: **draft, pending owner review** (2026-11-10). Branch:
-`develop_fix_bug_windows-provider-name`. No code has been changed yet; this
-document defines what the fix must do and how it will be verified.
+Status: **approved** by the project owner on 2026-11-10, with the proposed
+answer to every open question (see the end of this document) and plan
+ruling R-4 (the RFC 3164 PID is sanitized too). Branch:
+`develop_fix_bug_windows-provider-name`. Implementation plan:
+`docs/superpowers/plans/2026-11-10-syslog-header-sanitization.md`.
 
 ## Problem
 
@@ -301,3 +303,6 @@ Re-run the same harness (6 rounds, 216 lines) against the fixed binary.
    as today (proposed: uncapped)?
 4. **Part B in the same patch, or a follow-up?** The proposal is the same
    patch: same function, same root cause, small diff.
+
+**Answers (2026-11-10):** 1 → `_`. 2 → only when altered. 3 → uncapped.
+4 → same patch.
