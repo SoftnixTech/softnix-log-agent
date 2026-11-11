@@ -40,7 +40,7 @@ elsewhere.
 | SYS-2 | RFC 5424 parser ends STRUCTURED-DATA at the wrong `]` when a value contains `[` | receiver | Medium | P4 | No | **fixed** (`e755072`) |
 | SYS-3 | RFC 3164 parser rejects `TAG[PID]` longer than 48 characters | receiver | Medium (was Low) | P4 | No | **fixed** (`5ba805c`) |
 | SYS-4 | Syslog TCP/TLS input does not decode octet-counting framing | receiver | Medium | P3 (with SYS-1) | No | **fixed** (`fd90159`, `8de82c5`) |
-| SYS-5 | Agent self-logs go to stdout, not stderr | agent | Low | P4 | No | spec and plan drafted |
+| SYS-5 | Agent self-logs go to stdout, not stderr | agent | Low | P4 | No | **fixed** (`292f00e`) |
 | SYS-6 | SD-ID uses enterprise number 32473 (reserved for documentation) | sender | Low | P5 | Cosmetic / policy | **won't fix** (owner decision 2026-11-11) |
 | SYS-7 | CI breaks on Rust ≥ 1.99: `fetch_update` is deprecated under `-D warnings` | build | Medium (blocks CI) | **P1** | n/a | **fixed** (`af3018c`) |
 | SYS-8 | Eventlog XML attribute values are not entity-unescaped | input (Windows) | Low | P2 (with SYS-9) | n/a | **fixed** (`cb9586c`) |
@@ -235,7 +235,7 @@ length); such senders need `framing: octet_counting` on the input.
 
 ### SYS-5 — Agent self-logs go to stdout, not stderr
 
-**Status: open, spec and plan drafted.** #8 in the [Fix plan](#fix-plan). No owner decision needed.
+**Status: fixed** in `292f00e` (branch `develop_fix_bug_known-issues`, not yet merged). After the fix, the harness gives stdout 2 lines (2 events, 0 self-log) and stderr 856 bytes, in 3/3 runs.
 
 Already recorded in the header spec, under "Out of scope" #2.
 `src/main.rs:424` uses `tracing_subscriber::fmt::layer()`, whose writer
@@ -430,12 +430,12 @@ and commits.
 | 5 | SYS-4 | Medium | `fd90159`, `8de82c5` | `2026-11-11-sys4-tcp-input-octet-counting.md` |
 | 6 | SYS-2 | Medium | `e755072` | `2026-11-11-sys2-rfc5424-sd-bracket-in-value.md` |
 | 7 | SYS-3 | Medium (was Low) | `5ba805c` (option A) | `2026-11-11-sys3-rfc3164-long-tag.md` |
+| 8 | SYS-5 | Low | `292f00e` | `2026-11-11-sys5-self-logs-to-stderr.md` |
 
 **Remaining, in the order to do them:**
 
 | # | Issue | Severity | Effort | Blocked by | Why this position |
 |---|---|---|---|---|---|
-| **8** | **SYS-5** | Low | 1 line + test | nothing | Corrupts the event stream, but only for `stdout` outputs that are consumed as data. |
 | **9** | **SYS-10** | Low | Small (CI) | **push access**, to see it run | A guard, not a fix. Every gate so far has checked 1.98 by hand, so nothing is at risk while it waits. It can only be verified on a real CI run. |
 | **10** | **SYS-6** | Low | none | **closed: won't fix** (owner decision 2026-11-11, no PEN) | No breakage today, and the company has no PEN to switch to. Nothing to do unless a PEN is obtained. |
 
