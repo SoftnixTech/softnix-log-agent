@@ -167,7 +167,12 @@ inputs:
         # client_ca: /etc/softnix-log-agent/tls/clients-ca.crt   # mTLS
 ```
 
-> TCP/TLS syslog input uses newline framing only.
+> TCP/TLS syslog input uses newline framing only, so a message that contains
+> a line break arrives as one event per line. Send multi-line messages to it
+> as single lines (the agent's own syslog output does this; see `framing`
+> below) or over UDP. Octet-counting on this input is tracked as SYS-4 in
+> `ISSUES.md`. The UDP input treats each datagram as one event (RFC 5426),
+> line breaks included.
 
 ### `inputs.eventlog` (Windows-only)
 
@@ -379,7 +384,7 @@ condition matches (or all outputs, if no `when`), subject to failover.
 | `address` | `host:port` | — | Required for `syslog`. |
 | `protocol` | enum | `udp` | `udp`, `tcp`, `tls` (syslog). |
 | `format` | enum | `rfc5424` | `rfc5424`, `rfc3164`, `json`, `raw`. |
-| `framing` | enum | `newline` | `newline` or `octet_counting` (TCP/TLS). |
+| `framing` | enum | `newline` | `newline` or `octet_counting` (TCP/TLS and `stdout`). With `newline`, each line break inside an event (CR, LF or CRLF) is written as one space, so every event stays on one line; use `octet_counting` or `format: json` to carry multi-line messages unchanged. |
 | `tls` | object | — | Client TLS options (below). |
 | `when` | condition | — | Only route matching events here. |
 | `failover_for` | string | — | Receive traffic only while the named output is unhealthy. |

@@ -166,7 +166,12 @@ inputs:
         # client_ca: /etc/softnix-log-agent/tls/clients-ca.crt   # mTLS
 ```
 
-> syslog input แบบ TCP/TLS ใช้ newline framing เท่านั้น
+> syslog input แบบ TCP/TLS ใช้ newline framing เท่านั้น ข้อความที่มีการขึ้นบรรทัด
+> จึงถูกแยกเป็นหนึ่ง event ต่อบรรทัด ให้ส่งข้อความหลายบรรทัดมาเป็นบรรทัดเดียว
+> (syslog output ของ agent ทำให้อยู่แล้ว ดู `framing` ด้านล่าง) หรือส่งทาง UDP
+> การรองรับ octet-counting ที่ input นี้ติดตามไว้เป็น SYS-4 ใน `ISSUES.md`
+> ส่วน syslog input แบบ UDP ถือว่าหนึ่ง datagram คือหนึ่ง event (RFC 5426)
+> รวมการขึ้นบรรทัดในข้อความด้วย
 
 ### `inputs.eventlog` (Windows เท่านั้น)
 
@@ -378,7 +383,7 @@ list ของปลายทาง แต่ละ event จะถูก route 
 | `address` | `host:port` | — | บังคับสำหรับ `syslog` |
 | `protocol` | enum | `udp` | `udp`, `tcp`, `tls` (syslog) |
 | `format` | enum | `rfc5424` | `rfc5424`, `rfc3164`, `json`, `raw` |
-| `framing` | enum | `newline` | `newline` หรือ `octet_counting` (TCP/TLS) |
+| `framing` | enum | `newline` | `newline` หรือ `octet_counting` (TCP/TLS และ `stdout`) เมื่อใช้ `newline` การขึ้นบรรทัดภายใน event (CR, LF หรือ CRLF) จะถูกเขียนเป็นช่องว่างหนึ่งตัว ทุก event จึงอยู่บรรทัดเดียว ถ้าต้องการส่งข้อความหลายบรรทัดแบบไม่เปลี่ยน ให้ใช้ `octet_counting` หรือ `format: json` |
 | `tls` | object | — | ตัวเลือก TLS ฝั่ง client (ด้านล่าง) |
 | `when` | condition | — | route เฉพาะ event ที่ตรงมาที่นี่ |
 | `failover_for` | string | — | รับ traffic เฉพาะตอน output ที่ระบุไม่ healthy |
