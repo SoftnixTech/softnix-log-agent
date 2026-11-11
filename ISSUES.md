@@ -233,7 +233,10 @@ PR's CI.
 
 ### SYS-8 — Eventlog XML attribute values are not entity-unescaped
 
-`src/inputs/eventlog.rs:826` reads attribute values with
+**Status: fixed** in `cb9586c` (branch `develop_fix_bug_known-issues`, not yet merged).
+
+`src/inputs/eventlog.rs:826` (before the SYS-9 refactor moved the parser to
+`src/inputs/eventlog_xml.rs`) reads attribute values with
 `String::from_utf8_lossy(&a.value)`, the raw bytes, without
 `unescape_value()`.
 
@@ -252,8 +255,12 @@ The escaped name is also what `EvtOpenPublisherMetadata` receives, so
 message rendering fails for such providers. Low severity: real provider
 names rarely contain `&`, `'`, `"`, `<` or `>`.
 
-**Fix.** Use `a.unescape_value()` (or decode and then
-`quick_xml::escape::unescape`) and add a unit test with the cases above.
+**Fix.** Use `Attribute::normalized_value(XmlVersion::Implicit1_0)`,
+falling back to the raw value on error, and test the cases above.
+*(Correction: an earlier version of this entry suggested
+`unescape_value()`. That method is deprecated in `quick-xml` 0.41 and
+fails the `-D warnings` build.)* Spec:
+`docs/superpowers/specs/2026-11-11-sys8-eventlog-xml-attribute-unescape.md`.
 
 ---
 
@@ -335,7 +342,7 @@ work, by effort, and by whether an owner decision is needed first.
 |---|---|---|---|---|---|
 | **P1** | SYS-7 | Medium | 1 line | No | Blocks CI for every PR, including the provider-name fix waiting to merge. Fixed in `af3018c` (`update`, verified on MSRV 1.98). |
 | **P2** | SYS-9 | **High** | Medium | No | Security fields (`CommandLine` for Sysmon and 4688) are lost at the source, whatever the output, and no config works around it. Fixed in `f6fb143`. |
-| **P2** | SYS-8 | Low | Small | No | Same parser as SYS-9, so it can be fixed in the same change for almost no extra cost. |
+| **P2** | SYS-8 | Low | Small | No | Same parser as SYS-9, so it can be fixed in the same change for almost no extra cost. Fixed in `cb9586c`. |
 | **P3** | SYS-1 | **High** | Large | **Yes** | Affects every TCP receiver with newline framing, which is the default. The escaping choice changes what SIEMs see, so it needs a spec. Start the spec in parallel with P1 and P2. |
 | **P3** | SYS-4 | Medium | Medium | Minor | The agent-to-agent workaround for SYS-1, so design it in the same spec. |
 | **P4** | SYS-2 | Medium | Small | No | Only when the agent is a relay, but the whole message is lost. Easy to fix and to test. |
