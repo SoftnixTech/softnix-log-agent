@@ -156,6 +156,11 @@ pub struct SyslogInputConfig {
     pub port: u16,
     #[serde(default)]
     pub format: SyslogFormat,
+    /// TCP/TLS only (a UDP datagram is always one message): how the byte
+    /// stream is split into messages. The default, `auto`, accepts both
+    /// newline-terminated lines and RFC 6587 octet-counted frames.
+    #[serde(default)]
+    pub framing: InputFraming,
     /// Required when protocol = tls.
     #[serde(default)]
     pub tls: Option<TlsServerOptions>,

@@ -531,8 +531,7 @@ impl SyslogInput {
         metrics: &Metrics,
         cancel: CancellationToken,
     ) -> Result<()> {
-        let mut frames =
-            FramedRead::new(stream, SyslogFrameCodec::new(InputFraming::Auto, MAX_MSG));
+        let mut frames = FramedRead::new(stream, SyslogFrameCodec::new(self.cfg.framing, MAX_MSG));
         // Slowloris guard: a peer that opens the connection and then sends
         // (or reads) nothing must not hold the connection-limit slot and its
         // file descriptor forever.
@@ -602,6 +601,7 @@ mod tests {
             bind: "127.0.0.1".into(),
             port,
             format: SyslogFormat::Auto,
+            framing: InputFraming::Auto,
             tls: None,
             source_type: None,
             keep_raw_message: false,
@@ -1001,6 +1001,44 @@ mod tests {
                 .unwrap();
             assert_eq!(ev.message, want);
             assert_eq!(ev.application.as_deref(), Some("app"));
+        }
+        drop(conn);
+        cancel.cancel();
+    }
+
+    /// SYS-4: `framing: octet_counting` on the input carries payloads that
+    /// `auto` cannot detect, because they do not start with `<` or `{` (the
+    /// agent's own `format: raw` output is one).
+    #[tokio::test]
+    async fn tcp_explicit_octet_counting_receives_raw_payloads() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut cfg = test_cfg(SyslogProtocol::Tcp, 0);
+        cfg.framing = InputFraming::OctetCounting;
+        cfg.format = SyslogFormat::Raw;
+        let input = SyslogInput::new(&cfg);
+        let (raw_tx, mut rx) = mpsc::channel(16);
+        let tx = EventSender::with_budget(raw_tx, 16 * 1024 * 1024);
+        let status = Arc::new(StatusRegistry::default());
+        status.set_input(InputStatus {
+            id: "test".into(),
+            ..Default::default()
+        });
+        let metrics = Arc::new(Metrics::default());
+        let cancel = CancellationToken::new();
+        tokio::spawn(input.run_tcp(listener, None, tx, status, metrics, cancel.clone()));
+
+        use tokio::io::AsyncWriteExt;
+        let mut conn = tokio::net::TcpStream::connect(addr).await.unwrap();
+        conn.write_all(b"5 hello9 two\nlines").await.unwrap();
+        conn.flush().await.unwrap();
+
+        for want in ["hello", "two\nlines"] {
+            let ev = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+                .await
+                .expect("a raw octet-counted frame must be delivered before the sender closes")
+                .unwrap();
+            assert_eq!(ev.message, want);
         }
         drop(conn);
         cancel.cancel();

@@ -107,6 +107,29 @@ outputs:
         assert!(s.allowed_senders.is_empty());
     }
 
+    /// SYS-4: `framing` on a syslog input defaults to `auto`, accepts the
+    /// three documented values, and rejects anything else at load time.
+    #[test]
+    fn syslog_input_framing_option() {
+        let (cfg, _w) = parse(SAMPLE).unwrap();
+        assert_eq!(cfg.inputs.syslog[0].framing, InputFraming::Auto);
+
+        let yaml = |framing: &str| {
+            format!(
+                "inputs:\n  syslog:\n    - id: in\n      protocol: tcp\n      port: 5514\n      framing: {framing}\noutputs:\n  - id: console\n    type: stdout\n"
+            )
+        };
+        for (value, want) in [
+            ("auto", InputFraming::Auto),
+            ("newline", InputFraming::Newline),
+            ("octet_counting", InputFraming::OctetCounting),
+        ] {
+            let (cfg, _w) = parse(&yaml(value)).unwrap();
+            assert_eq!(cfg.inputs.syslog[0].framing, want, "framing: {value}");
+        }
+        assert!(parse(&yaml("lines")).is_err());
+    }
+
     /// Regression for the shipped `examples/agent.yaml`: `expand_env` runs
     /// over the raw file text before YAML parsing and is not comment-aware,
     /// so a `${VAR}` reference left inside a `#`-prefixed comment still fails
