@@ -39,7 +39,7 @@ elsewhere.
 | SYS-1 | Multi-line event messages are split into several events | sender + receiver | **High** | P3 (spec first) | Yes (TCP, newline framing) | **fixed** (`5693b55`, `a508a6d`) |
 | SYS-2 | RFC 5424 parser ends STRUCTURED-DATA at the wrong `]` when a value contains `[` | receiver | Medium | P4 | No | spec and plan drafted |
 | SYS-3 | RFC 3164 parser rejects `TAG[PID]` longer than 48 characters | receiver | Medium (was Low) | P4 | No | spec and plan drafted, option A decided |
-| SYS-4 | Syslog TCP/TLS input does not decode octet-counting framing | receiver | Medium | P3 (with SYS-1) | No | spec and plan drafted |
+| SYS-4 | Syslog TCP/TLS input does not decode octet-counting framing | receiver | Medium | P3 (with SYS-1) | No | **fixed** (`fd90159`, `8de82c5`) |
 | SYS-5 | Agent self-logs go to stdout, not stderr | agent | Low | P4 | No | spec and plan drafted |
 | SYS-6 | SD-ID uses enterprise number 32473 (reserved for documentation) | sender | Low | P5 | Cosmetic / policy | **won't fix** (owner decision 2026-11-11) |
 | SYS-7 | CI breaks on Rust ≥ 1.99: `fetch_update` is deprecated under `-D warnings` | build | Medium (blocks CI) | **P1** | n/a | **fixed** (`af3018c`) |
@@ -61,7 +61,7 @@ PR grouping, and the decisions still needed.
 
 ### SYS-1 — Multi-line event messages are split into several events
 
-**Status: fixed** in `5693b55` (sender) and `a508a6d` (UDP receiver), branch `develop_fix_bug_known-issues`, not yet merged. Agent-to-agent TCP with `octet_counting` still needs SYS-4.
+**Status: fixed** in `5693b55` (sender) and `a508a6d` (UDP receiver), branch `develop_fix_bug_known-issues`, not yet merged. Agent-to-agent TCP with `octet_counting` works since SYS-4 (`fd90159`).
 
 **Symptom.** Windows renders many event messages with embedded CRLF and
 tabs: 4624/4625/4688 (Security), 7045 (Service Control Manager),
@@ -209,7 +209,7 @@ relaxing the parser (name and PID each up to 128). Spec:
 
 ### SYS-4 — Syslog TCP/TLS input does not decode octet-counting framing
 
-**Status: open, spec and plan drafted.** **Next to implement**: #5 in the [Fix plan](#fix-plan). The minor choices have proposed answers.
+**Status: fixed** in `fd90159` (decoder) and `8de82c5` (`framing` option), branch `develop_fix_bug_known-issues`, not yet merged.
 
 Already recorded in the header spec, under "Out of scope" #1.
 `src/inputs/syslog.rs:344` (`:343` before `a508a6d`) only uses
@@ -227,6 +227,8 @@ UDP decodes lossily and does not have this problem.
 `<` or `{`), add an optional input `framing: auto | newline |
 octet_counting`, and decode UTF-8 lossily, as UDP does. Spec:
 `docs/superpowers/specs/2026-11-11-sys4-tcp-input-octet-counting.md`.
+`auto` does not detect octet-counted `raw` text (no `<` or `{` after the
+length); such senders need `framing: octet_counting` on the input.
 
 ---
 
@@ -424,12 +426,12 @@ and commits.
 | 2 | SYS-9 | **High** | `f6fb143` (refactor `71b954b`) | `2026-11-11-sys9-eventlog-xml-text-entities.md` |
 | 3 | SYS-8 | Low | `cb9586c` | `2026-11-11-sys8-eventlog-xml-attribute-unescape.md` |
 | 4 | SYS-1 | **High** | `5693b55`, `a508a6d` (option B) | `2026-11-11-sys1-multiline-messages-newline-framing.md` |
+| 5 | SYS-4 | Medium | `fd90159`, `8de82c5` | `2026-11-11-sys4-tcp-input-octet-counting.md` |
 
 **Remaining, in the order to do them:**
 
 | # | Issue | Severity | Effort | Blocked by | Why this position |
 |---|---|---|---|---|---|
-| **5** | **SYS-4** | Medium | Medium | nothing (the minor choices have proposed answers) | Completes SYS-1: carrying multi-line messages *unchanged* agent-to-agent needs octet-counting. It also stops one invalid UTF-8 byte from closing a TCP connection and dropping buffered events (found 2026-11-11). The fix with the most data-loss impact left. |
 | **6** | **SYS-2** | Medium | Small | nothing | When the agent is a relay, **the whole message** is lost for any SD value containing `[`. No decision is needed, and it is easy to test. |
 | **7** | **SYS-3** | Medium (proposed; was Low) | Small | nothing (option A decided 2026-11-11) | RDP logon providers lose `application`/`process_id` on RFC 3164, even on `main`. A smaller loss than SYS-2 (the event still arrives, in `message`). |
 | **8** | **SYS-5** | Low | 1 line + test | nothing | Corrupts the event stream, but only for `stdout` outputs that are consumed as data. |
@@ -467,9 +469,9 @@ in parts):
   Medium as proposed, unless the owner says otherwise.
 - ~~**SYS-6:** PEN, option, timing~~: decided 2026-11-11. The company has
   no IANA PEN. Keep `softnix@32473`, no code change (won't fix).
-- *Minor, with proposed answers that are used unless vetoed:* **SYS-4**:
+- *Minor, with proposed answers that are used unless vetoed:* ~~**SYS-4**:
   the detection rule (digits + SP + `<`/`{`), an input `framing` option,
-  and lossy UTF-8. **SYS-10**: Linux-only MSRV job.
+  and lossy UTF-8~~ (used as proposed). **SYS-10**: Linux-only MSRV job.
 - ~~**SYS-1:** how to handle CR/LF~~: decided 2026-11-11, option B (a
   space).
 
