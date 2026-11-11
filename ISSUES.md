@@ -37,7 +37,7 @@ elsewhere.
 | ID | Title | Side | Severity | Priority | Affects third-party receivers? | Status |
 |---|---|---|---|---|---|---|
 | SYS-1 | Multi-line event messages are split into several events | sender + receiver | **High** | P3 (spec first) | Yes (TCP, newline framing) | **fixed** (`5693b55`, `a508a6d`) |
-| SYS-2 | RFC 5424 parser ends STRUCTURED-DATA at the wrong `]` when a value contains `[` | receiver | Medium | P4 | No | spec and plan drafted |
+| SYS-2 | RFC 5424 parser ends STRUCTURED-DATA at the wrong `]` when a value contains `[` | receiver | Medium | P4 | No | **fixed** (`e755072`) |
 | SYS-3 | RFC 3164 parser rejects `TAG[PID]` longer than 48 characters | receiver | Medium (was Low) | P4 | No | spec and plan drafted, option A decided |
 | SYS-4 | Syslog TCP/TLS input does not decode octet-counting framing | receiver | Medium | P3 (with SYS-1) | No | **fixed** (`fd90159`, `8de82c5`) |
 | SYS-5 | Agent self-logs go to stdout, not stderr | agent | Low | P4 | No | spec and plan drafted |
@@ -126,7 +126,7 @@ unchanged. Spec:
 
 ### SYS-2 — RFC 5424 parser ends STRUCTURED-DATA at the wrong `]` when a value contains `[`
 
-**Status: open, spec and plan drafted.** Next in line: #6 in the [Fix plan](#fix-plan). No owner decision needed.
+**Status: fixed** in `e755072` (branch `develop_fix_bug_known-issues`, not yet merged).
 
 **Symptom.** When an SD PARAM-VALUE contains `[`, the receiver reads the
 whole rest of the line as STRUCTURED-DATA and `message` becomes empty.
@@ -158,10 +158,11 @@ contain `[` (rule names, paths, file names).
 inside `"…"`, honour `\"` / `\\` / `\]` escapes there, and count brackets
 only outside quotes. Add a regression test using the line above. If the
 scan finds no end of the SD (a malformed line, for example an unterminated
-quote), fall back to today's scan, so that line parses exactly as before.
+quote), fall back to the previous scan, so that line parses exactly as before.
 Spec:
 `docs/superpowers/specs/2026-11-11-sys2-rfc5424-sd-bracket-in-value.md`
-(re-verified 2026-11-11: 4/4 bug cases, 2/2 controls correct).
+(re-verified 2026-11-11: 4/4 bug cases, 2/2 controls correct). After the
+fix, the harness gives 6/6 correct in 3/3 runs.
 
 ---
 
@@ -427,12 +428,12 @@ and commits.
 | 3 | SYS-8 | Low | `cb9586c` | `2026-11-11-sys8-eventlog-xml-attribute-unescape.md` |
 | 4 | SYS-1 | **High** | `5693b55`, `a508a6d` (option B) | `2026-11-11-sys1-multiline-messages-newline-framing.md` |
 | 5 | SYS-4 | Medium | `fd90159`, `8de82c5` | `2026-11-11-sys4-tcp-input-octet-counting.md` |
+| 6 | SYS-2 | Medium | `e755072` | `2026-11-11-sys2-rfc5424-sd-bracket-in-value.md` |
 
 **Remaining, in the order to do them:**
 
 | # | Issue | Severity | Effort | Blocked by | Why this position |
 |---|---|---|---|---|---|
-| **6** | **SYS-2** | Medium | Small | nothing | When the agent is a relay, **the whole message** is lost for any SD value containing `[`. No decision is needed, and it is easy to test. |
 | **7** | **SYS-3** | Medium (proposed; was Low) | Small | nothing (option A decided 2026-11-11) | RDP logon providers lose `application`/`process_id` on RFC 3164, even on `main`. A smaller loss than SYS-2 (the event still arrives, in `message`). |
 | **8** | **SYS-5** | Low | 1 line + test | nothing | Corrupts the event stream, but only for `stdout` outputs that are consumed as data. |
 | **9** | **SYS-10** | Low | Small (CI) | **push access**, to see it run | A guard, not a fix. Every gate so far has checked 1.98 by hand, so nothing is at risk while it waits. It can only be verified on a real CI run. |
