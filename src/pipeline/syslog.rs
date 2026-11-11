@@ -91,26 +91,7 @@ fn parse_rfc5424(ev: &mut Event, line: &str) -> bool {
         stripped.trim_start()
     } else if tail.starts_with('[') {
         // find end of (possibly multiple) SD elements
-        let mut depth = 0usize;
-        let mut idx = tail.len();
-        let bytes = tail.as_bytes();
-        let mut i = 0;
-        while i < bytes.len() {
-            match bytes[i] {
-                b'[' => depth += 1,
-                b']' => {
-                    depth = depth.saturating_sub(1);
-                    if depth == 0 && (i + 1 >= bytes.len() || bytes[i + 1] != b'[') {
-                        idx = i + 1;
-                        break;
-                    }
-                }
-                b'\\' => i += 1, // skip escaped char
-                _ => {}
-            }
-            i += 1;
-        }
-        let (sd, m) = tail.split_at(idx.min(tail.len()));
+        let (sd, m) = tail.split_at(sd_end(tail));
         ev.fields
             .insert("structured_data".to_string(), Value::String(sd.to_string()));
         m.trim_start()
@@ -119,6 +100,65 @@ fn parse_rfc5424(ev: &mut Event, line: &str) -> bool {
     };
     ev.message = msg.strip_prefix('\u{feff}').unwrap_or(msg).to_string();
     true
+}
+
+/// Byte index just past the last SD-ELEMENT of `tail`, which starts with `[`.
+/// The index always follows an ASCII `]` (or is `tail.len()`), so it is a
+/// char boundary.
+fn sd_end(tail: &str) -> usize {
+    sd_end_by_grammar(tail).unwrap_or_else(|| sd_end_by_brackets(tail))
+}
+
+/// The RFC 5424 §6.3 grammar: `[` and `]` delimit SD-ELEMENTs only outside a
+/// quoted PARAM-VALUE, and inside quotes `\` escapes the next byte (`\"`,
+/// `\\`, `\]`). Returns `None` when the line ends before the SD does, which
+/// means the SD is malformed (for example an unterminated quote).
+fn sd_end_by_grammar(tail: &str) -> Option<usize> {
+    let bytes = tail.as_bytes();
+    let mut depth = 0usize;
+    let mut in_quotes = false;
+    let mut i = 0;
+    while i < bytes.len() {
+        match (in_quotes, bytes[i]) {
+            (true, b'\\') => i += 1, // skip the escaped byte
+            (true, b'"') => in_quotes = false,
+            (false, b'"') => in_quotes = true,
+            (false, b'[') => depth += 1,
+            (false, b']') => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 && bytes.get(i + 1) != Some(&b'[') {
+                    return Some(i + 1);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// The scan used before SYS-2: every `[` and `]` counts, quoted or not. Kept
+/// for malformed SD only, so such a line parses exactly as it always has.
+/// Returns `tail.len()` when it finds no end either.
+fn sd_end_by_brackets(tail: &str) -> usize {
+    let bytes = tail.as_bytes();
+    let mut depth = 0usize;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'[' => depth += 1,
+            b']' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 && (i + 1 >= bytes.len() || bytes[i + 1] != b'[') {
+                    return i + 1;
+                }
+            }
+            b'\\' => i += 1, // skip escaped char
+            _ => {}
+        }
+        i += 1;
+    }
+    tail.len()
 }
 
 /// RFC3164: <PRI>Mmm dd hh:mm:ss HOSTNAME TAG[pid]: MSG
@@ -213,6 +253,119 @@ mod tests {
         assert_eq!(ev.process_id.as_deref(), Some("2317"));
         assert_eq!(ev.message, "An application event");
         assert!(ev.fields.contains_key("structured_data"));
+    }
+
+    /// Parse an RFC 5424 line whose STRUCTURED-DATA and MSG are `tail`.
+    /// Returns the `structured_data` field and `message`.
+    fn parse_sd(tail: &str) -> (Option<String>, String) {
+        let mut ev = Event::new("net", "syslog", "");
+        let line = format!("<165>1 2026-06-10T22:14:15Z h1 app 1 ID47 {tail}");
+        assert!(parse_rfc5424(&mut ev, &line));
+        let sd = ev
+            .fields
+            .get("structured_data")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        (sd, ev.message)
+    }
+
+    fn assert_sd(tail: &str, sd: &str, message: &str) {
+        let (got_sd, got_message) = parse_sd(tail);
+        assert_eq!(got_sd.as_deref(), Some(sd), "structured_data of {tail:?}");
+        assert_eq!(got_message, message, "message of {tail:?}");
+    }
+
+    // SYS-2: `[` inside a quoted PARAM-VALUE is valid (RFC 5424 §6.3.3) and
+    // must not be counted as an SD-ELEMENT bracket.
+    #[test]
+    fn sd_value_with_open_bracket_keeps_message() {
+        assert_sd(
+            r#"[ex@32473 k="open [ only"] hello"#,
+            r#"[ex@32473 k="open [ only"]"#,
+            "hello",
+        );
+    }
+
+    #[test]
+    fn sd_value_with_escaped_close_and_open_bracket() {
+        assert_sd(
+            r#"[ex@32473 rule="Contoso [TCP 443\]"] hello"#,
+            r#"[ex@32473 rule="Contoso [TCP 443\]"]"#,
+            "hello",
+        );
+    }
+
+    #[test]
+    fn sd_value_bracket_in_first_of_two_elements() {
+        assert_sd(
+            r#"[a@32473 k="x [y\]"][b@32473 z="1"] hello"#,
+            r#"[a@32473 k="x [y\]"][b@32473 z="1"]"#,
+            "hello",
+        );
+    }
+
+    #[test]
+    fn sd_escaped_quote_before_bracket_in_value() {
+        assert_sd(
+            r#"[ex@32473 k="a\"]b"] hello"#,
+            r#"[ex@32473 k="a\"]b"]"#,
+            "hello",
+        );
+    }
+
+    #[test]
+    fn sd_plain_and_escaped_close_unchanged() {
+        assert_sd(
+            r#"[ex@32473 k="plain"] hello"#,
+            r#"[ex@32473 k="plain"]"#,
+            "hello",
+        );
+        assert_sd(
+            r#"[ex@32473 k="a\]b"] hello"#,
+            r#"[ex@32473 k="a\]b"]"#,
+            "hello",
+        );
+    }
+
+    #[test]
+    fn sd_escaped_backslash_before_closing_quote() {
+        assert_sd(
+            r#"[ex@32473 k="a\\"] hello"#,
+            r#"[ex@32473 k="a\\"]"#,
+            "hello",
+        );
+    }
+
+    /// Malformed SD (an unterminated quote): parsed as before SYS-2.
+    #[test]
+    fn sd_unterminated_quote_falls_back_to_old_scan() {
+        assert_sd(
+            r#"[ex@32473 k="never closed] hello"#,
+            r#"[ex@32473 k="never closed]"#,
+            "hello",
+        );
+    }
+
+    /// Malformed SD whose stray quote pairs up with a quote in MSG: the
+    /// grammar scan ends outside quotes without finding an end, and the old
+    /// scan decides.
+    #[test]
+    fn sd_stray_quotes_fall_back_to_old_scan() {
+        assert_sd(
+            r#"[ex@32473 k="5" screen"] it's ""#,
+            r#"[ex@32473 k="5" screen"]"#,
+            r#"it's ""#,
+        );
+    }
+
+    #[test]
+    fn sd_without_message_unchanged() {
+        assert_sd(r#"[ex@32473 k="v"]"#, r#"[ex@32473 k="v"]"#, "");
+    }
+
+    #[test]
+    fn sd_nilvalue_unchanged() {
+        assert_eq!(parse_sd("- hello"), (None, "hello".to_string()));
     }
 
     #[test]
