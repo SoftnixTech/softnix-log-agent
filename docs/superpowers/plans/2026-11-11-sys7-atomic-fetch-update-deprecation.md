@@ -222,7 +222,7 @@ No commit (R-4).
 ### Task 4: push, PR and CI (owner, blocked)
 
 - [ ] **Step 1:** Get write access to `SoftnixTech/softnix-log-agent` (the account currently has `"push": false`), or agree on a fork workflow. A fork of this public repo is public.
-- [ ] **Step 2:** `git push -u origin fix/sys-7-atomic-update`, then open the PR against the base the owner picks (`main` or `develop`, R-1). The PR body ends with the Claude Code attribution line.
+- [ ] **Step 2:** `git push -u origin develop_fix_bug_known-issues` (the branch was renamed from `fix/sys-7-atomic-update` on 2026-11-11, so it can carry every `ISSUES.md` fix), then open the PR against the base the owner picks (`main` or `develop`, R-1). The PR body ends with the Claude Code attribution line.
 - [ ] **Step 3 (spec V5):** All of `test-linux`, `test-windows` and `lint` must be green. If `test-windows` fails on a *different* deprecation in `#[cfg(windows)]` code, that is a new issue (record it as SYS-n), not part of this PR, unless it is just as trivial.
 - [ ] **Step 4:** After merge, rebase `develop_fix_bug_windows-provider-name` onto the updated base so its CI picks up the fix. Then update SYS-7's status line to say "merged in #<PR>".
 

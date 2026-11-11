@@ -204,7 +204,7 @@ change for SIEM parsers, so it needs an owner decision and a release note.
 
 ### SYS-7 — CI breaks on Rust ≥ 1.99: `fetch_update` is deprecated under `-D warnings`
 
-**Status: fixed** in `af3018c` (branch `fix/sys-7-atomic-update`, not yet merged).
+**Status: fixed** in `af3018c` (branch `develop_fix_bug_known-issues`, not yet merged).
 
 `src/engine.rs:251` calls `AtomicU64::fetch_update`, which is deprecated in
 favour of `try_update` as of the 1.99 toolchain used locally. CI installs
