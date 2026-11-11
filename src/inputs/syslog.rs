@@ -198,14 +198,15 @@ impl SyslogInput {
                                 continue;
                             }
                             let text = String::from_utf8_lossy(&buf[..n]);
-                            for line in text.lines() {
-                                let line = line.trim();
-                                if line.is_empty() { continue; }
-                                let ev = self.make_event(line, &peer);
-                                metrics.events_received.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                status.update_input(&self.cfg.id, |s| s.events += 1);
-                                if tx.send(ev).await.is_err() { return; }
-                            }
+                            // RFC 5426 §3.1: one syslog message per datagram.
+                            // Do not split on LF: a multi-line message (a
+                            // Windows event) is still one event (SYS-1).
+                            let line = text.trim();
+                            if line.is_empty() { continue; }
+                            let ev = self.make_event(line, &peer);
+                            metrics.events_received.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            status.update_input(&self.cfg.id, |s| s.events += 1);
+                            if tx.send(ev).await.is_err() { return; }
                         }
                         Err(e) => {
                             let msg = format!("syslog {} udp recv: {e}", self.cfg.id);
@@ -663,6 +664,77 @@ mod tests {
         assert_eq!(ev.message, "hello udp");
         assert_eq!(ev.hostname.as_deref(), Some("host1"));
         assert_eq!(ev.severity, Some(5));
+        cancel.cancel();
+    }
+
+    /// Start a UDP input on an ephemeral port; returns where to send and the
+    /// channel its events arrive on.
+    async fn start_udp() -> (SocketAddr, mpsc::Receiver<Event>, CancellationToken) {
+        let cfg = test_cfg(SyslogProtocol::Udp, 0);
+        let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = sock.local_addr().unwrap();
+        let input = SyslogInput::new(&cfg);
+        let (raw_tx, rx) = mpsc::channel(16);
+        let tx = EventSender::with_budget(raw_tx, 16 * 1024 * 1024);
+        let status = Arc::new(StatusRegistry::default());
+        status.set_input(InputStatus {
+            id: "test".into(),
+            ..Default::default()
+        });
+        let metrics = Arc::new(Metrics::default());
+        let cancel = CancellationToken::new();
+        tokio::spawn(input.run_udp(sock, tx, status, metrics, cancel.clone()));
+        (addr, rx, cancel)
+    }
+
+    /// SYS-1: RFC 5426 says one syslog message per datagram, so a multi-line
+    /// message (a Windows event) must arrive as one event, not one per line.
+    #[tokio::test]
+    async fn udp_datagram_is_one_event() {
+        let (addr, mut rx, cancel) = start_udp().await;
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        client
+            .send_to(
+                b"<13>Jun 10 12:00:00 host1 app[7]: line one\r\nline two\r\nline three",
+                addr,
+            )
+            .await
+            .unwrap();
+
+        let ev = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(ev.message, "line one\r\nline two\r\nline three");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), rx.recv())
+                .await
+                .is_err(),
+            "the datagram was split into several events"
+        );
+        cancel.cancel();
+    }
+
+    #[tokio::test]
+    async fn udp_trailing_newline_still_one_event() {
+        let (addr, mut rx, cancel) = start_udp().await;
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        client
+            .send_to(b"<13>Jun 10 12:00:00 host1 app[7]: hello\n", addr)
+            .await
+            .unwrap();
+
+        let ev = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(ev.message, "hello");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), rx.recv())
+                .await
+                .is_err(),
+            "a trailing newline must not produce a second, empty event"
+        );
         cancel.cancel();
     }
 
