@@ -54,6 +54,8 @@ PR grouping, and the decisions still needed.
 
 ### SYS-1 — Multi-line event messages are split into several events
 
+**Status: fixed** in `5693b55` (sender) and `a508a6d` (UDP receiver), branch `develop_fix_bug_known-issues`, not yet merged. Agent-to-agent TCP with `octet_counting` still needs SYS-4.
+
 **Symptom.** Windows renders many event messages with embedded CRLF and
 tabs: 4624/4625/4688 (Security), 7045 (Service Control Manager),
 Application Error 1000, Sysmon. On the receiver, each line becomes its own
@@ -96,7 +98,7 @@ end up in fragments that a SIEM cannot correlate back to the event, so
 detections keyed on 4624/4625 do not see them. `framing: newline` is the
 default, so every TCP deployment is affected.
 
-**Fix options (decision needed, so write a spec first).**
+**Fix options** (decided 2026-11-11: option B, a space, as described below).
 - Sender: on newline framing, escape or replace CR/LF/TAB in MSG, e.g.
   rsyslog-style `#015#012`, `\r\n` → literal `\n`, or replace with a space.
   This changes the text SIEMs see.
@@ -104,6 +106,14 @@ default, so every TCP deployment is affected.
   agent-to-agent traffic.
 - Receiver UDP: treat one datagram as one message (drop the `lines()`
   split, or trim only the trailing newline).
+
+**Fix.** With `framing: newline`, each line break inside an event is
+written as one space (`frame_batch`, which covers TCP, TLS and stdout). A
+space keeps field extraction such as `Account Name:\s+(\S+)` correct, while
+rsyslog-style `#012` breaks it. The agent's UDP input treats one datagram as
+one event. `octet_counting` and `format: json` carry multi-line messages
+unchanged. Spec:
+`docs/superpowers/specs/2026-11-11-sys1-multiline-messages-newline-framing.md`.
 
 ---
 
@@ -343,7 +353,7 @@ work, by effort, and by whether an owner decision is needed first.
 | **P1** | SYS-7 | Medium | 1 line | No | Blocks CI for every PR, including the provider-name fix waiting to merge. Fixed in `af3018c` (`update`, verified on MSRV 1.98). |
 | **P2** | SYS-9 | **High** | Medium | No | Security fields (`CommandLine` for Sysmon and 4688) are lost at the source, whatever the output, and no config works around it. Fixed in `f6fb143`. |
 | **P2** | SYS-8 | Low | Small | No | Same parser as SYS-9, so it can be fixed in the same change for almost no extra cost. Fixed in `cb9586c`. |
-| **P3** | SYS-1 | **High** | Large | **Yes** | Affects every TCP receiver with newline framing, which is the default. The escaping choice changes what SIEMs see, so it needs a spec. Start the spec in parallel with P1 and P2. |
+| **P3** | SYS-1 | **High** | Large | **Yes** | Affects every TCP receiver with newline framing, which is the default. The escaping choice changes what SIEMs see, so it needs a spec. Start the spec in parallel with P1 and P2. Fixed in `5693b55`/`a508a6d` (option B). |
 | **P3** | SYS-4 | Medium | Medium | Minor | The agent-to-agent workaround for SYS-1, so design it in the same spec. |
 | **P4** | SYS-2 | Medium | Small | No | Only when the agent is a relay, but the whole message is lost. Easy to fix and to test. |
 | **P4** | SYS-3 | Low | Small | **Yes** | Choose between relaxing the parser and capping TAG on the sender. Recommended: relax the parser, so no sender data is lost. |
@@ -366,8 +376,8 @@ work, by effort, and by whether an owner decision is needed first.
 
 **Owner decisions needed** (these can happen in parallel with PR-A and PR-B):
 
-- **SYS-1:** how to handle CR/LF in MSG on newline framing: rsyslog-style
-  `#015#012`, replace with a space, or recommend octet-counting.
+- **SYS-1:** ~~how to handle CR/LF in MSG on newline framing~~ decided
+  2026-11-11: replace each line break with a space (option B).
 - **SYS-3:** relax the parser, or cap the sender's TAG.
 - **SYS-6:** does the company have an IANA PEN, and when should the SD-ID
   change?
