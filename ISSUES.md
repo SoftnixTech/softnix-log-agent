@@ -259,6 +259,8 @@ names rarely contain `&`, `'`, `"`, `<` or `>`.
 
 ### SYS-9 — Eventlog `EventData` values containing XML entities are truncated and split
 
+**Status: fixed** in `f6fb143` (refactor `71b954b`, branch `develop_fix_bug_known-issues`, not yet merged).
+
 **Symptom.** Any `<Data>` value that contains an XML entity is cut at the
 first entity. The remainder becomes extra, unnamed Data items, and the
 escaped characters themselves are lost. Well-formed XML always escapes
@@ -284,7 +286,9 @@ Similarly, `Tom &amp; Jerry` becomes `"Tom "`.
 
 **Root cause.** `quick-xml` 0.41 reports each entity reference as a
 separate `Event::GeneralRef`, and splits the surrounding text into
-several `Event::Text` events. `parse_event_xml` (`eventlog.rs:851`) only
+several `Event::Text` events. `parse_event_xml` (`eventlog.rs:851`; line
+numbers are from before `71b954b` moved the parser to
+`src/inputs/eventlog_xml.rs`) only
 handles `Text`, and pushes every text chunk as its own Data item, using
 `std::mem::take` on the name for the first chunk only. `GeneralRef`
 events fall into `_ => {}` and are dropped. The comment above the `Text`
@@ -300,8 +304,10 @@ the fallback message (joined `EventData`) is truncated the same way.
 **Fix.** Accumulate the text of the current element across `Text` and
 `GeneralRef` events: resolve `amp`, `lt`, `gt`, `quot`, `apos` and
 numeric references from `GeneralRef`, and push the Data item once, on
-`End`. Add a `#[cfg(windows)]` unit test with the input above, so it also
-runs in CI's `test-windows` job.
+`End`. The parser was first moved to `src/inputs/eventlog_xml.rs`
+(`cfg(any(windows, test))`), so its tests run in every CI job and locally,
+not only `test-windows`. Spec:
+`docs/superpowers/specs/2026-11-11-sys9-eventlog-xml-text-entities.md`.
 
 ---
 
@@ -328,7 +334,7 @@ work, by effort, and by whether an owner decision is needed first.
 | Priority | Issue | Severity | Effort | Owner decision? | Why this position |
 |---|---|---|---|---|---|
 | **P1** | SYS-7 | Medium | 1 line | No | Blocks CI for every PR, including the provider-name fix waiting to merge. Fixed in `af3018c` (`update`, verified on MSRV 1.98). |
-| **P2** | SYS-9 | **High** | Medium | No | Security fields (`CommandLine` for Sysmon and 4688) are lost at the source, whatever the output, and no config works around it. |
+| **P2** | SYS-9 | **High** | Medium | No | Security fields (`CommandLine` for Sysmon and 4688) are lost at the source, whatever the output, and no config works around it. Fixed in `f6fb143`. |
 | **P2** | SYS-8 | Low | Small | No | Same parser as SYS-9, so it can be fixed in the same change for almost no extra cost. |
 | **P3** | SYS-1 | **High** | Large | **Yes** | Affects every TCP receiver with newline framing, which is the default. The escaping choice changes what SIEMs see, so it needs a spec. Start the spec in parallel with P1 and P2. |
 | **P3** | SYS-4 | Medium | Medium | Minor | The agent-to-agent workaround for SYS-1, so design it in the same spec. |
@@ -343,8 +349,8 @@ work, by effort, and by whether an owner decision is needed first.
 1. **PR-A — SYS-7.** Either a small standalone PR, or a commit on
    `develop_fix_bug_windows-provider-name`. It goes first so that CI passes
    and the provider-name fix can merge.
-2. **PR-B — SYS-9 + SYS-8** (eventlog parser). Needs tests that run in CI's
-   `test-windows` job, because this code only compiles on Windows.
+2. **PR-B — SYS-9 + SYS-8** (eventlog parser). The parser's tests now run
+   on every platform (`71b954b`).
 3. **PR-C — SYS-2 + SYS-3 + SYS-5** (receiver parsers and logging). Three
    small TDD changes. Starts once the owner has chosen the SYS-3 option.
 4. **PR-D — SYS-1 + SYS-4** (framing). Spec, then plan, then
