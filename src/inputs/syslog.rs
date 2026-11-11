@@ -1,13 +1,14 @@
 //! Syslog receiver: UDP, TCP and TLS listeners with RFC3164/RFC5424/JSON/raw
-//! parsing and newline framing for stream transports.
+//! parsing. Stream transports accept newline and octet-counted framing (RFC 6587).
 
-use crate::config::{parse_ip_net, SyslogInputConfig, SyslogProtocol};
+use crate::config::{parse_ip_net, InputFraming, SyslogInputConfig, SyslogProtocol};
 use crate::engine::EventSender;
 use crate::event::Event;
 use crate::metrics::{InputStatus, Metrics, StatusRegistry};
 use crate::pipeline::parse_syslog_into;
 use crate::tls;
 use anyhow::{Context, Result};
+use bytes::{Buf, BytesMut};
 use ipnet::IpNet;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -17,10 +18,199 @@ use tokio::io::AsyncRead;
 use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::Semaphore;
 use tokio_stream::StreamExt;
-use tokio_util::codec::{FramedRead, LinesCodec};
+use tokio_util::codec::{Decoder, FramedRead};
 use tokio_util::sync::CancellationToken;
 
 const MAX_MSG: usize = 64 * 1024;
+
+/// Longest MSG-LEN the decoder reads. Six digits cover `MAX_MSG` (65536).
+const MAX_LEN_DIGITS: usize = 6;
+
+/// What the start of the buffer says about RFC 6587 octet-counting.
+enum OctetHeader {
+    /// `MSG-LEN SP` is complete: `header_len` bytes of header, then a
+    /// message of `msg_len` bytes.
+    Frame { header_len: usize, msg_len: usize },
+    /// Still a possible header prefix (such as `12`); more bytes decide.
+    Undecided,
+    /// Not an octet-counting header.
+    No,
+}
+
+/// Read `MSG-LEN SP` at the start of `buf` (which must not be empty).
+/// MSG-LEN is 1 to `MAX_LEN_DIGITS` ASCII digits with no leading zero. With
+/// `need_msg_start`, the byte after the space must also be `<` (a syslog
+/// PRI) or `{` (JSON): that is what tells a real header from a plain-text
+/// line that happens to begin with a number, such as `200 OK`.
+fn octet_header(buf: &[u8], need_msg_start: bool) -> OctetHeader {
+    let digits = buf
+        .iter()
+        .take(MAX_LEN_DIGITS + 1)
+        .take_while(|b| b.is_ascii_digit())
+        .count();
+    if digits == 0 || digits > MAX_LEN_DIGITS || buf[0] == b'0' {
+        return OctetHeader::No;
+    }
+    match buf.get(digits) {
+        None => return OctetHeader::Undecided,
+        Some(b' ') => {}
+        Some(_) => return OctetHeader::No,
+    }
+    if need_msg_start {
+        match buf.get(digits + 1) {
+            None => return OctetHeader::Undecided,
+            Some(b'<' | b'{') => {}
+            Some(_) => return OctetHeader::No,
+        }
+    }
+    let msg_len = buf[..digits]
+        .iter()
+        .fold(0usize, |n, d| n * 10 + usize::from(d - b'0'));
+    OctetHeader::Frame {
+        header_len: digits + 1,
+        msg_len,
+    }
+}
+
+fn lossy(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes).into_owned()
+}
+
+fn too_long(len: usize, max: usize) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        format!("syslog frame of {len} bytes exceeds the {max}-byte limit"),
+    )
+}
+
+/// Frame decoder for the TCP/TLS input (RFC 6587): octet-counted frames
+/// (`MSG-LEN SP MSG`, §3.4.1) and newline-terminated lines (§3.4.2), detected
+/// per frame in `auto` mode so both can share one connection.
+///
+/// Unlike `LinesCodec`, which this replaces, invalid UTF-8 is decoded lossily
+/// (as the UDP path does) instead of ending the connection, so one
+/// legacy-encoded byte cannot drop everything still buffered behind it.
+struct SyslogFrameCodec {
+    mode: InputFraming,
+    max: usize,
+    /// How much of the pending newline frame was already searched for `\n`.
+    scanned: usize,
+}
+
+impl SyslogFrameCodec {
+    fn new(mode: InputFraming, max: usize) -> Self {
+        Self {
+            mode,
+            max,
+            scanned: 0,
+        }
+    }
+
+    fn header(&self, buf: &[u8]) -> OctetHeader {
+        match self.mode {
+            InputFraming::Newline => OctetHeader::No,
+            InputFraming::Auto => octet_header(buf, true),
+            InputFraming::OctetCounting => octet_header(buf, false),
+        }
+    }
+
+    /// One newline-terminated line, without its `\n` and one trailing `\r`.
+    /// A line longer than `max` is an error, as with `LinesCodec`.
+    fn decode_line(&mut self, buf: &mut BytesMut) -> std::io::Result<Option<String>> {
+        let from = self.scanned.min(buf.len());
+        match buf[from..].iter().position(|b| *b == b'\n') {
+            Some(off) => {
+                let end = from + off;
+                self.scanned = 0;
+                if end > self.max {
+                    return Err(too_long(end, self.max));
+                }
+                let line = buf.split_to(end + 1);
+                let line = &line[..end];
+                Ok(Some(lossy(line.strip_suffix(b"\r").unwrap_or(line))))
+            }
+            None if buf.len() > self.max => Err(too_long(buf.len(), self.max)),
+            None => {
+                self.scanned = buf.len();
+                Ok(None)
+            }
+        }
+    }
+}
+
+impl Decoder for SyslogFrameCodec {
+    type Item = String;
+    type Error = std::io::Error;
+
+    fn decode(&mut self, buf: &mut BytesMut) -> std::io::Result<Option<String>> {
+        // Between frames, skip CR/LF: an empty line, or the LF some senders
+        // add after an octet-counted frame.
+        if self.scanned == 0 {
+            let skip = buf
+                .iter()
+                .take_while(|b| matches!(**b, b'\r' | b'\n'))
+                .count();
+            buf.advance(skip);
+        }
+        if buf.is_empty() {
+            return Ok(None);
+        }
+        match self.header(buf) {
+            OctetHeader::Frame {
+                header_len,
+                msg_len,
+            } => {
+                if msg_len > self.max {
+                    return Err(too_long(msg_len, self.max));
+                }
+                let total = header_len + msg_len;
+                if buf.len() < total {
+                    buf.reserve(total - buf.len());
+                    return Ok(None);
+                }
+                buf.advance(header_len);
+                Ok(Some(lossy(&buf.split_to(msg_len))))
+            }
+            OctetHeader::Undecided => Ok(None),
+            OctetHeader::No if self.mode == InputFraming::OctetCounting => {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "malformed octet-counting header (expected `MSG-LEN SP`)",
+                ))
+            }
+            OctetHeader::No => self.decode_line(buf),
+        }
+    }
+
+    fn decode_eof(&mut self, buf: &mut BytesMut) -> std::io::Result<Option<String>> {
+        if let Some(frame) = self.decode(buf)? {
+            return Ok(Some(frame));
+        }
+        if buf.is_empty() {
+            return Ok(None);
+        }
+        // What is left is a frame the sender never finished.
+        let truncated_octet = match self.header(buf) {
+            OctetHeader::Frame { .. } => true,
+            OctetHeader::Undecided => self.mode == InputFraming::OctetCounting,
+            OctetHeader::No => false,
+        };
+        self.scanned = 0;
+        let rest = buf.split_to(buf.len());
+        if truncated_octet {
+            // Not a valid message: drop it rather than deliver a partial event.
+            tracing::debug!(
+                "syslog: dropping a truncated octet-counted frame ({} bytes) at end of stream",
+                rest.len()
+            );
+            return Ok(None);
+        }
+        // A last line without its `\n` (or a lone header prefix such as
+        // `12 `) is delivered, as `LinesCodec` did.
+        let line = rest.strip_suffix(b"\r").unwrap_or(&rest);
+        Ok(Some(lossy(line)))
+    }
+}
 
 /// Log a rejection (allowlist or connection-cap) at most once every 100
 /// occurrences per `counter`, mirroring the shedding-log idiom already used
@@ -341,7 +531,8 @@ impl SyslogInput {
         metrics: &Metrics,
         cancel: CancellationToken,
     ) -> Result<()> {
-        let mut frames = FramedRead::new(stream, LinesCodec::new_with_max_length(MAX_MSG));
+        let mut frames =
+            FramedRead::new(stream, SyslogFrameCodec::new(InputFraming::Auto, MAX_MSG));
         // Slowloris guard: a peer that opens the connection and then sends
         // (or reads) nothing must not hold the connection-limit slot and its
         // file descriptor forever.
@@ -772,6 +963,212 @@ mod tests {
             .unwrap();
         assert_eq!(e2.message, "raw second line");
         cancel.cancel();
+    }
+
+    /// SYS-4: octet-counted frames are delivered one event per frame while
+    /// the connection is still open, and a line break inside a frame stays.
+    #[tokio::test]
+    async fn tcp_receives_octet_counted_frames() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let input = SyslogInput::new(&test_cfg(SyslogProtocol::Tcp, 0));
+        let (raw_tx, mut rx) = mpsc::channel(16);
+        let tx = EventSender::with_budget(raw_tx, 16 * 1024 * 1024);
+        let status = Arc::new(StatusRegistry::default());
+        status.set_input(InputStatus {
+            id: "test".into(),
+            ..Default::default()
+        });
+        let metrics = Arc::new(Metrics::default());
+        let cancel = CancellationToken::new();
+        tokio::spawn(input.run_tcp(listener, None, tx, status, metrics, cancel.clone()));
+
+        let mut payload = Vec::new();
+        for msg in ["first", "line a\r\nline b", "third"] {
+            let frame = format!("<165>1 2026-06-10T22:14:15Z h1 app 1 - - {msg}");
+            payload.extend_from_slice(format!("{} {frame}", frame.len()).as_bytes());
+        }
+        use tokio::io::AsyncWriteExt;
+        let mut conn = tokio::net::TcpStream::connect(addr).await.unwrap();
+        conn.write_all(&payload).await.unwrap();
+        conn.flush().await.unwrap();
+
+        // `conn` stays open: every event must arrive without waiting for EOF.
+        for want in ["first", "line a\r\nline b", "third"] {
+            let ev = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+                .await
+                .expect("an octet-counted frame must be delivered before the sender closes")
+                .unwrap();
+            assert_eq!(ev.message, want);
+            assert_eq!(ev.application.as_deref(), Some("app"));
+        }
+        drop(conn);
+        cancel.cancel();
+    }
+
+    fn codec(mode: InputFraming) -> SyslogFrameCodec {
+        SyslogFrameCodec::new(mode, MAX_MSG)
+    }
+
+    /// Decode until the codec asks for more bytes.
+    fn decode_all(c: &mut SyslogFrameCodec, buf: &mut BytesMut) -> Vec<String> {
+        let mut out = Vec::new();
+        while let Some(frame) = c.decode(buf).unwrap() {
+            out.push(frame);
+        }
+        out
+    }
+
+    #[test]
+    fn octet_frames_decode_one_per_frame() {
+        let mut buf = BytesMut::from(&b"12 <14>1 a b\r\nc5 <1>xy"[..]);
+        assert_eq!(
+            decode_all(&mut codec(InputFraming::Auto), &mut buf),
+            ["<14>1 a b\r\nc", "<1>xy"]
+        );
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn octet_frame_split_across_reads() {
+        let mut c = codec(InputFraming::Auto);
+        let mut buf = BytesMut::from(&b"1"[..]);
+        assert_eq!(c.decode(&mut buf).unwrap(), None);
+        buf.extend_from_slice(b"2 <14>1");
+        assert_eq!(c.decode(&mut buf).unwrap(), None);
+        buf.extend_from_slice(b" a b\r\nc");
+        assert_eq!(
+            c.decode(&mut buf).unwrap().as_deref(),
+            Some("<14>1 a b\r\nc")
+        );
+        assert_eq!(c.decode(&mut buf).unwrap(), None);
+    }
+
+    #[test]
+    fn mixed_frames_on_one_connection() {
+        let mut buf = BytesMut::from(&b"<13>line one\n5 <1>xy<13>line two\n"[..]);
+        assert_eq!(
+            decode_all(&mut codec(InputFraming::Auto), &mut buf),
+            ["<13>line one", "<1>xy", "<13>line two"]
+        );
+    }
+
+    #[test]
+    fn newline_line_starting_with_digits_stays_a_line() {
+        let mut buf = BytesMut::from(&b"200 OK fine\n"[..]);
+        assert_eq!(
+            decode_all(&mut codec(InputFraming::Auto), &mut buf),
+            ["200 OK fine"]
+        );
+    }
+
+    #[test]
+    fn crlf_line_ending_is_stripped() {
+        let mut buf = BytesMut::from(&b"<13>dos line\r\n"[..]);
+        assert_eq!(
+            decode_all(&mut codec(InputFraming::Auto), &mut buf),
+            ["<13>dos line"]
+        );
+    }
+
+    #[test]
+    fn octet_frame_too_long_is_an_error() {
+        let mut buf = BytesMut::from(&b"70000 <14>1 x"[..]);
+        assert!(codec(InputFraming::Auto).decode(&mut buf).is_err());
+    }
+
+    #[test]
+    fn invalid_utf8_is_decoded_lossily() {
+        let mut buf = BytesMut::from(&b"<13>caf\xff one\n10 <13>caf\xff 2"[..]);
+        assert_eq!(
+            decode_all(&mut codec(InputFraming::Auto), &mut buf),
+            ["<13>caf\u{fffd} one", "<13>caf\u{fffd} 2"]
+        );
+    }
+
+    #[test]
+    fn explicit_octet_counting_accepts_raw_payload() {
+        let mut buf = BytesMut::from(&b"5 hello"[..]);
+        assert_eq!(
+            decode_all(&mut codec(InputFraming::OctetCounting), &mut buf),
+            ["hello"]
+        );
+        // The same bytes in `auto` are a line: no `<` or `{` after the header.
+        let mut buf = BytesMut::from(&b"5 hello\n"[..]);
+        assert_eq!(
+            decode_all(&mut codec(InputFraming::Auto), &mut buf),
+            ["5 hello"]
+        );
+    }
+
+    #[test]
+    fn explicit_octet_counting_rejects_bad_header() {
+        let mut buf = BytesMut::from(&b"hello\n"[..]);
+        assert!(codec(InputFraming::OctetCounting).decode(&mut buf).is_err());
+    }
+
+    #[test]
+    fn explicit_newline_mode_is_linescodec() {
+        let mut buf = BytesMut::from(&b"12 <14>1 a b\n"[..]);
+        assert_eq!(
+            decode_all(&mut codec(InputFraming::Newline), &mut buf),
+            ["12 <14>1 a b"]
+        );
+    }
+
+    #[test]
+    fn partial_header_waits_then_decides() {
+        let mut c = codec(InputFraming::Auto);
+        let mut buf = BytesMut::from(&b"12"[..]);
+        assert_eq!(c.decode(&mut buf).unwrap(), None);
+        buf.extend_from_slice(b" ");
+        assert_eq!(c.decode(&mut buf).unwrap(), None);
+        buf.extend_from_slice(b"OK\n");
+        assert_eq!(c.decode(&mut buf).unwrap().as_deref(), Some("12 OK"));
+    }
+
+    #[test]
+    fn trailing_lf_after_octet_frame_is_skipped() {
+        let mut buf = BytesMut::from(&b"5 <1>xy\n5 <1>zz"[..]);
+        assert_eq!(
+            decode_all(&mut codec(InputFraming::Auto), &mut buf),
+            ["<1>xy", "<1>zz"]
+        );
+    }
+
+    #[test]
+    fn newline_line_too_long_is_an_error() {
+        let mut c = codec(InputFraming::Auto);
+        // Exactly MAX_MSG bytes with no `\n` yet may still grow into a line...
+        let mut buf = BytesMut::from(&vec![b'x'; MAX_MSG][..]);
+        assert_eq!(c.decode(&mut buf).unwrap(), None);
+        // ...one more byte may not.
+        buf.extend_from_slice(b"x");
+        assert!(c.decode(&mut buf).is_err());
+    }
+
+    #[test]
+    fn eof_drops_incomplete_octet_frame() {
+        let mut buf = BytesMut::from(&b"12 <14>1 a"[..]);
+        assert_eq!(
+            codec(InputFraming::Auto).decode_eof(&mut buf).unwrap(),
+            None
+        );
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn eof_returns_pending_line_and_undecided_prefix() {
+        let mut c = codec(InputFraming::Auto);
+        let mut buf = BytesMut::from(&b"last line"[..]);
+        assert_eq!(
+            c.decode_eof(&mut buf).unwrap().as_deref(),
+            Some("last line")
+        );
+        assert_eq!(c.decode_eof(&mut buf).unwrap(), None);
+
+        let mut buf = BytesMut::from(&b"12 "[..]);
+        assert_eq!(c.decode_eof(&mut buf).unwrap().as_deref(), Some("12 "));
     }
 
     #[test]

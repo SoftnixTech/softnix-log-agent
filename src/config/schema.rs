@@ -130,6 +130,21 @@ pub enum SyslogFormat {
     Raw,
 }
 
+/// How a TCP/TLS syslog input splits the byte stream into messages
+/// (RFC 6587). UDP ignores it: one datagram is one message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum InputFraming {
+    /// Detect per frame: `MSG-LEN SP` followed by `<` or `{` is an
+    /// octet-counted frame, anything else is a newline-terminated line.
+    #[default]
+    Auto,
+    /// Newline-terminated lines only, with no detection.
+    Newline,
+    /// Every frame is `MSG-LEN SP MSG`, whatever the message starts with.
+    OctetCounting,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SyslogInputConfig {
