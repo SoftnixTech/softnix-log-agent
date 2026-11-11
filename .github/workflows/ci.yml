@@ -42,6 +42,23 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo clippy --all-targets
 
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      # Single source of truth: the MSRV is whatever Cargo.toml declares. If
+      # rust-version is ever removed, the output is empty and the toolchain
+      # step fails, instead of silently checking stable.
+      - id: msrv
+        run: echo "version=$(sed -n 's/^rust-version *= *"\(.*\)"/\1/p' Cargo.toml)" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable branch, resolved 2026-09-07
+        with:
+          toolchain: ${{ steps.msrv.outputs.version }}
+      - uses: Swatinem/rust-cache@63fed3e2fecf6f7b51dc6f043341b79ef82a9ae7 # v2.9.2
+      # check, not test: enough to catch API and syntax newer than the MSRV.
+      # --all-targets compiles the tests too.
+      - run: cargo check --all-targets
+
   audit:
     runs-on: ubuntu-latest
     # rustsec/audit-check reports its findings as a GitHub check run, which
