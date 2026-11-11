@@ -46,6 +46,8 @@ elsewhere.
 | SYS-8 | Eventlog XML attribute values are not entity-unescaped | input (Windows) | Low | P2 (with SYS-9) | n/a | **fixed** (`cb9586c`) |
 | SYS-9 | Eventlog `EventData` values containing XML entities are truncated and split | input (Windows) | **High** | **P2** | Yes (data lost at the source) | **fixed** (`f6fb143`) |
 | SYS-10 | CI never builds on the declared MSRV (1.98) | build | Low | P4 | n/a | **fixed** (`98dc828`), pending first CI run |
+| SYS-11 | e2e test `a_backed_up_destination_does_not_stop_its_peers` is flaky on Windows and did not guard the bug it names | test | Medium (blocks CI) | P1 | n/a | **fixed** (`170d99f`), pending Windows CI |
+| SYS-12 | `Engine::stop` waits the full 8 s timeout when a TCP output's peer stops reading | agent | Low | P4 | n/a | open |
 
 Fixes are on branch `develop_fix_bug_known-issues`, which is based on `main`
 and not yet merged. The entries above were found and first verified on the
@@ -398,6 +400,60 @@ writing the SYS-7 spec, where it was checked by hand
 `Cargo.toml`, and the pinned `dtolnay/rust-toolchain` SHA accepts a
 `toolchain:` input (verified). Spec:
 `docs/superpowers/specs/2026-11-11-sys10-ci-msrv-job.md`.
+
+---
+
+### SYS-11 — e2e isolation test is flaky on Windows and did not guard the bug it names
+
+**Status: fixed** in `170d99f`, not yet seen passing on Windows CI.
+
+`a_backed_up_destination_does_not_stop_its_peers` failed on `test-windows`
+in run 42992580077 (`de96813`) with `healthy destination only got 0/50
+marker events`. It passed on Windows in the two runs before it, so it is
+flaky, not a regression from `de96813`. Passing runs took 4–5 s; the
+failing run took 18.8 s (about 8.5 s to fill, then the full 10 s marker
+wait with nothing arriving).
+
+**Root cause (test only).**
+1. The test did not read the healthy UDP sink until after it sent the
+   markers. "healthy" also forwards every 8 KiB filler, so the sink's
+   kernel receive buffer was already full and the markers were dropped
+   before `recv_from` ran. Windows' small default UDP buffer makes this
+   lose every marker.
+2. The 50 markers went out in one burst while the agent's input socket
+   buffer and the "healthy" router channel were still full of filler.
+3. Checked by putting the pre-fix blocking `tx.send` back in
+   `route_event` (`src/engine.rs`): the old test **still passed**. One
+   `is_full()` reading did not mean "stuck" was stalled: its worker keeps
+   draining into loopback TCP buffers, which autotune to several MiB, and a
+   blocking fan-out only stalls once the 4096-event router channel
+   (`ROUTER_CAPACITY`) is also full.
+
+**Fix.** Drain the sink in a background task for the whole test. Wait
+until the stuck queue is full and its `len()` has not moved for 1 s. Push
+4096 + 1024 small top-up events, counted by `events_received`. Wait for
+the input to go quiet, then send the markers 10 ms apart. The failure
+message now includes the "healthy" `router_shed` delta. Checked on macOS:
+5/5 pass on the current code, and 3/3 fail with the blocking `send` put
+back.
+
+---
+
+### SYS-12 — `Engine::stop` waits the full 8 s timeout when a TCP output's peer stops reading
+
+**Status: open.** Found while fixing SYS-11.
+
+`src/outputs/worker.rs:128` awaits `self.sink.send_batch(&batch)` without
+racing it against `cancel`. When a TCP peer accepts but stops reading,
+`write_all` blocks for good, so the worker never sees the cancel, and
+`Engine::stop` (`src/engine.rs:474`) waits its 8 s per-task timeout before
+giving up on that task. In the SYS-11 test, `engine.stop()` took 8.0 s.
+This affects shutdown and every config reload (SIGHUP or GUI
+save-and-reload), which stop the engine the same way.
+
+**Fix options.** Race `send_batch` against `cancel.cancelled()` in
+`select!`, and leave the in-flight batch un-acked so it is resent after a
+restart. Or add a write timeout to the TCP/TLS sink.
 
 ---
 
