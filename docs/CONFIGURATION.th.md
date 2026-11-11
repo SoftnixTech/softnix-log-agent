@@ -135,6 +135,7 @@ offset ถูกเก็บข้าม restart บน Windows การระ�
 | `bind` | IP | `0.0.0.0` | address ที่จะ listen |
 | `port` | int | — (บังคับ) | พอร์ต (1–65535) |
 | `format` | enum | `auto` | `auto`, `rfc3164`, `rfc5424`, `json`, `raw` — `auto` ลองตามลำดับ RFC5424 → RFC3164 → JSON → raw |
+| `framing` | enum | `auto` | เฉพาะ TCP/TLS (UDP ไม่ใช้ค่านี้) เลือกได้ `auto`, `newline` หรือ `octet_counting` — `auto` ตรวจทีละ frame: ตัวเลข ตามด้วยช่องว่าง แล้วตามด้วย `<` หรือ `{` คือ frame แบบ octet-counting ตาม RFC 6587 (`MSG-LEN SP MSG`) นอกนั้นถือเป็นบรรทัดที่จบด้วย newline — `newline` ปิดการตรวจ — `octet_counting` บังคับให้ทุก frame เป็น `MSG-LEN SP MSG` ไม่ว่าข้อความจะขึ้นต้นด้วยอะไร และปิด connection เมื่อ header ผิดรูป — frame ที่ยาวเกิน 64 KiB จะปิด connection — UTF-8 ที่ไม่ถูกต้องจะถูกแทนด้วย U+FFFD โดยไม่ปิด connection |
 | `tls` | object | — | บังคับเมื่อ `protocol: tls` (ดูด้านล่าง) |
 | `source_type` | string | `syslog` | แทนค่า `source_type` ของ event |
 | `keep_raw_message` | bool | `false` | เก็บบรรทัดต้นฉบับทั้งบรรทัด (รวม PRI, timestamp, hostname, tag) ไว้ใน `raw_message` ก่อนเวอร์ชันนี้ค่านี้เปิดอยู่เสมอโดยปริยาย — `message` (เนื้อหาที่ parse แล้ว) กับ `raw_message` สำหรับ syslog นั้นต่างกันจริง ดังนั้นการปิดค่านี้คือการสูญเสียข้อมูลจริง ไม่ใช่แค่การประหยัด — เปิดใช้หากต้องการบรรทัดต้นฉบับ (สำหรับ forensics หรือ SIEM ปลายทางที่ parse ข้อความดิบเอง) ทำให้หน่วยความจำ การใช้ queue และขนาดข้อมูลที่ส่งต่อเหตุการณ์เพิ่มเป็นสองเท่า |
@@ -166,12 +167,17 @@ inputs:
         # client_ca: /etc/softnix-log-agent/tls/clients-ca.crt   # mTLS
 ```
 
-> syslog input แบบ TCP/TLS ใช้ newline framing เท่านั้น ข้อความที่มีการขึ้นบรรทัด
-> จึงถูกแยกเป็นหนึ่ง event ต่อบรรทัด ให้ส่งข้อความหลายบรรทัดมาเป็นบรรทัดเดียว
-> (syslog output ของ agent ทำให้อยู่แล้ว ดู `framing` ด้านล่าง) หรือส่งทาง UDP
-> การรองรับ octet-counting ที่ input นี้ติดตามไว้เป็น SYS-4 ใน `ISSUES.md`
-> ส่วน syslog input แบบ UDP ถือว่าหนึ่ง datagram คือหนึ่ง event (RFC 5426)
-> รวมการขึ้นบรรทัดในข้อความด้วย
+> syslog input แบบ TCP/TLS รับ framing ของ RFC 6587 ได้ทั้งสองแบบ โดยตรวจ
+> ทีละ frame (`framing: auto`): บรรทัดที่จบด้วย newline และ frame แบบ
+> octet-counting — frame แบบ octet-counting หนึ่ง frame คือหนึ่ง event และ
+> คงการขึ้นบรรทัดไว้ ผู้ส่งที่ใช้ `framing: octet_counting` (รวมถึง syslog
+> output ของ agent เอง) จึงส่งข้อความหลายบรรทัดมาได้โดยไม่ถูกเปลี่ยน — ถ้าใช้
+> newline framing ข้อความที่มีการขึ้นบรรทัดจะยังถูกแยกเป็นหนึ่ง event ต่อ
+> บรรทัด ซึ่ง output ของ agent เลี่ยงโดยเขียนการขึ้นบรรทัดเป็นช่องว่าง
+> (ดู `framing` ในหัวข้อ `outputs`) — `auto` รู้จัก frame แบบ octet-counting
+> จาก `<` หรือ `{` ที่ตามหลังความยาว ผู้ส่งข้อความ `raw` แบบ octet-counting
+> จึงต้องตั้ง `framing: octet_counting` ที่ input นี้ — ส่วน syslog input แบบ
+> UDP ถือว่าหนึ่ง datagram คือหนึ่ง event (RFC 5426) รวมการขึ้นบรรทัดด้วย
 
 ### `inputs.eventlog` (Windows เท่านั้น)
 

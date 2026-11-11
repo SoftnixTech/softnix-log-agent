@@ -136,6 +136,7 @@ Receive syslog over the network.
 | `bind` | IP | `0.0.0.0` | Local address to listen on. |
 | `port` | int | — (required) | Port (1–65535). |
 | `format` | enum | `auto` | `auto`, `rfc3164`, `rfc5424`, `json`, `raw`. `auto` tries RFC5424 → RFC3164 → JSON → raw. |
+| `framing` | enum | `auto` | TCP/TLS only (ignored for UDP). `auto`, `newline` or `octet_counting`. `auto` detects each frame: digits, a space, then `<` or `{` is an RFC 6587 octet-counted frame (`MSG-LEN SP MSG`), and anything else is a newline-terminated line. `newline` turns detection off. `octet_counting` requires every frame to be `MSG-LEN SP MSG` whatever the message starts with, and closes the connection on a malformed header. A frame longer than 64 KiB closes the connection. Invalid UTF-8 is replaced with U+FFFD and does not close the connection. |
 | `tls` | object | — | Required when `protocol: tls`. See below. |
 | `source_type` | string | `syslog` | Overrides `source_type` on emitted events. |
 | `keep_raw_message` | bool | `false` | Keep the original wire line (PRI, timestamp, hostname, tag included) in `raw_message`. Before this version this was implicitly always on; `message` (the parsed body) and `raw_message` genuinely differ for syslog, so leaving this off is real information loss, not just savings — enable it if you need the original line (forensics, a downstream SIEM that re-parses raw text). Doubles memory, queue usage and wire size per event. |
@@ -167,12 +168,17 @@ inputs:
         # client_ca: /etc/softnix-log-agent/tls/clients-ca.crt   # mTLS
 ```
 
-> TCP/TLS syslog input uses newline framing only, so a message that contains
-> a line break arrives as one event per line. Send multi-line messages to it
-> as single lines (the agent's own syslog output does this; see `framing`
-> below) or over UDP. Octet-counting on this input is tracked as SYS-4 in
-> `ISSUES.md`. The UDP input treats each datagram as one event (RFC 5426),
-> line breaks included.
+> The TCP/TLS syslog input accepts both RFC 6587 framings, detected per
+> frame (`framing: auto`): newline-terminated lines and octet-counted
+> frames. An octet-counted frame is one event with its line breaks kept, so
+> a sender using `framing: octet_counting` (the agent's own syslog output
+> included) delivers multi-line messages unchanged. With newline framing, a
+> message that contains a line break still arrives as one event per line.
+> The agent's own output avoids that by writing each line break as a space
+> (see `framing` under `outputs`). `auto` recognises an octet-counted frame
+> by the `<` or `{` after its length, so a sender of octet-counted `raw`
+> text needs `framing: octet_counting` on this input. The UDP input treats
+> each datagram as one event (RFC 5426), line breaks included.
 
 ### `inputs.eventlog` (Windows-only)
 
