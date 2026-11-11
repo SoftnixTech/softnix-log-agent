@@ -35,6 +35,7 @@ pub(super) struct ParsedEvent {
 pub(super) fn parse_event_xml(xml: &str) -> ParsedEvent {
     use quick_xml::events::Event as Xml;
     use quick_xml::reader::Reader;
+    use quick_xml::XmlVersion;
 
     let mut reader = Reader::from_str(xml);
     let mut p = ParsedEvent::default();
@@ -43,10 +44,17 @@ pub(super) fn parse_event_xml(xml: &str) -> ParsedEvent {
     let mut cur_data_name = String::new();
     let mut in_event_data = false;
 
+    // Attribute values with references resolved (SYS-8). `normalized_value`,
+    // not the deprecated `unescape_value` (which fails `-D warnings`). On a
+    // malformed reference fall back to the raw value, so a bad attribute
+    // never turns into `None`.
     let attr = |e: &quick_xml::events::BytesStart, name: &[u8]| -> Option<String> {
         e.attributes().flatten().find_map(|a| {
             if a.key.as_ref() == name {
-                Some(String::from_utf8_lossy(&a.value).into_owned())
+                Some(match a.normalized_value(XmlVersion::Implicit1_0) {
+                    Ok(v) => v.into_owned(),
+                    Err(_) => String::from_utf8_lossy(&a.value).into_owned(),
+                })
             } else {
                 None
             }
@@ -279,6 +287,44 @@ mod tests {
         );
         assert_eq!(p.computer.as_deref(), Some("a&b"));
         assert_eq!(p.keywords.as_deref(), Some("0x10"));
+    }
+
+    // --- SYS-8: attribute values must be unescaped ---
+
+    #[test]
+    fn provider_name_is_unescaped() {
+        for (raw, want) in [
+            ("Backup &amp; Restore", "Backup & Restore"),
+            ("Contoso &quot;Agent&quot;", "Contoso \"Agent\""),
+            ("O&apos;Brien Tools", "O'Brien Tools"),
+            ("Tab&#9;Name", "Tab\tName"),
+        ] {
+            let p = parse_event_xml(&format!(
+                "<Event><System><Provider Name='{raw}'/></System></Event>"
+            ));
+            assert_eq!(p.provider, want, "Provider Name='{raw}'");
+        }
+    }
+
+    #[test]
+    fn data_name_attribute_is_unescaped() {
+        assert_eq!(
+            data_of("<Data Name='A&amp;B'>v</Data>"),
+            vec![pair("A&B", "v")]
+        );
+    }
+
+    #[test]
+    fn malformed_attribute_reference_keeps_raw_value() {
+        // `normalized_value` returns Err for these; the fallback keeps the
+        // raw attribute instead of dropping it (spec Goal 4). Same result
+        // as before the fix.
+        for raw in ["a&foo;b", "a&#0;b", "a&b"] {
+            let p = parse_event_xml(&format!(
+                "<Event><System><Provider Name='{raw}'/></System></Event>"
+            ));
+            assert_eq!(p.provider, raw, "Provider Name='{raw}'");
+        }
     }
 
     // --- Guards: XML without references must parse exactly as before ---
