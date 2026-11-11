@@ -134,7 +134,8 @@ offset ถูกเก็บข้าม restart บน Windows การระ�
 | `protocol` | enum | `udp` | `udp`, `tcp`, หรือ `tls` |
 | `bind` | IP | `0.0.0.0` | address ที่จะ listen |
 | `port` | int | — (บังคับ) | พอร์ต (1–65535) |
-| `format` | enum | `auto` | `auto`, `rfc3164`, `rfc5424`, `json`, `raw` — `auto` ลองตามลำดับ RFC5424 → RFC3164 → JSON → raw |
+| `format` | enum | `auto` | `auto`, `rfc3164`, `rfc5424`, `json`, `raw` — `auto` ลองตามลำดับ RFC5424 → RFC3164 → JSON → raw — สำหรับ `rfc3164` ชื่อ TAG และ PID ใน `TAG[PID]:` ยาวได้อย่างละไม่เกิน 128 ตัวอักษร ถ้ายาวกว่านั้นจะไม่ตั้งค่า `application` และ `process_id` และเก็บข้อความทั้งหมดไว้ใน `message` |
+| `framing` | enum | `auto` | เฉพาะ TCP/TLS (UDP ไม่ใช้ค่านี้) เลือกได้ `auto`, `newline` หรือ `octet_counting` — `auto` ตรวจทีละ frame: ตัวเลข ตามด้วยช่องว่าง แล้วตามด้วย `<` หรือ `{` คือ frame แบบ octet-counting ตาม RFC 6587 (`MSG-LEN SP MSG`) นอกนั้นถือเป็นบรรทัดที่จบด้วย newline — `newline` ปิดการตรวจ — `octet_counting` บังคับให้ทุก frame เป็น `MSG-LEN SP MSG` ไม่ว่าข้อความจะขึ้นต้นด้วยอะไร และปิด connection เมื่อ header ผิดรูป — frame ที่ยาวเกิน 64 KiB จะปิด connection — UTF-8 ที่ไม่ถูกต้องจะถูกแทนด้วย U+FFFD โดยไม่ปิด connection |
 | `tls` | object | — | บังคับเมื่อ `protocol: tls` (ดูด้านล่าง) |
 | `source_type` | string | `syslog` | แทนค่า `source_type` ของ event |
 | `keep_raw_message` | bool | `false` | เก็บบรรทัดต้นฉบับทั้งบรรทัด (รวม PRI, timestamp, hostname, tag) ไว้ใน `raw_message` ก่อนเวอร์ชันนี้ค่านี้เปิดอยู่เสมอโดยปริยาย — `message` (เนื้อหาที่ parse แล้ว) กับ `raw_message` สำหรับ syslog นั้นต่างกันจริง ดังนั้นการปิดค่านี้คือการสูญเสียข้อมูลจริง ไม่ใช่แค่การประหยัด — เปิดใช้หากต้องการบรรทัดต้นฉบับ (สำหรับ forensics หรือ SIEM ปลายทางที่ parse ข้อความดิบเอง) ทำให้หน่วยความจำ การใช้ queue และขนาดข้อมูลที่ส่งต่อเหตุการณ์เพิ่มเป็นสองเท่า |
@@ -166,7 +167,17 @@ inputs:
         # client_ca: /etc/softnix-log-agent/tls/clients-ca.crt   # mTLS
 ```
 
-> syslog input แบบ TCP/TLS ใช้ newline framing เท่านั้น
+> syslog input แบบ TCP/TLS รับ framing ของ RFC 6587 ได้ทั้งสองแบบ โดยตรวจ
+> ทีละ frame (`framing: auto`): บรรทัดที่จบด้วย newline และ frame แบบ
+> octet-counting — frame แบบ octet-counting หนึ่ง frame คือหนึ่ง event และ
+> คงการขึ้นบรรทัดไว้ ผู้ส่งที่ใช้ `framing: octet_counting` (รวมถึง syslog
+> output ของ agent เอง) จึงส่งข้อความหลายบรรทัดมาได้โดยไม่ถูกเปลี่ยน — ถ้าใช้
+> newline framing ข้อความที่มีการขึ้นบรรทัดจะยังถูกแยกเป็นหนึ่ง event ต่อ
+> บรรทัด ซึ่ง output ของ agent เลี่ยงโดยเขียนการขึ้นบรรทัดเป็นช่องว่าง
+> (ดู `framing` ในหัวข้อ `outputs`) — `auto` รู้จัก frame แบบ octet-counting
+> จาก `<` หรือ `{` ที่ตามหลังความยาว ผู้ส่งข้อความ `raw` แบบ octet-counting
+> จึงต้องตั้ง `framing: octet_counting` ที่ input นี้ — ส่วน syslog input แบบ
+> UDP ถือว่าหนึ่ง datagram คือหนึ่ง event (RFC 5426) รวมการขึ้นบรรทัดด้วย
 
 ### `inputs.eventlog` (Windows เท่านั้น)
 
@@ -380,7 +391,7 @@ list ของปลายทาง แต่ละ event จะถูก route 
 | `address` | `host:port` | — | บังคับสำหรับ `syslog` |
 | `protocol` | enum | `udp` | `udp`, `tcp`, `tls` (syslog) |
 | `format` | enum | `rfc5424` | `rfc5424`, `rfc3164`, `json`, `raw` |
-| `framing` | enum | `newline` | `newline` หรือ `octet_counting` (TCP/TLS) |
+| `framing` | enum | `newline` | `newline` หรือ `octet_counting` (TCP/TLS และ `stdout`) เมื่อใช้ `newline` การขึ้นบรรทัดภายใน event (CR, LF หรือ CRLF) จะถูกเขียนเป็นช่องว่างหนึ่งตัว ทุก event จึงอยู่บรรทัดเดียว ถ้าต้องการส่งข้อความหลายบรรทัดแบบไม่เปลี่ยน ให้ใช้ `octet_counting` หรือ `format: json` |
 | `tls` | object | — | ตัวเลือก TLS ฝั่ง client (ด้านล่าง) |
 | `when` | condition | — | route เฉพาะ event ที่ตรงมาที่นี่ |
 | `failover_for` | string | — | รับ traffic เฉพาะตอน output ที่ระบุไม่ healthy |

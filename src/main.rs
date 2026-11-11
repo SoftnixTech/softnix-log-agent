@@ -421,7 +421,11 @@ async fn run_agent(
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(&cfg.agent.log_level));
     tracing_subscriber::registry()
         .with(filter)
-        .with(tracing_subscriber::fmt::layer().with_target(false))
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_target(false)
+                .with_writer(std::io::stderr),
+        )
         .with(LogBufferLayer(log_buffer.clone()))
         .init();
 

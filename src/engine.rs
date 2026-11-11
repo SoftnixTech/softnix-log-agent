@@ -246,7 +246,7 @@ impl ChannelBudget {
         // ordinary operation should never underflow it — but wrapping to
         // ~18 quintillion on any residual edge case would make `/metrics`
         // briefly nonsensical, whereas saturating just clamps to 0.
-        let _ = metrics
+        metrics
             .channel_bytes
             .try_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
                 Some(cur.saturating_sub(EventSender::event_bytes(ev)))
@@ -929,6 +929,36 @@ mod tests {
         let ev = rx.recv().await.unwrap();
         budget.release(&ev, &metrics);
         assert_eq!(metrics.channel_bytes.load(Ordering::Relaxed), 0);
+    }
+
+    /// `ChannelBudget::release` must clamp `agent_channel_bytes` at 0, not
+    /// wrap, when it releases more bytes than the gauge currently holds.
+    /// Pins the behaviour across the SYS-7 `fetch_update` → `update`
+    /// replacement; plain `fetch_sub` would wrap to ~u64::MAX here.
+    #[test]
+    fn channel_budget_release_saturates_at_zero() {
+        let (tx, _rx) = mpsc::channel::<Event>(8);
+        let metrics = Arc::new(Metrics::default());
+        let sender = EventSender::with_budget(tx, 1024 * 1024).with_metrics(metrics.clone());
+        let budget = sender.channel_budget();
+        let ev = Event::new("s", "t", &"x".repeat(2048));
+
+        // Gauge below the event's size: clamp to 0, not u64::MAX - 1047.
+        metrics.channel_bytes.store(1000, Ordering::Relaxed);
+        budget.release(&ev, &metrics);
+        assert_eq!(
+            metrics.channel_bytes.load(Ordering::Relaxed),
+            0,
+            "release of 2048 bytes from a 1000-byte gauge must saturate at 0"
+        );
+
+        // Gauge already at 0: stays at 0, not u64::MAX - 2047.
+        budget.release(&ev, &metrics);
+        assert_eq!(
+            metrics.channel_bytes.load(Ordering::Relaxed),
+            0,
+            "release from an empty gauge must stay at 0"
+        );
     }
 
     /// Regression guard for the fix-round-2 drain fix: `run_pipeline`'s

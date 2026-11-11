@@ -60,6 +60,10 @@ windows = { version = "0.58", features = [
 ] }
 
 [dev-dependencies]
+# Also a Windows dependency above; listed here so `src/inputs/eventlog_xml.rs`
+# (cfg(any(windows, test))) builds in test builds on every platform. Release
+# builds on non-Windows targets still do not pull it in.
+quick-xml = "0.41"
 tower = { version = "0.5", features = ["util"] }
 hyper = { version = "1", features = ["server"] }
 

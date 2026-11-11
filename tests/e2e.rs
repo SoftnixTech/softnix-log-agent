@@ -414,6 +414,29 @@ web:
     let (cfg, _w) = softnix_log_agent::config::parse(&yaml).unwrap();
     let engine = softnix_log_agent::engine::Engine::start(cfg).await.unwrap();
 
+    // Drain the healthy sink for the whole test, not only after the markers
+    // are sent. "healthy" forwards every filler event too, and nothing read
+    // the sink during phase 1, so its kernel receive buffer was already full
+    // of 8 KiB fillers by the time the markers arrived - the kernel dropped
+    // them before the test ever called recv. Windows' default UDP receive
+    // buffer is small enough that this lost every marker (0/50).
+    let markers_seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let sink_task = {
+        let markers_seen = Arc::clone(&markers_seen);
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 65535];
+            loop {
+                // Keep reading past a transient error (e.g. a Windows
+                // WSAECONNRESET); the task is aborted when the test ends.
+                if let Ok((n, _)) = sink.recv_from(&mut buf).await {
+                    if buf[..n].windows(6).any(|w| w == b"MARKER") {
+                        markers_seen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+            }
+        })
+    };
+
     let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
 
     // Phase 1: flood "stuck" past the point where it can possibly still be
@@ -436,19 +459,45 @@ web:
     // compensate (UDP datagrams over loopback cap out around 9216 bytes on
     // this OS, well below double `padding`'s size), so the deadline below is
     // widened instead to give the retry loop enough room under lossy UDP.
+    //
+    // `is_full()` turning true once is not enough. The "stuck" output worker
+    // keeps draining the queue into the TCP socket buffers until they fill,
+    // and loopback buffers autotune to several MiB (macOS) - so for a while
+    // the queue dips below its cap, the router un-parks, and a blocking
+    // fan-out would still make progress. Keep topping up until the queue is
+    // full AND its depth has not moved for a full second (the worker is
+    // parked in `write_all` and acks nothing).
+    let stuck_q = Arc::clone(&engine.shared.queues["stuck"]);
     let padding = "x".repeat(8192);
     let mut filler_sent = 0usize;
     let fill_deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-    while !engine.shared.queues["stuck"].is_full() && tokio::time::Instant::now() < fill_deadline {
-        for _ in 0..200 {
-            let line = format!("<14>Jun 10 10:00:00 h1 app: filler {filler_sent} {padding}");
-            client
-                .send_to(line.as_bytes(), ("127.0.0.1", in_port))
-                .await
-                .unwrap();
-            filler_sent += 1;
+    let mut stable: Option<(u64, tokio::time::Instant)> = None;
+    let mut wedged = false;
+    while tokio::time::Instant::now() < fill_deadline {
+        if !stuck_q.is_full() {
+            stable = None;
+            for _ in 0..200 {
+                let line = format!("<14>Jun 10 10:00:00 h1 app: filler {filler_sent} {padding}");
+                client
+                    .send_to(line.as_bytes(), ("127.0.0.1", in_port))
+                    .await
+                    .unwrap();
+                filler_sent += 1;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            continue;
         }
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        let len = stuck_q.len();
+        match stable {
+            Some((l, since)) if l == len => {
+                if since.elapsed() >= Duration::from_secs(1) {
+                    wedged = true;
+                    break;
+                }
+            }
+            _ => stable = Some((len, tokio::time::Instant::now())),
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
     // Confirm the filler actually achieved its purpose before relying on it:
@@ -457,11 +506,50 @@ web:
     // purpose as a regression guard. Fail loudly instead if the precondition
     // wasn't met.
     assert!(
-        engine.shared.queues["stuck"].is_full(),
-        "precondition not met: \"stuck\" destination's disk queue never became full \
-         after sending {filler_sent} filler events, so this test cannot actually \
-         exercise the isolation property it claims to guard (kernel socket buffers \
-         on this host may be absorbing more of the filler than expected)"
+        wedged,
+        "precondition not met: \"stuck\" destination's disk queue never stayed full \
+         after sending {filler_sent} filler events (full now: {}), so this test cannot \
+         actually exercise the isolation property it claims to guard",
+        stuck_q.is_full()
+    );
+
+    // A parked "stuck" router is still not a stalled fan-out: a blocking
+    // `tx.send` only stalls once the router's channel (ROUTER_CAPACITY = 4096
+    // events in src/engine.rs) is full too, and the filler above may have
+    // left it nearly empty. Push well over that many more events through the
+    // input. They are small, so few are lost to UDP and they cost the
+    // "healthy" queue little; count what the agent actually received rather
+    // than what was sent. Under the fix "stuck" sheds them and the count
+    // climbs to the target. Under a blocking fan-out the pipeline stops
+    // after ~4096 of them, and the input channel behind it (8192) still
+    // absorbs the rest, so the target is reached either way.
+    const TOP_UP: u64 = 4096 + 1024;
+    let received = || {
+        engine
+            .shared
+            .metrics
+            .events_received
+            .load(std::sync::atomic::Ordering::Relaxed)
+    };
+    let top_up_start = received();
+    let top_up_deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    let mut top_up_sent = 0usize;
+    while received() - top_up_start < TOP_UP && tokio::time::Instant::now() < top_up_deadline {
+        for _ in 0..200 {
+            let line = format!("<14>Jun 10 10:00:00 h1 app: topup {top_up_sent}");
+            client
+                .send_to(line.as_bytes(), ("127.0.0.1", in_port))
+                .await
+                .unwrap();
+            top_up_sent += 1;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        received() - top_up_start >= TOP_UP,
+        "precondition not met: the agent received only {} of {TOP_UP} top-up events \
+         ({top_up_sent} sent), so \"stuck\"'s router channel may not be full",
+        received() - top_up_start
     );
 
     // Phase 2: with "stuck" now genuinely backed up, send events that only
@@ -471,6 +559,28 @@ web:
     // sink - this is exactly the C-3 bug re-appearing one layer up. Under the
     // fix (`try_send`), "stuck" sheds the marker events it can't accept and
     // "healthy" keeps flowing untouched.
+    //
+    // Let the filler backlog clear first. The flood leaves the agent's input
+    // socket buffer and the "healthy" router channel full of fillers; markers
+    // sent into that would be dropped by the kernel or shed by `try_send` for
+    // "healthy" too, which is filler loss, not the stall this test guards.
+    // Wait until the input stops receiving (its socket buffer is drained),
+    // then pace the markers so neither buffer refills. The pre-fix stall
+    // still fails this: the pipeline never routes another event, so no
+    // marker reaches the sink however long we wait.
+    let settle_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let mut last = received();
+    loop {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let now = received();
+        if now == last || tokio::time::Instant::now() >= settle_deadline {
+            break;
+        }
+        last = now;
+    }
+    let healthy_shed_before =
+        engine.shared.router_shed["healthy"].load(std::sync::atomic::Ordering::Relaxed);
+
     const MARKERS: usize = 50;
     for i in 0..MARKERS {
         let line = format!("<14>Jun 10 10:00:00 h1 app: MARKER {i}");
@@ -478,28 +588,27 @@ web:
             .send_to(line.as_bytes(), ("127.0.0.1", in_port))
             .await
             .unwrap();
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
 
-    let mut buf = vec![0u8; 65535];
-    let mut markers_received = 0;
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
-    while tokio::time::Instant::now() < deadline && markers_received < MARKERS {
-        if let Ok(Ok((n, _))) = tokio::time::timeout(
-            std::time::Duration::from_millis(500),
-            sink.recv_from(&mut buf),
-        )
-        .await
-        {
-            if n > 0 && buf[..n].windows(6).any(|w| w == b"MARKER") {
-                markers_received += 1;
-            }
-        }
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while tokio::time::Instant::now() < deadline
+        && markers_seen.load(std::sync::atomic::Ordering::Relaxed) < MARKERS
+    {
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
+    let markers_received = markers_seen.load(std::sync::atomic::Ordering::Relaxed);
+    let healthy_shed = engine.shared.router_shed["healthy"]
+        .load(std::sync::atomic::Ordering::Relaxed)
+        - healthy_shed_before;
+    let still_full = engine.shared.queues["stuck"].is_full();
+    sink_task.abort();
     engine.stop().await;
     assert!(
         markers_received >= MARKERS / 2,
         "healthy destination only got {markers_received}/{MARKERS} marker events sent \
-         after the stuck destination backed up"
+         after the stuck destination backed up (healthy router shed {healthy_shed} \
+         events during the marker phase; stuck still full: {still_full})"
     );
 }
 
