@@ -161,6 +161,14 @@ fn sd_end_by_brackets(tail: &str) -> usize {
     tail.len()
 }
 
+/// Longest RFC 3164 TAG name, and longest PID inside `TAG[PID]`, that
+/// `parse_rfc3164` accepts. RFC 3164 says 32 for the whole TAG, but real
+/// senders (the agent's own included) do not truncate: Windows provider names
+/// reach 66 characters. The bound only keeps a long token before the first
+/// `:` of a tag-less line from being taken as a tag without limit.
+const MAX_TAG_NAME: usize = 128;
+const MAX_TAG_PID: usize = 128;
+
 /// RFC3164: <PRI>Mmm dd hh:mm:ss HOSTNAME TAG[pid]: MSG
 fn parse_rfc3164(ev: &mut Event, line: &str) -> bool {
     let Some((facility, severity, rest)) = parse_pri(line) else {
@@ -203,12 +211,21 @@ fn parse_rfc3164(ev: &mut Event, line: &str) -> bool {
     // TAG[pid]: message
     if let Some(colon) = remainder.find(':') {
         let (tag, msg) = remainder.split_at(colon);
-        if !tag.contains(' ') && tag.len() <= 48 {
-            if let Some(br) = tag.find('[') {
-                ev.application = Some(tag[..br].to_string());
-                ev.process_id = Some(tag[br + 1..].trim_end_matches(']').to_string());
-            } else if !tag.is_empty() {
-                ev.application = Some(tag.to_string());
+        let (name, pid) = match tag.find('[') {
+            Some(br) => (&tag[..br], Some(tag[br + 1..].trim_end_matches(']'))),
+            None => (tag, None),
+        };
+        if !tag.contains(' ')
+            && name.len() <= MAX_TAG_NAME
+            && pid.is_none_or(|p| p.len() <= MAX_TAG_PID)
+        {
+            match pid {
+                Some(pid) => {
+                    ev.application = Some(name.to_string());
+                    ev.process_id = Some(pid.to_string());
+                }
+                None if !tag.is_empty() => ev.application = Some(tag.to_string()),
+                None => {}
             }
             ev.message = msg[1..].trim_start().to_string();
             return true;
@@ -236,6 +253,89 @@ mod tests {
         assert_eq!(ev.application.as_deref(), Some("su"));
         assert_eq!(ev.process_id.as_deref(), Some("1234"));
         assert!(ev.message.starts_with("'su root' failed"));
+    }
+
+    /// Parse `<34>Oct 11 22:14:15 mymachine {tag}: hello` as RFC 3164.
+    fn parse_tag(tag: &str) -> Event {
+        let mut ev = Event::new("net", "syslog", "");
+        let line = format!("<34>Oct 11 22:14:15 mymachine {tag}: hello");
+        assert!(parse_rfc3164(&mut ev, &line));
+        assert_eq!(ev.hostname.as_deref(), Some("mymachine"));
+        ev
+    }
+
+    /// What `parse_tag` gives when `tag` is not accepted as a tag: nothing is
+    /// extracted, and the whole `TAG: msg` stays in `message`.
+    fn assert_not_a_tag(tag: &str) {
+        let ev = parse_tag(tag);
+        assert_eq!(ev.application, None, "application of {tag:?}");
+        assert_eq!(ev.process_id, None, "process_id of {tag:?}");
+        assert_eq!(ev.message, format!("{tag}: hello"));
+    }
+
+    // SYS-3: the tag bound applies to the name and the PID separately, not to
+    // `TAG[PID]` as a whole, so long Windows provider names are still parsed.
+    #[test]
+    fn rfc3164_long_tag_with_pid_is_parsed() {
+        let name = "A".repeat(43);
+        let ev = parse_tag(&format!("{name}[1234]")); // 49 chars in all
+        assert_eq!(ev.application.as_deref(), Some(name.as_str()));
+        assert_eq!(ev.process_id.as_deref(), Some("1234"));
+        assert_eq!(ev.message, "hello");
+    }
+
+    #[test]
+    fn rfc3164_rdp_provider_tag_is_parsed() {
+        let name = "Microsoft-Windows-TerminalServices-LocalSessionManager";
+        let ev = parse_tag(&format!("{name}[1234]")); // 60 chars in all
+        assert_eq!(ev.application.as_deref(), Some(name));
+        assert_eq!(ev.process_id.as_deref(), Some("1234"));
+        assert_eq!(ev.message, "hello");
+    }
+
+    #[test]
+    fn rfc3164_long_tag_without_pid_is_parsed() {
+        let name = "B".repeat(49);
+        let ev = parse_tag(&name);
+        assert_eq!(ev.application.as_deref(), Some(name.as_str()));
+        assert_eq!(ev.process_id, None);
+        assert_eq!(ev.message, "hello");
+    }
+
+    #[test]
+    fn rfc3164_tag_name_at_limit_is_parsed() {
+        let name = "C".repeat(128);
+        let ev = parse_tag(&format!("{name}[1234]"));
+        assert_eq!(ev.application.as_deref(), Some(name.as_str()));
+        assert_eq!(ev.process_id.as_deref(), Some("1234"));
+    }
+
+    #[test]
+    fn rfc3164_tag_at_48_unchanged() {
+        let with_pid = "D".repeat(42);
+        let ev = parse_tag(&format!("{with_pid}[1234]")); // exactly 48
+        assert_eq!(ev.application.as_deref(), Some(with_pid.as_str()));
+        assert_eq!(ev.process_id.as_deref(), Some("1234"));
+
+        let without_pid = "E".repeat(48);
+        let ev = parse_tag(&without_pid);
+        assert_eq!(ev.application.as_deref(), Some(without_pid.as_str()));
+        assert_eq!(ev.process_id, None);
+    }
+
+    #[test]
+    fn rfc3164_tag_name_over_limit_is_not_a_tag() {
+        assert_not_a_tag(&"F".repeat(129));
+    }
+
+    #[test]
+    fn rfc3164_tag_pid_over_limit_is_not_a_tag() {
+        assert_not_a_tag(&format!("app[{}]", "7".repeat(129)));
+    }
+
+    #[test]
+    fn rfc3164_tag_with_space_is_not_a_tag() {
+        assert_not_a_tag("two words[1]");
     }
 
     #[test]
