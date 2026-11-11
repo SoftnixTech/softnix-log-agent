@@ -34,18 +34,25 @@ RFC 3164, TCP and UDP. The harness lives outside the repo, at
 on the wire was correct for 190/190 events; the failures below are all
 elsewhere.
 
-| ID | Title | Side | Severity | Priority | Affects third-party receivers? |
-|---|---|---|---|---|---|
-| SYS-1 | Multi-line event messages are split into several events | sender + receiver | **High** | P3 (spec first) | Yes (TCP, newline framing) |
-| SYS-2 | RFC 5424 parser ends STRUCTURED-DATA at the wrong `]` when a value contains `[` | receiver | Medium | P4 | No |
-| SYS-3 | RFC 3164 parser rejects `TAG[PID]` longer than 48 characters | receiver | Low | P4 | No |
-| SYS-4 | Syslog TCP/TLS input does not decode octet-counting framing | receiver | Medium | P3 (with SYS-1) | No |
-| SYS-5 | Agent self-logs go to stdout, not stderr | agent | Low | P4 | No |
-| SYS-6 | SD-ID uses enterprise number 32473 (reserved for documentation) | sender | Low | P5 | Cosmetic / policy |
-| SYS-7 | CI breaks on Rust ≥ 1.99: `fetch_update` is deprecated under `-D warnings` | build | Medium (blocks CI) | **P1** | n/a |
-| SYS-8 | Eventlog XML attribute values are not entity-unescaped | input (Windows) | Low | P2 (with SYS-9) | n/a |
-| SYS-9 | Eventlog `EventData` values containing XML entities are truncated and split | input (Windows) | **High** | **P2** | Yes (data lost at the source) |
-| SYS-10 | CI never builds on the declared MSRV (1.98) | build | Low | P4 | n/a |
+| ID | Title | Side | Severity | Priority | Affects third-party receivers? | Status |
+|---|---|---|---|---|---|---|
+| SYS-1 | Multi-line event messages are split into several events | sender + receiver | **High** | P3 (spec first) | Yes (TCP, newline framing) | **fixed** (`5693b55`, `a508a6d`) |
+| SYS-2 | RFC 5424 parser ends STRUCTURED-DATA at the wrong `]` when a value contains `[` | receiver | Medium | P4 | No | spec and plan drafted |
+| SYS-3 | RFC 3164 parser rejects `TAG[PID]` longer than 48 characters | receiver | Medium (was Low) | P4 | No | spec and plan drafted, option A decided |
+| SYS-4 | Syslog TCP/TLS input does not decode octet-counting framing | receiver | Medium | P3 (with SYS-1) | No | spec and plan drafted |
+| SYS-5 | Agent self-logs go to stdout, not stderr | agent | Low | P4 | No | spec and plan drafted |
+| SYS-6 | SD-ID uses enterprise number 32473 (reserved for documentation) | sender | Low | P5 | Cosmetic / policy | **won't fix** (owner decision 2026-11-11) |
+| SYS-7 | CI breaks on Rust ≥ 1.99: `fetch_update` is deprecated under `-D warnings` | build | Medium (blocks CI) | **P1** | n/a | **fixed** (`af3018c`) |
+| SYS-8 | Eventlog XML attribute values are not entity-unescaped | input (Windows) | Low | P2 (with SYS-9) | n/a | **fixed** (`cb9586c`) |
+| SYS-9 | Eventlog `EventData` values containing XML entities are truncated and split | input (Windows) | **High** | **P2** | Yes (data lost at the source) | **fixed** (`f6fb143`) |
+| SYS-10 | CI never builds on the declared MSRV (1.98) | build | Low | P4 | n/a | spec and plan drafted |
+
+Fixes are on branch `develop_fix_bug_known-issues`, which is based on `main`
+and not yet merged. The entries above were found and first verified on the
+provider-name branch (`f910a8f`). They were **re-verified on 2026-11-11**
+on `develop_fix_bug_known-issues`, 3 runs each: SYS-1 at `4d9f58b` (before
+its fix), and SYS-2 to SYS-5 after `a508a6d`. The details are in each
+issue's spec under `docs/superpowers/specs/`.
 
 See [Fix plan](#fix-plan) at the end of this section for the reasoning, the
 PR grouping, and the decisions still needed.
@@ -79,7 +86,7 @@ the first line:
 Mock result: 50/50 multi-line events were split, leaving 38 orphan fragments
 per round, on TCP **and** UDP.
 
-**Root cause.**
+**Root cause** (line numbers are from before the fix).
 1. `src/inputs/eventlog.rs` (`format_message`) trims only *trailing*
    `\0`/`\r`/`\n`. Embedded CRLF stays in `Event.message`.
 2. `src/outputs/format.rs` puts `ev.message` into the line verbatim, and
@@ -119,6 +126,8 @@ unchanged. Spec:
 
 ### SYS-2 — RFC 5424 parser ends STRUCTURED-DATA at the wrong `]` when a value contains `[`
 
+**Status: open, spec and plan drafted.** Next in line: #6 in the [Fix plan](#fix-plan). No owner decision needed.
+
 **Symptom.** When an SD PARAM-VALUE contains `[`, the receiver reads the
 whole rest of the line as STRUCTURED-DATA and `message` becomes empty.
 Per RFC 5424 §6.3.3 only `"`, `\` and `]` must be escaped inside
@@ -147,11 +156,18 @@ contain `[` (rule names, paths, file names).
 
 **Fix.** Track an "inside quotes" state while scanning: ignore `[`/`]`
 inside `"…"`, honour `\"` / `\\` / `\]` escapes there, and count brackets
-only outside quotes. Add a regression test using the line above.
+only outside quotes. Add a regression test using the line above. If the
+scan finds no end of the SD (a malformed line, for example an unterminated
+quote), fall back to today's scan, so that line parses exactly as before.
+Spec:
+`docs/superpowers/specs/2026-11-11-sys2-rfc5424-sd-bracket-in-value.md`
+(re-verified 2026-11-11: 4/4 bug cases, 2/2 controls correct).
 
 ---
 
 ### SYS-3 — RFC 3164 parser rejects `TAG[PID]` longer than 48 characters
+
+**Status: open, spec and plan drafted. Option A decided 2026-11-11** (relax the parser). #7 in the [Fix plan](#fix-plan).
 
 **Symptom.** On the receiver, an RFC 3164 line whose `TAG[PID]` is longer
 than 48 characters gets `application = None`, and the whole
@@ -170,7 +186,7 @@ fix, this name contained spaces and failed the same check anyway. It is
 the one remaining gap between the fix's RFC 3164 output and the agent's own
 RFC 3164 parser.
 
-**Fix options (owner picks one).**
+**Fix options** (decided 2026-11-11: the first one, relax the parser).
 - Relax the parser so it measures only the name part (before `[`) and
   accepts longer names. The sender stays unchanged.
 - Cap the sender's TAG so that `TAG[PID]` stays within 48 characters. This
@@ -180,21 +196,43 @@ RFC 3164 parser.
 Either way, the RFC 3164 note in `docs/CONFIGURATION*.md` must be updated
 to match.
 
+**Found 2026-11-11: it also happens without spaces, on `main`.** Real
+providers with no spaces exceed 48 once `[PID]` is appended:
+`Microsoft-Windows-TerminalServices-LocalSessionManager` (60 with
+`[1234]`, RDP logon / logoff events 21/23/24/25) and
+`…-RemoteConnectionManager` (64, RDP authentication 1149). The spec
+therefore proposes raising the severity to **Medium**, and recommends
+relaxing the parser (name and PID each up to 128). Spec:
+`docs/superpowers/specs/2026-11-11-sys3-rfc3164-long-tag.md`.
+
 ---
 
 ### SYS-4 — Syslog TCP/TLS input does not decode octet-counting framing
 
-Already recorded in the header spec, under "Out of scope" #1.
-`src/inputs/syslog.rs:343` only uses `LinesCodec`. When an agent sends with
-`framing: octet_counting`, all events on the connection arrive as one huge
-message. Smoke rounds 2 and 5 lost 36/36. This blocks the obvious
-workaround for SYS-1 between agents.
+**Status: open, spec and plan drafted.** **Next to implement**: #5 in the [Fix plan](#fix-plan). The minor choices have proposed answers.
 
-**Fix.** Detect RFC 6587 octet-counting (the frame starts with a digit
-then SP) per connection, or make it configurable on the input, and decode
-`MSG-LEN SP SYSLOG-MSG`.
+Already recorded in the header spec, under "Out of scope" #1.
+`src/inputs/syslog.rs:344` (`:343` before `a508a6d`) only uses
+`LinesCodec`. When an agent sends with `framing: octet_counting`, all
+events on the connection arrive as one huge message. Smoke rounds 2 and 5
+lost 36/36. Re-verified 2026-11-11: 10 events sent, **0 delivered while the
+sender stays connected**, then 1 event of 830 bytes after it closes. This
+blocks the obvious workaround for SYS-1 between agents.
+
+Incidental finding: `LinesCodec` also **closes the connection on one
+invalid UTF-8 byte** (`InvalidData`), dropping everything still buffered.
+UDP decodes lossily and does not have this problem.
+
+**Fix.** Detect RFC 6587 octet-counting per frame (`MSG-LEN SP` followed by
+`<` or `{`), add an optional input `framing: auto | newline |
+octet_counting`, and decode UTF-8 lossily, as UDP does. Spec:
+`docs/superpowers/specs/2026-11-11-sys4-tcp-input-octet-counting.md`.
+
+---
 
 ### SYS-5 — Agent self-logs go to stdout, not stderr
+
+**Status: open, spec and plan drafted.** #8 in the [Fix plan](#fix-plan). No owner decision needed.
 
 Already recorded in the header spec, under "Out of scope" #2.
 `src/main.rs:424` uses `tracing_subscriber::fmt::layer()`, whose writer
@@ -204,13 +242,25 @@ configured…` are mixed into the event stream. The mock harness had to
 skip them.
 
 **Fix.** `.with_writer(std::io::stderr)` on the fmt layer.
+`docs/OPERATIONS.md:132` already documents stderr. Re-verified 2026-11-11:
+stdout had 10 lines (2 events + 8 self-log), and stderr had 0 bytes. Spec:
+`docs/superpowers/specs/2026-11-11-sys5-self-logs-to-stderr.md`.
+
+---
 
 ### SYS-6 — SD-ID uses enterprise number 32473 (reserved for documentation)
+
+**Status: won't fix (owner decision 2026-11-11).** The company has no IANA PEN, so the SD-ID stays `softnix@32473` and no code changes. Nothing is broken by this: the number is a fixed label that no code reads. Its spec and plan were deleted at the owner's request. If a PEN is obtained later, reopen this entry and write new ones.
 
 Already recorded in the header spec, under "Out of scope" #3. RFC 5612
 reserves 32473 for documentation examples. A production SD-ID should use
 a registered IANA Private Enterprise Number. Changing it is a wire-format
 change for SIEM parsers, so it needs an owner decision and a release note.
+The SD-ID is also not documented anywhere. The spec recommended making it
+configurable, with an unchanged default, and switching the default once a
+PEN exists. That is not being done (see the status above).
+
+---
 
 ### SYS-7 — CI breaks on Rust ≥ 1.99: `fetch_update` is deprecated under `-D warnings`
 
@@ -330,6 +380,8 @@ not only `test-windows`. Spec:
 
 ### SYS-10 — CI never builds on the declared MSRV (1.98)
 
+**Status: open, spec and plan drafted.** #9 in the [Fix plan](#fix-plan). It can only be verified on a real CI run, which needs push access.
+
 `Cargo.toml:7` declares `rust-version = "1.98"`, but every CI job
 (`.github/workflows/ci.yml`: `test-linux`, `test-windows`, `lint`)
 installs the latest stable. Nothing checks that the crate still builds on
@@ -339,48 +391,87 @@ writing the SYS-7 spec, where it was checked by hand
 
 **Fix.** Add an `msrv` job that installs 1.98 and runs
 `cargo check --all-targets` (Linux is enough; add Windows if the
-`#[cfg(windows)]` code should be covered too).
+`#[cfg(windows)]` code should be covered too). It reads the version from
+`Cargo.toml`, and the pinned `dtolnay/rust-toolchain` SHA accepts a
+`toolchain:` input (verified). Spec:
+`docs/superpowers/specs/2026-11-11-sys10-ci-msrv-job.md`.
 
 ---
 
 ### Fix plan
 
-Agreed 2026-11-11. Ranked by impact, by whether the issue blocks other
-work, by effort, and by whether an owner decision is needed first.
+First agreed 2026-11-11 (P1–P5), and **revised the same day** after SYS-7,
+SYS-9, SYS-8 and SYS-1 were fixed and specs were drafted for every
+remaining issue. Later that day the specs were reviewed and revised,
+plans were written for SYS-2, SYS-3, SYS-4, SYS-5 and SYS-10 (under
+`docs/superpowers/plans/`), SYS-3 was decided (option A) and SYS-6 was
+closed as "won't fix". The order weighs, in turn:
 
-| Priority | Issue | Severity | Effort | Owner decision? | Why this position |
+1. **Impact:** data lost or corrupted ranks above cosmetic issues.
+2. **Whether an owner decision blocks the work:** unblocked work goes
+   first.
+3. **Effort and dependencies.**
+
+Every fix goes on one branch, `develop_fix_bug_known-issues` (based on
+`main`), at the owner's request. Each issue still gets its own spec, plan
+and commits.
+
+**Done** (not yet merged):
+
+| # | Issue | Severity | Fixed in | Spec |
+|---|---|---|---|---|
+| 1 | SYS-7 | Medium (blocked CI) | `af3018c` | `2026-11-11-sys7-atomic-fetch-update-deprecation.md` |
+| 2 | SYS-9 | **High** | `f6fb143` (refactor `71b954b`) | `2026-11-11-sys9-eventlog-xml-text-entities.md` |
+| 3 | SYS-8 | Low | `cb9586c` | `2026-11-11-sys8-eventlog-xml-attribute-unescape.md` |
+| 4 | SYS-1 | **High** | `5693b55`, `a508a6d` (option B) | `2026-11-11-sys1-multiline-messages-newline-framing.md` |
+
+**Remaining, in the order to do them:**
+
+| # | Issue | Severity | Effort | Blocked by | Why this position |
 |---|---|---|---|---|---|
-| **P1** | SYS-7 | Medium | 1 line | No | Blocks CI for every PR, including the provider-name fix waiting to merge. Fixed in `af3018c` (`update`, verified on MSRV 1.98). |
-| **P2** | SYS-9 | **High** | Medium | No | Security fields (`CommandLine` for Sysmon and 4688) are lost at the source, whatever the output, and no config works around it. Fixed in `f6fb143`. |
-| **P2** | SYS-8 | Low | Small | No | Same parser as SYS-9, so it can be fixed in the same change for almost no extra cost. Fixed in `cb9586c`. |
-| **P3** | SYS-1 | **High** | Large | **Yes** | Affects every TCP receiver with newline framing, which is the default. The escaping choice changes what SIEMs see, so it needs a spec. Start the spec in parallel with P1 and P2. Fixed in `5693b55`/`a508a6d` (option B). |
-| **P3** | SYS-4 | Medium | Medium | Minor | The agent-to-agent workaround for SYS-1, so design it in the same spec. |
-| **P4** | SYS-2 | Medium | Small | No | Only when the agent is a relay, but the whole message is lost. Easy to fix and to test. |
-| **P4** | SYS-3 | Low | Small | **Yes** | Choose between relaxing the parser and capping TAG on the sender. Recommended: relax the parser, so no sender data is lost. |
-| **P4** | SYS-5 | Low | 1 line | No | Low-risk one-liner that goes in the same PR as SYS-2 and SYS-3. |
-| **P4** | SYS-10 | Low | Small (CI) | No | Keeps the declared MSRV honest. Found while fixing SYS-7, where the MSRV had to be checked by hand. |
-| **P5** | SYS-6 | Low | Small (code) | **Yes** | Needs a registered IANA PEN, and changes the wire format for every SIEM parser. Ship it in a major release with advance notice. |
+| **5** | **SYS-4** | Medium | Medium | nothing (the minor choices have proposed answers) | Completes SYS-1: carrying multi-line messages *unchanged* agent-to-agent needs octet-counting. It also stops one invalid UTF-8 byte from closing a TCP connection and dropping buffered events (found 2026-11-11). The fix with the most data-loss impact left. |
+| **6** | **SYS-2** | Medium | Small | nothing | When the agent is a relay, **the whole message** is lost for any SD value containing `[`. No decision is needed, and it is easy to test. |
+| **7** | **SYS-3** | Medium (proposed; was Low) | Small | nothing (option A decided 2026-11-11) | RDP logon providers lose `application`/`process_id` on RFC 3164, even on `main`. A smaller loss than SYS-2 (the event still arrives, in `message`). |
+| **8** | **SYS-5** | Low | 1 line + test | nothing | Corrupts the event stream, but only for `stdout` outputs that are consumed as data. |
+| **9** | **SYS-10** | Low | Small (CI) | **push access**, to see it run | A guard, not a fix. Every gate so far has checked 1.98 by hand, so nothing is at risk while it waits. It can only be verified on a real CI run. |
+| **10** | **SYS-6** | Low | none | **closed: won't fix** (owner decision 2026-11-11, no PEN) | No breakage today, and the company has no PEN to switch to. Nothing to do unless a PEN is obtained. |
 
-**PR grouping.**
+The workflow for each one is the same as for SYS-7/8/9/1: review the spec
+with a prototype in a throw-away worktree, write a plan, then implement in
+TDD commits, followed by a docs commit that marks the entry fixed here.
 
-1. **PR-A — SYS-7.** Either a small standalone PR, or a commit on
-   `develop_fix_bug_windows-provider-name`. It goes first so that CI passes
-   and the provider-name fix can merge.
-2. **PR-B — SYS-9 + SYS-8** (eventlog parser). The parser's tests now run
-   on every platform (`71b954b`).
-3. **PR-C — SYS-2 + SYS-3 + SYS-5** (receiver parsers and logging). Three
-   small TDD changes. Starts once the owner has chosen the SYS-3 option.
-4. **PR-D — SYS-1 + SYS-4** (framing). Spec, then plan, then
-   implementation, the same flow as the provider-name fix.
-5. **PR-E — SYS-6.** Waits for the owner's PEN decision.
+**Merge order with the provider-name branch**
+(`develop_fix_bug_windows-provider-name`):
 
-**Owner decisions needed** (these can happen in parallel with PR-A and PR-B):
+- **SYS-7 must merge before, or together with, it.** Otherwise its CI fails
+  on Rust ≥ 1.99.
+- **SYS-3:** its CONFIGURATION note must say the same thing as the
+  provider-name branch's RFC 3164 output note when the two meet.
+- **SYS-1's end-to-end check** reaches 5/5 on the agent side only once
+  provider names with spaces are sanitized by that fix.
 
-- **SYS-1:** ~~how to handle CR/LF in MSG on newline framing~~ decided
-  2026-11-11: replace each line break with a space (option B).
-- **SYS-3:** relax the parser, or cap the sender's TAG.
-- **SYS-6:** does the company have an IANA PEN, and when should the SD-ID
-  change?
+**Review units** (the former PR grouping; useful if the branch is reviewed
+in parts):
+
+- **A**: SYS-7.
+- **B**: SYS-9 + SYS-8.
+- **D**: SYS-1 + SYS-4 (framing).
+- **C**: SYS-2 + SYS-3 + SYS-5 (receiver parsers and logging).
+- **F**: SYS-10 (CI).
+- ~~**E**: SYS-6~~ (closed, won't fix).
+
+**Owner decisions needed:**
+
+- ~~**SYS-3:** relax the parser (A) or cap the sender's TAG (B)~~: decided
+  2026-11-11, option A (name and PID ≤ 128). The severity is raised to
+  Medium as proposed, unless the owner says otherwise.
+- ~~**SYS-6:** PEN, option, timing~~: decided 2026-11-11. The company has
+  no IANA PEN. Keep `softnix@32473`, no code change (won't fix).
+- *Minor, with proposed answers that are used unless vetoed:* **SYS-4**:
+  the detection rule (digits + SP + `<`/`{`), an input `framing` option,
+  and lossy UTF-8. **SYS-10**: Linux-only MSRV job.
+- ~~**SYS-1:** how to handle CR/LF~~: decided 2026-11-11, option B (a
+  space).
 
 **Blocker for every PR.** The GitHub account `siwacarn` has pull-only access
 to `SoftnixTech/softnix-log-agent` (`"push": false`), so no branch can be
