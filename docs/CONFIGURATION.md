@@ -202,7 +202,9 @@ inputs:
   The full event XML is kept in `raw_message` only when `keep_raw_message: true`.
 - Mapped event fields: `Level` → `severity`, `Provider` → `application`,
   `Computer` → `hostname`, plus `event_id`, `channel`, `record_id`, `keywords`
-  and each `EventData` item as `data_<Name>`.
+  and each `EventData` item as `data_<Name>`. Provider names containing
+  spaces are sanitized on the syslog wire only — see *Notes on
+  formats/transports* under [`outputs`](#outputs).
 - Reading the **`Security`** channel requires elevated privilege. The Windows
   Service runs as LocalSystem, which satisfies this.
 
@@ -407,6 +409,16 @@ condition matches (or all outputs, if no `when`), subject to failover.
 **Notes on formats/transports:**
 
 - `rfc5424` output emits enrichment/custom fields in the STRUCTURED-DATA element.
+- Header fields are made wire-safe: in `rfc5424` and `rfc3164` output, any
+  character outside printable ASCII (spaces, tabs, non-ASCII) in `hostname`,
+  `application` or `process_id` is replaced by `_` (a run collapses to one),
+  and values are capped at the RFC limits (APP-NAME 48, HOSTNAME 255,
+  PROCID 128). Example: provider `Service Control Manager` is sent as
+  APP-NAME `Service_Control_Manager`. In `rfc5424` the original value is kept
+  in the STRUCTURED-DATA element (`application="Service Control Manager"`,
+  likewise `hostname` / `process_id`); `rfc3164` has no place for it. Values
+  that are already valid are sent unchanged. `json` output, `when:`
+  conditions and routing always see the original value.
 - `json` emits the full event including `raw_message`.
 - UDP sends one event per datagram; events larger than ~64 KB are dropped
   (counted in `events_dropped`) so they cannot block the queue.
