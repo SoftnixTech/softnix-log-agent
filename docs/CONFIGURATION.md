@@ -135,7 +135,7 @@ Receive syslog over the network.
 | `protocol` | enum | `udp` | `udp`, `tcp`, or `tls`. |
 | `bind` | IP | `0.0.0.0` | Local address to listen on. |
 | `port` | int | — (required) | Port (1–65535). |
-| `format` | enum | `auto` | `auto`, `rfc3164`, `rfc5424`, `json`, `raw`. `auto` tries RFC5424 → RFC3164 → JSON → raw. |
+| `format` | enum | `auto` | `auto`, `rfc3164`, `rfc5424`, `json`, `raw`. `auto` tries RFC5424 → RFC3164 → JSON → raw. For `rfc3164`, the TAG name and the PID in `TAG[PID]:` are each accepted up to 128 characters. A longer one leaves `application` and `process_id` unset and keeps the whole text in `message`. |
 | `framing` | enum | `auto` | TCP/TLS only (ignored for UDP). `auto`, `newline` or `octet_counting`. `auto` detects each frame: digits, a space, then `<` or `{` is an RFC 6587 octet-counted frame (`MSG-LEN SP MSG`), and anything else is a newline-terminated line. `newline` turns detection off. `octet_counting` requires every frame to be `MSG-LEN SP MSG` whatever the message starts with, and closes the connection on a malformed header. A frame longer than 64 KiB closes the connection. Invalid UTF-8 is replaced with U+FFFD and does not close the connection. |
 | `tls` | object | — | Required when `protocol: tls`. See below. |
 | `source_type` | string | `syslog` | Overrides `source_type` on emitted events. |

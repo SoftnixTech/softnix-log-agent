@@ -38,7 +38,7 @@ elsewhere.
 |---|---|---|---|---|---|---|
 | SYS-1 | Multi-line event messages are split into several events | sender + receiver | **High** | P3 (spec first) | Yes (TCP, newline framing) | **fixed** (`5693b55`, `a508a6d`) |
 | SYS-2 | RFC 5424 parser ends STRUCTURED-DATA at the wrong `]` when a value contains `[` | receiver | Medium | P4 | No | **fixed** (`e755072`) |
-| SYS-3 | RFC 3164 parser rejects `TAG[PID]` longer than 48 characters | receiver | Medium (was Low) | P4 | No | spec and plan drafted, option A decided |
+| SYS-3 | RFC 3164 parser rejects `TAG[PID]` longer than 48 characters | receiver | Medium (was Low) | P4 | No | **fixed** (`5ba805c`) |
 | SYS-4 | Syslog TCP/TLS input does not decode octet-counting framing | receiver | Medium | P3 (with SYS-1) | No | **fixed** (`fd90159`, `8de82c5`) |
 | SYS-5 | Agent self-logs go to stdout, not stderr | agent | Low | P4 | No | spec and plan drafted |
 | SYS-6 | SD-ID uses enterprise number 32473 (reserved for documentation) | sender | Low | P5 | Cosmetic / policy | **won't fix** (owner decision 2026-11-11) |
@@ -168,7 +168,7 @@ fix, the harness gives 6/6 correct in 3/3 runs.
 
 ### SYS-3 — RFC 3164 parser rejects `TAG[PID]` longer than 48 characters
 
-**Status: open, spec and plan drafted. Option A decided 2026-11-11** (relax the parser). #7 in the [Fix plan](#fix-plan).
+**Status: fixed** in `5ba805c` (option A, name and PID up to 128 each; branch `develop_fix_bug_known-issues`, not yet merged). After the fix, the harness gives 8/8 correct in 3/3 runs (was 4/8).
 
 **Symptom.** On the receiver, an RFC 3164 line whose `TAG[PID]` is longer
 than 48 characters gets `application = None`, and the whole
@@ -429,12 +429,12 @@ and commits.
 | 4 | SYS-1 | **High** | `5693b55`, `a508a6d` (option B) | `2026-11-11-sys1-multiline-messages-newline-framing.md` |
 | 5 | SYS-4 | Medium | `fd90159`, `8de82c5` | `2026-11-11-sys4-tcp-input-octet-counting.md` |
 | 6 | SYS-2 | Medium | `e755072` | `2026-11-11-sys2-rfc5424-sd-bracket-in-value.md` |
+| 7 | SYS-3 | Medium (was Low) | `5ba805c` (option A) | `2026-11-11-sys3-rfc3164-long-tag.md` |
 
 **Remaining, in the order to do them:**
 
 | # | Issue | Severity | Effort | Blocked by | Why this position |
 |---|---|---|---|---|---|
-| **7** | **SYS-3** | Medium (proposed; was Low) | Small | nothing (option A decided 2026-11-11) | RDP logon providers lose `application`/`process_id` on RFC 3164, even on `main`. A smaller loss than SYS-2 (the event still arrives, in `message`). |
 | **8** | **SYS-5** | Low | 1 line + test | nothing | Corrupts the event stream, but only for `stdout` outputs that are consumed as data. |
 | **9** | **SYS-10** | Low | Small (CI) | **push access**, to see it run | A guard, not a fix. Every gate so far has checked 1.98 by hand, so nothing is at risk while it waits. It can only be verified on a real CI run. |
 | **10** | **SYS-6** | Low | none | **closed: won't fix** (owner decision 2026-11-11, no PEN) | No breakage today, and the company has no PEN to switch to. Nothing to do unless a PEN is obtained. |
