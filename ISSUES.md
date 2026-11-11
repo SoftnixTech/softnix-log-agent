@@ -45,7 +45,7 @@ elsewhere.
 | SYS-7 | CI breaks on Rust ≥ 1.99: `fetch_update` is deprecated under `-D warnings` | build | Medium (blocks CI) | **P1** | n/a | **fixed** (`af3018c`) |
 | SYS-8 | Eventlog XML attribute values are not entity-unescaped | input (Windows) | Low | P2 (with SYS-9) | n/a | **fixed** (`cb9586c`) |
 | SYS-9 | Eventlog `EventData` values containing XML entities are truncated and split | input (Windows) | **High** | **P2** | Yes (data lost at the source) | **fixed** (`f6fb143`) |
-| SYS-10 | CI never builds on the declared MSRV (1.98) | build | Low | P4 | n/a | spec and plan drafted |
+| SYS-10 | CI never builds on the declared MSRV (1.98) | build | Low | P4 | n/a | **fixed** (`98dc828`), pending first CI run |
 
 Fixes are on branch `develop_fix_bug_known-issues`, which is based on `main`
 and not yet merged. The entries above were found and first verified on the
@@ -383,7 +383,7 @@ not only `test-windows`. Spec:
 
 ### SYS-10 — CI never builds on the declared MSRV (1.98)
 
-**Status: open, spec and plan drafted.** #9 in the [Fix plan](#fix-plan). It can only be verified on a real CI run, which needs push access.
+**Status: fixed** in `98dc828`, **not yet seen running**: the first CI run needs push access (see the Fix plan's blocker). Checked locally: the job's `sed` step prints `1.98`, `RUSTFLAGS="-D warnings" cargo +1.98 check --all-targets` passes, and `ci.yml` parses with the new `msrv` job (Linux only).
 
 `Cargo.toml:7` declares `rust-version = "1.98"`, but every CI job
 (`.github/workflows/ci.yml`: `test-linux`, `test-windows`, `lint`)
@@ -431,12 +431,12 @@ and commits.
 | 6 | SYS-2 | Medium | `e755072` | `2026-11-11-sys2-rfc5424-sd-bracket-in-value.md` |
 | 7 | SYS-3 | Medium (was Low) | `5ba805c` (option A) | `2026-11-11-sys3-rfc3164-long-tag.md` |
 | 8 | SYS-5 | Low | `292f00e` | `2026-11-11-sys5-self-logs-to-stderr.md` |
+| 9 | SYS-10 | Low | `98dc828` (**pending first CI run**, needs push access) | `2026-11-11-sys10-ci-msrv-job.md` |
 
 **Remaining, in the order to do them:**
 
 | # | Issue | Severity | Effort | Blocked by | Why this position |
 |---|---|---|---|---|---|
-| **9** | **SYS-10** | Low | Small (CI) | **push access**, to see it run | A guard, not a fix. Every gate so far has checked 1.98 by hand, so nothing is at risk while it waits. It can only be verified on a real CI run. |
 | **10** | **SYS-6** | Low | none | **closed: won't fix** (owner decision 2026-11-11, no PEN) | No breakage today, and the company has no PEN to switch to. Nothing to do unless a PEN is obtained. |
 
 The workflow for each one is the same as for SYS-7/8/9/1: review the spec
@@ -472,7 +472,8 @@ in parts):
   no IANA PEN. Keep `softnix@32473`, no code change (won't fix).
 - *Minor, with proposed answers that are used unless vetoed:* ~~**SYS-4**:
   the detection rule (digits + SP + `<`/`{`), an input `framing` option,
-  and lossy UTF-8~~ (used as proposed). **SYS-10**: Linux-only MSRV job.
+  and lossy UTF-8~~ (used as proposed). ~~**SYS-10**: Linux-only MSRV job~~
+  (used as proposed).
 - ~~**SYS-1:** how to handle CR/LF~~: decided 2026-11-11, option B (a
   space).
 
