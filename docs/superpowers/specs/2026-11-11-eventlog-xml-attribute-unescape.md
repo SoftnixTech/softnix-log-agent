@@ -1,22 +1,22 @@
-# SYS-8: Eventlog XML attribute values are not entity-unescaped — design spec
+# Eventlog XML attribute values are not entity-unescaped — design spec
 
 Status: **implemented for trial, not committed** (2026-11-11). V1–V4 pass
 on macOS. V5 (Windows CI) is still pending.
-Issue: SYS-8 in `ISSUES.md` (Low, P2).
 Implementation plan:
-`docs/superpowers/plans/2026-11-11-sys8-eventlog-xml-attribute-unescape.md`
-(runs after the SYS-9 plan).
-Related: SYS-9 (element text),
-`docs/superpowers/specs/2026-11-11-sys9-eventlog-xml-text-entities.md`.
+`docs/superpowers/plans/2026-11-11-eventlog-xml-attribute-unescape.md`
+(runs after the text-entity plan).
+Related: `EventData` values with XML entities truncated and split (element
+text, the text-entity fix),
+`docs/superpowers/specs/2026-11-11-eventlog-xml-text-entities.md`.
 The two are separate defects in separate parts of the same parser. This fix
-touches only the attribute closure. It uses SYS-9's Part 2 (the parser now
-lives in `src/inputs/eventlog_xml.rs`, testable on every platform), but not
-SYS-9's Part 1.
+touches only the attribute closure. It uses the text-entity fix's Part 2 (the
+parser now lives in `src/inputs/eventlog_xml.rs`, testable on every
+platform), but not its Part 1.
 
 ## Problem
 
 The `attr` closure in `parse_event_xml` (`src/inputs/eventlog.rs:826`
-before the SYS-9 move) returns `String::from_utf8_lossy(&a.value)`, the raw
+before the text-entity fix moved it) returns `String::from_utf8_lossy(&a.value)`, the raw
 attribute bytes. The attributes the parser reads are therefore never
 unescaped:
 
@@ -39,13 +39,14 @@ unescaped:
 `<Data Name='A&amp;B'>v</Data>` produces the key `A&amp;B` today. With
 this fix it is `A&B`.
 
-### A trap in the fix that `ISSUES.md` proposes
+### A trap in the originally proposed fix
 
-`ISSUES.md` suggests `a.unescape_value()`. In `quick-xml` 0.41 that method
+The original bug report suggested `a.unescape_value()`. In `quick-xml` 0.41 that method
 is **deprecated** ("use `Self::normalized_value()`"). Verified: a test build
 with `RUSTFLAGS="-D warnings"` fails with
 `use of deprecated method … Attribute::unescape_value`. Using it would break
-CI's `test-windows` job, the same class of failure as SYS-7.
+CI's `test-windows` job, the same class of failure as the
+`AtomicU64::fetch_update` deprecation on Rust 1.99.
 
 ## Impact
 
@@ -67,7 +68,7 @@ EventData instead of the rendered text.
 
 ## Non-goals
 
-- Element text: SYS-9.
+- Element text: the text-entity fix.
 - Every other part of the parser and `build_event`.
 
 ## Design
@@ -107,14 +108,14 @@ The guards pass before and after the change:
 
 | # | Command | Where | Expected | Trial result |
 | --- | --- | --- | --- | --- |
-| V1 | `cargo test --lib eventlog_xml` before the change | macOS | the 2 SYS-8 tests fail | as expected |
-| V2 | `RUSTFLAGS="-D warnings" cargo test --all-targets` | macOS, 1.99.1 | all pass | passes (together with SYS-9) |
+| V1 | `cargo test --lib eventlog_xml` before the change | macOS | the 2 new tests fail | as expected |
+| V2 | `RUSTFLAGS="-D warnings" cargo test --all-targets` | macOS, 1.99.1 | all pass | passes (together with the text-entity fix) |
 | V3 | `RUSTFLAGS="-D warnings" cargo clippy --all-targets`, `cargo fmt --all -- --check` | macOS, 1.99.1 | clean, with no deprecation warning | clean |
 | V4 | `RUSTFLAGS="-D warnings" cargo +1.98 check --all-targets` | macOS, 1.98.1 | passes | passes |
 | V5 | CI `test-windows` | Windows | passes | **pending** |
 
-Independence from SYS-9: with only SYS-9's fix applied (this change
-reverted), exactly the 2 SYS-8 tests fail, and the other 10 pass.
+Independence from the text-entity fix: with only that fix applied (this
+change reverted), exactly the 2 new tests fail, and the other 10 pass.
 
 ## Behaviour changes
 
@@ -151,12 +152,12 @@ reverted), exactly the 2 SYS-8 tests fail, and the other 10 pass.
 
 ## Rollout
 
-On `develop_fix_bug_known-issues`, right after SYS-9's commits:
+On `develop_fix_bug_known-issues`, right after the text-entity fix's commits:
 
 1. `fix(eventlog): unescape XML attribute values` (the `attr` closure and
-   the 2 tests). This fixes SYS-8.
-2. `docs`: mark SYS-8 fixed in `ISSUES.md`, and correct its **Fix** text:
-   `normalized_value`, not the deprecated `unescape_value`.
+   the 2 tests). This fixes the bug.
+2. `docs`: record the fix in the issue tracker, and correct the proposed
+   fix there: `normalized_value`, not the deprecated `unescape_value`.
 
 ## Open questions
 

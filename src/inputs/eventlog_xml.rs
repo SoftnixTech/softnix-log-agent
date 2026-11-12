@@ -31,7 +31,7 @@ pub(super) struct ParsedEvent {
 /// quick-xml 0.41 reports every entity / character reference (`&amp;`,
 /// `&#13;`) as its own `Event::GeneralRef` and splits the text around it
 /// into several `Event::Text` events. So an element's value is accumulated
-/// across `Text` and `GeneralRef` and assigned once, on its `End` (SYS-9).
+/// across `Text` and `GeneralRef` and assigned once, on its `End`.
 pub(super) fn parse_event_xml(xml: &str) -> ParsedEvent {
     use quick_xml::events::Event as Xml;
     use quick_xml::reader::Reader;
@@ -44,7 +44,7 @@ pub(super) fn parse_event_xml(xml: &str) -> ParsedEvent {
     let mut cur_data_name = String::new();
     let mut in_event_data = false;
 
-    // Attribute values with references resolved (SYS-8). `normalized_value`,
+    // Attribute values with references resolved. `normalized_value`,
     // not the deprecated `unescape_value` (which fails `-D warnings`). On a
     // malformed reference fall back to the raw value, so a bad attribute
     // never turns into `None`.
@@ -211,7 +211,7 @@ mod tests {
         (k.to_string(), v.to_string())
     }
 
-    // --- SYS-9: element text must survive entity / character references ---
+    // --- Element text must survive entity / character references ---
     //
     // quick-xml 0.41 reports every `&…;` as its own `Event::GeneralRef` and
     // splits the surrounding text into several `Event::Text` events; each
@@ -289,7 +289,7 @@ mod tests {
         assert_eq!(p.keywords.as_deref(), Some("0x10"));
     }
 
-    // --- SYS-8: attribute values must be unescaped ---
+    // --- Attribute values must be unescaped ---
 
     #[test]
     fn provider_name_is_unescaped() {

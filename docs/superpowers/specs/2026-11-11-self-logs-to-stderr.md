@@ -1,8 +1,7 @@
-# SYS-5: Agent self-logs go to stdout, not stderr — design spec
+# Agent self-logs go to stdout, not stderr — design spec
 
 Status: **draft — owner review** (no decision is needed; the documented
 behaviour is already stderr). Nothing is implemented yet.
-Issue: SYS-5 in `ISSUES.md` (Low, P4).
 Branch: `develop_fix_bug_known-issues`.
 
 ## Problem
@@ -25,7 +24,7 @@ log collector parsing JSON) gets lines that are not events.
 
 ### Evidence (2026-11-11, branch HEAD after `a508a6d`, 3 independent runs)
 
-The harness (`issues_repro.py`, SYS-5 case) runs the agent with a file
+The harness (`issues_repro.py`, the self-logs case) runs the agent with a file
 input of 2 JSON events, a `type: stdout, format: json` output,
 `log_level: info` and the web UI on. Every run was identical:
 
@@ -93,7 +92,7 @@ Before the fix, step 3 fails on its first assertion: the startup line is
 on stdout. The test needs no network port, and it runs on Linux, macOS and
 Windows CI.
 
-End-to-end: the harness's SYS-5 case. Expected: stdout 2 lines (2 events,
+End-to-end: the harness's self-logs case. Expected: stdout 2 lines (2 events,
 0 self-log), and stderr greater than 0 bytes.
 
 Gate: fmt, clippy `-D warnings`, test `-D warnings`, `+1.98 check`.
@@ -114,7 +113,7 @@ On `develop_fix_bug_known-issues`, after the spec and plan:
 
 1. `fix(main): write agent self-logs to stderr` (the one-line change and the
    integration test).
-2. `docs`: mark SYS-5 fixed in `ISSUES.md`. `OPERATIONS.md` already says
+2. `docs`: record the fix in the issue tracker. `OPERATIONS.md` already says
    stderr. If the owner wants, add a release-note line for risk 1.
 
 ## Open questions

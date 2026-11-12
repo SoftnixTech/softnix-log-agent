@@ -1,4 +1,4 @@
-//! SYS-5: the agent's own log lines go to stderr, so stdout carries only what
+//! The agent's own log lines go to stderr, so stdout carries only what
 //! a `type: stdout` output writes. The tracing subscriber is installed inside
 //! the binary, so this spawns the real executable.
 
@@ -7,7 +7,7 @@ use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-const MARKER: &str = "SYS5-EVENT";
+const MARKER: &str = "SELF-LOGS-EVENT";
 
 #[test]
 fn self_logs_go_to_stderr_not_stdout() {

@@ -1,8 +1,7 @@
-# SYS-2: RFC 5424 parser ends STRUCTURED-DATA at the wrong `]` when a value contains `[` — design spec
+# RFC 5424 parser ends STRUCTURED-DATA at the wrong `]` when a value contains `[` — design spec
 
 Status: **draft — owner review** (no decision is needed; the fix is the
 standard grammar). Nothing is implemented yet.
-Issue: SYS-2 in `ISSUES.md` (Medium, P4).
 Branch: `develop_fix_bug_known-issues`.
 
 ## Problem
@@ -31,8 +30,8 @@ empty**.
 
 ### Evidence (2026-11-11, branch HEAD after `a508a6d`, 3 independent runs)
 
-The harness (`/tmp/softnix-smoke.LTIcHO/harness/issues_repro.py`, SYS-2
-case) sends 6 RFC 5424 lines to agent B's TCP input. Every run gave
+The harness (`/tmp/softnix-smoke.LTIcHO/harness/issues_repro.py`, the
+STRUCTURED-DATA case) sends 6 RFC 5424 lines to agent B's TCP input. Every run gave
 identical results:
 
 | Case | SD | `message` | Correct? |
@@ -69,7 +68,8 @@ includes another agent.
 
 - Parsing SD into fields. `structured_data` stays the raw string, as today.
 - Validating SD-ID or PARAM-NAME syntax.
-- RFC 3164 parsing (SYS-3).
+- RFC 3164 parsing (the RFC 3164 parser rejecting a long `TAG[PID]`,
+  `2026-11-11-rfc3164-long-tag.md`).
 
 ## Design
 
@@ -132,7 +132,7 @@ Unit tests in `src/pipeline/syslog.rs`'s `mod tests`:
 The existing RFC 5424 test (`rfc5424_parses`, `[exampleSDID@32473
 iut="3"]`) stays green.
 
-End-to-end: the harness's SYS-2 case. Expected: 6/6 correct, 3 runs.
+End-to-end: the harness's STRUCTURED-DATA case. Expected: 6/6 correct, 3 runs.
 
 Gate: fmt, clippy `-D warnings`, test `-D warnings`, `+1.98 check`.
 
@@ -151,10 +151,10 @@ On `develop_fix_bug_known-issues`, after the spec and plan:
 
 1. `fix(pipeline): end RFC 5424 STRUCTURED-DATA by the grammar, not raw brackets`
    (the scanner and its tests).
-2. `docs`: mark SYS-2 fixed in `ISSUES.md`.
+2. `docs`: record the fix in the issue tracker.
 
 ## Open questions
 
-None. The grammar fixes the behaviour. (In `ISSUES.md`'s PR grouping, this
-spec belongs with SYS-3 and SYS-5 in PR-C, but each has its own spec and
-commits.)
+None. The grammar fixes the behaviour. (This fix may ship in one PR with
+the long RFC 3164 tag fix and the self-logs-to-stderr fix, but each has its
+own spec and commits.)

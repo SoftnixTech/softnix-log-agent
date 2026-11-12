@@ -1,9 +1,10 @@
-# SYS-4: Syslog TCP/TLS input does not decode octet-counting framing — design spec
+# Syslog TCP/TLS input does not decode octet-counting framing — design spec
 
-Status: **draft — owner review needed** (open question 1 is the "minor"
-decision recorded in `ISSUES.md`). Nothing is implemented yet.
-Issue: SYS-4 in `ISSUES.md` (Medium, P3).
-Related: SYS-1 (fixed in `5693b55`/`a508a6d`). Its spec names
+Status: **draft — owner review needed** (open question 1 is a minor
+owner decision). Nothing is implemented yet.
+Related: multi-line messages split by newline framing (fixed in
+`5693b55`/`a508a6d`). Its spec,
+`2026-11-11-multiline-messages-newline-framing.md`, names
 `framing: octet_counting` as the way to carry multi-line messages
 unchanged, and that path does not work agent-to-agent until this is fixed.
 Branch: `develop_fix_bug_known-issues`.
@@ -46,7 +47,7 @@ question 3.
 ### Evidence (2026-11-11, branch HEAD after `a508a6d`, 3 independent runs)
 
 The repro harness (`/tmp/softnix-smoke.LTIcHO/harness/issues_repro.py`,
-SYS-4 case): agent A sends 10 single-line events with `protocol: tcp,
+octet-counting case): agent A sends 10 single-line events with `protocol: tcp,
 framing: octet_counting` to a plain-Python sink and to agent B's TCP input.
 Every run gave identical results:
 
@@ -61,7 +62,8 @@ Every run gave identical results:
 Medium. Only the agent's own TCP/TLS **input** is affected. Third-party
 receivers that support octet-counting decode the agent's output correctly.
 But this blocks the agent-to-agent (relay) use of octet-counting, which is
-the only way to carry multi-line messages *unchanged* over TCP (SYS-1).
+the only way to carry multi-line messages *unchanged* over TCP (see the multi-line newline framing fix,
+`2026-11-11-multiline-messages-newline-framing.md`).
 While the sender stays connected, events are also delayed without limit
 and then lost into one blob.
 
@@ -80,7 +82,8 @@ and then lost into one blob.
 ## Non-goals
 
 - The output side: `framing: octet_counting` is already correct.
-- UDP: datagrams carry no framing (SYS-1 Part 2).
+- UDP: datagrams carry no framing (Part 2 of the multi-line newline framing
+  fix).
 - Changing `MAX_MSG` or the idle and handshake timeouts.
 
 ## Design
@@ -150,8 +153,8 @@ not compile.
 ### Part 3: documentation
 
 - `docs/CONFIGURATION.md:170` and `docs/CONFIGURATION.th.md:169`: replace
-  the SYS-1 note "uses newline framing only … tracked as SYS-4" with the
-  new behaviour. Both framings are accepted (auto-detected per frame), and
+  the note from the multi-line newline framing fix ("uses newline framing
+  only", with a pointer to this issue) with the new behaviour. Both framings are accepted (auto-detected per frame), and
   octet-counting keeps multi-line messages intact.
 - Add the `framing` row to the `inputs.syslog` table (en/th).
 - State the one combination `auto` cannot detect: an octet-counted sender
@@ -191,11 +194,12 @@ Integration (`src/inputs/syslog.rs` tests, next to `tcp_receives_lines`):
   does today.) On today's code this fails: no event arrives before close.
 - `tcp_receives_lines` (existing) stays green, which guards Goal 2.
 
-End-to-end: the harness's SYS-4 case (3 runs). Expected: agent B gets
+End-to-end: the harness's octet-counting case (3 runs). Expected: agent B gets
 **10 events while A is connected**, 0 after close, and each one equals the
-sent line. In addition, the SYS-1 case with agent A's TCP output switched to
+sent line. In addition, the multi-line case with agent A's TCP output switched to
 `framing: octet_counting` gives agent B the **exact** multi-line messages
-(5/5, minus the provider-name confounder described in the SYS-1 spec).
+(5/5, minus the provider-name confounder described in the multi-line spec,
+`2026-11-11-multiline-messages-newline-framing.md`).
 
 Gate: fmt, clippy `-D warnings`, test `-D warnings`, `+1.98 check`.
 
@@ -226,7 +230,7 @@ plan:
    with `auto` as the only behaviour, plus the codec and integration tests).
 2. `feat(config): add framing option to syslog inputs` (Part 2 and its
    tests).
-3. `docs`: CONFIGURATION en/th, and mark SYS-4 fixed in `ISSUES.md`.
+3. `docs`: CONFIGURATION en/th, and record the fix in the issue tracker.
 
 ## Open questions
 

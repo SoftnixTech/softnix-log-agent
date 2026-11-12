@@ -1,17 +1,18 @@
-# SYS-1: Multi-line event messages are split into several events — design spec
+# Multi-line event messages are split into several events — design spec
 
 Status: **approved, 2026-11-11.** The owner chose **option B** (each line
 break becomes one space) for open question 1. Open questions 2–4 take the
 proposed answers. A prototype in a throw-away worktree passed every test
 and the end-to-end harness (see [Prototype results](#prototype-results-2026-11-11)).
 Implementation plan:
-`docs/superpowers/plans/2026-11-11-sys1-multiline-messages-newline-framing.md`.
-Issue: SYS-1 in `ISSUES.md` (High, P3).
-Related: SYS-4 (the agent's TCP/TLS input cannot decode octet-counting)
-gets its **own spec**. It is the receiver-side half of the "use
-octet-counting" workaround, and this spec depends on it only for that
-workaround. SYS-9 (fixed in `f6fb143`) adds a new way for CR/LF to reach
-the wire: `&#13;&#10;` in EventData now becomes real CR/LF in `data_*`.
+`docs/superpowers/plans/2026-11-11-multiline-messages-newline-framing.md`.
+Related: the TCP/TLS input octet-counting framing issue (the agent's TCP/TLS
+input cannot decode octet-counting) gets its **own spec**,
+`2026-11-11-tcp-input-octet-counting.md`. It is the receiver-side half of
+the "use octet-counting" workaround, and this spec depends on it only for
+that workaround. The fix for Eventlog `EventData` values with XML entities
+truncated and split (`2026-11-11-eventlog-xml-text-entities.md`, fixed in
+`f6fb143`) adds a new way for CR/LF to reach the wire: `&#13;&#10;` in EventData now becomes real CR/LF in `data_*`.
 Branch: `develop_fix_bug_known-issues`.
 
 ## Problem
@@ -27,14 +28,14 @@ are carried, in three separate places:
 | --- | --- | --- | --- |
 | 1 | **Sender**, TCP/TLS (and `stdout`) with `framing: newline` | `frame_batch`, `src/outputs/stdout.rs:46-49`, shared by `SyslogSink` TCP/TLS (`src/outputs/syslog.rs:138`, `:143`) and `StdoutSink` | The formatted line is written as it is, then `\n` is appended. A line that already contains CR/LF becomes several frames. **Every** newline-framed receiver splits it, the agent or third-party. RFC 6587 §3.4.2 (non-transparent framing) cannot carry an LF inside a message. |
 | 2 | **Receiver**, the agent's UDP input | `src/inputs/syslog.rs:200-202`: `for line in text.lines()` | The sender correctly sends one event per datagram (`src/outputs/syslog.rs:110`, RFC 5426 §3.1), but the agent's receiver splits each datagram on LF anyway. |
-| 3 | **Receiver**, the agent's TCP/TLS input | `src/inputs/syslog.rs:343`: `LinesCodec` | Correct for newline framing, which is the only framing it supports. Carrying multi-line messages agent-to-agent needs octet-counting: **SYS-4, out of scope here.** |
+| 3 | **Receiver**, the agent's TCP/TLS input | `src/inputs/syslog.rs:343`: `LinesCodec` | Correct for newline framing, which is the only framing it supports. Carrying multi-line messages agent-to-agent needs octet-counting: **the octet-counting input fix (`2026-11-11-tcp-input-octet-counting.md`), out of scope here.** |
 
 Where it happens, by output setting:
 
 | Output | `format` | Affected? |
 | --- | --- | --- |
 | syslog TCP/TLS, `framing: newline` (the **default**) | `rfc5424`, `rfc3164`, `raw` | **Yes, for every receiver** (row 1) |
-| syslog TCP/TLS, `framing: octet_counting` | any | Third-party receivers that decode octet-counting: no. The agent's own input: yes (SYS-4). |
+| syslog TCP/TLS, `framing: octet_counting` | any | Third-party receivers that decode octet-counting: no. The agent's own input: yes (until the octet-counting input fix). |
 | syslog UDP | any | The sender is fine. The agent's own UDP input: yes (row 2). |
 | any | `json` | **No.** serde escapes CR/LF as `\r`/`\n` inside the JSON string. |
 | stdout, `framing: newline` | `rfc5424`, `rfc3164`, `raw` | Yes, for line-based consumers (row 1, same function) |
@@ -42,7 +43,7 @@ Where it happens, by output setting:
 ### Evidence (2026-11-11, branch HEAD `4d9f58b`, 3 independent runs)
 
 The repro harness from the 2026-11-11 verification
-(`/tmp/softnix-smoke.LTIcHO/harness/issues_repro.py`, SYS-1 case) was run
+(`/tmp/softnix-smoke.LTIcHO/harness/issues_repro.py`, multi-line case) was run
 again against a fresh debug build of this branch. It uses 7 realistic Windows
 events (5 multi-line, 2 single-line). Agent A sends them over RFC 5424 to a
 plain-Python TCP and UDP sink (standing in for a third-party SIEM) and to
@@ -66,7 +67,7 @@ which does not have the provider-name header fix
 (`develop_fix_bug_windows-provider-name`), so the space in APP-NAME breaks
 agent B's RFC 5424 parse: `application` becomes `Service` or `Application`,
 and the rest of the header leaks into `message`. That is why 1 of the 2
-single-line events is not intact on agent B. The bug is unrelated to SYS-1,
+single-line events is not intact on agent B. The bug is unrelated to this issue,
 but on agent B it also hides 2 of the 5 multi-line events (see the
 prototype results below).
 
@@ -91,7 +92,8 @@ uses `rfc5424`, `rfc3164` or `raw` is affected.
 
 ## Non-goals
 
-- Octet-counting on the agent's TCP/TLS input: SYS-4.
+- Octet-counting on the agent's TCP/TLS input: the octet-counting input fix
+  (`2026-11-11-tcp-input-octet-counting.md`).
 - Changing the default framing or the default format.
 - Tabs. They do not break any framing, and RFC 5424 MSG may contain them.
 - CR/LF in header fields (HOSTNAME, APP-NAME, TAG). That is header
@@ -106,8 +108,8 @@ In `frame_batch`'s `Framing::Newline` arm, before appending the trailing
 pair, and each lone `\r` or `\n`. This is the **only** place that writes
 newline-framed output, so it covers TCP, TLS and stdout together. It
 covers the MSG and the RFC 5424 SD values (including `data_*` values that
-now carry CR/LF because of SYS-9), since both are part of the formatted
-line. Lines without CR/LF take a fast path and stay byte-identical with no
+now carry CR/LF because of the `EventData` entity fix), since both are
+part of the formatted line. Lines without CR/LF take a fast path and stay byte-identical with no
 extra allocation (Goal 3). `format: json` never contains a raw CR/LF, so
 this is a no-op for it. `Framing::OctetCounting` and the UDP path do not go
 through this arm, so they are not touched.
@@ -134,7 +136,7 @@ Why **B** is recommended:
 - What is lost (the line structure) remains available to anyone who needs
   it: `format: json` keeps CR/LF escaped inside JSON, and
   `framing: octet_counting` carries the message unchanged to receivers that
-  support it (rsyslog `imtcp`, syslog-ng, and the agent itself after SYS-4).
+  support it (rsyslog `imtcp`, syslog-ng, and the agent itself after the octet-counting input fix).
 
 When A would be better: if existing SIEM parsers already expect rsyslog's
 `#012` convention (for example, Windows logs that used to arrive through an
@@ -166,7 +168,7 @@ break just as the per-line `trim()` did.
   `frame_batch`.
 - `docs/CONFIGURATION.md:170` and `CONFIGURATION.th.md:169` ("TCP/TLS
   syslog input uses newline framing only"): add that a multi-line message
-  arriving on TCP/TLS is split, and point to SYS-4. Also add that UDP keeps
+  arriving on TCP/TLS is split, and point to the octet-counting input fix. Also add that UDP keeps
   one datagram as one event.
 
 ## Testing
@@ -183,7 +185,7 @@ Unit tests (all cross-platform):
 | `udp_datagram_is_one_event` | `src/inputs/syslog.rs` tests (next to `udp_receives_rfc3164`) | one datagram with an RFC 5424 line whose MSG has `\r\n`: **one** event, message contains the CR/LF | fails (several events) |
 | `udp_trailing_newline_still_one_event` | same | `"<14>… msg\n"`: one event, no empty event | passes (guard) |
 
-End-to-end: re-run the harness's SYS-1 case (3 runs) with its "intact"
+End-to-end: re-run the harness's multi-line case (3 runs) with its "intact"
 check adapted for option B: compare against the message with CR/LF replaced.
 Expected on this branch: SIEM TCP **7 frames for 7 events** and 0
 header-less frames, SIEM UDP 5/5, 0 fragment events on agent B, and on agent
@@ -222,8 +224,8 @@ Gate: `cargo fmt --all -- --check`, `RUSTFLAGS="-D warnings" cargo clippy
    because fragments carry no header) or that expect rsyslog's `#012` will
    need adjusting. Needs a release note.
 2. **SD values with line breaks change the same way on that wire** (for
-   example `data_*` values that carry `&#13;&#10;`, which SYS-9 now
-   resolves). `format: json` still carries them exactly.
+   example `data_*` values that carry `&#13;&#10;`, which the `EventData` entity fix
+   now resolves). `format: json` still carries them exactly.
 3. **A UDP datagram that contains several LF-separated messages** (a
    non-conforming sender batching messages) becomes one event instead of
    several. RFC 5426 forbids such batching. No sender in this project does
@@ -240,12 +242,13 @@ first, then):
    (Part 1 and its tests).
 2. `fix(inputs): treat one UDP datagram as one syslog message` (Part 2 and
    its tests).
-3. `docs`: CONFIGURATION (en/th) framing notes, and mark SYS-1 fixed in
-   `ISSUES.md`.
+3. `docs`: CONFIGURATION (en/th) framing notes, and record the fix in the
+   issue tracker.
 
 ## Out of scope
 
-1. **SYS-4**: octet-counting on the agent's TCP/TLS input (own spec). Until
+1. **Octet-counting on the agent's TCP/TLS input** (own spec,
+   `2026-11-11-tcp-input-octet-counting.md`). Until
    it lands, agent-to-agent TCP still relies on Part 1.
 2. **A config knob for the replacement** (for example
    `newline_replacement: space | octal`). Not proposed for now (open

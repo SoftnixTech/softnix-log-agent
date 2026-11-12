@@ -1,4 +1,4 @@
-# SYS-1 Multi-line Messages Under Newline Framing Implementation Plan
+# Multi-line Messages Under Newline Framing Implementation Plan
 
 > **For agentic workers:** Steps use checkbox (`- [ ]`) syntax for tracking. Execute the tasks in order. Every commit-producing task shows a red run before its fix, and ends with the full gate.
 
@@ -8,12 +8,12 @@
 
 **Tech Stack:** Rust 2021, `std::borrow::Cow`, existing tokio test scaffolding.
 
-**Spec:** `docs/superpowers/specs/2026-11-11-sys1-multiline-messages-newline-framing.md`
+**Spec:** `docs/superpowers/specs/2026-11-11-multiline-messages-newline-framing.md`
 
 ## Global Constraints
 
 - Branch `develop_fix_bug_known-issues`. Starting HEAD is `4d9f58b` plus this plan's docs commit (T0). `rust-version = "1.98"`. The local toolchains are 1.99.1 (with clippy) and 1.98.1 (no clippy, so use `check`).
-- **Code changes only in** `src/outputs/stdout.rs` (T1) and `src/inputs/syslog.rs` (T2). Docs: `docs/CONFIGURATION.md`, `docs/CONFIGURATION.th.md` (T3), and `ISSUES.md` (T4). No config-schema, dependency or wire change other than the one intended.
+- **Code changes only in** `src/outputs/stdout.rs` (T1) and `src/inputs/syslog.rs` (T2). Docs: `docs/CONFIGURATION.md`, `docs/CONFIGURATION.th.md` (T3). T4 records the fix in the issue tracker. No config-schema, dependency or wire change other than the one intended.
 - **Lib test counts on macOS** (bin 3 and e2e 6 never change): 190 at the start, **195** after T1, **197** after T2.
 - **Gate** (after T1 and T2; everything must pass):
 
@@ -26,7 +26,7 @@
 
   Do **not** set `CARGO_TARGET_DIR`: the `update::apply` preflight tests look for the binary under `<repo>/target/debug`.
 - Stage files **by name**, never `git add -A` (`report.html` stays untracked). Every commit message ends with `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`.
-- **The prototype has already been done** (2026-11-11, throw-away worktree at `4d9f58b`). The code below is exactly the prototype's code after `cargo fmt`, and it passed every step of this plan: red 3/4, then 9/9, gate 197 lib, harness 7 frames / 0 fragments. The prototype's per-commit patches are kept at `/tmp/sys1/p1-outputs.diff` (T1) and `/tmp/sys1/p2-inputs.diff` (T2) as a cross-check. They are optional: the snippets below are authoritative, so the plan works without `/tmp`.
+- **The prototype has already been done** (2026-11-11, throw-away worktree at `4d9f58b`). The code below is exactly the prototype's code after `cargo fmt`, and it passed every step of this plan: red 3/4, then 9/9, gate 197 lib, harness 7 frames / 0 fragments. The prototype's per-commit patches are kept at `/tmp/multiline/p1-outputs.diff` (T1) and `/tmp/multiline/p2-inputs.diff` (T2) as a cross-check. They are optional: the snippets below are authoritative, so the plan works without `/tmp`.
 
 ## Rulings
 
@@ -41,7 +41,7 @@
 
 **R-1: Sender and receiver are separate commits.** They are independent: either one alone passes the gate. The receiver change is also the one with a compatibility risk for non-conforming third-party senders (spec risk 3), so it can be reverted on its own.
 
-**R-2: The end-to-end harness is a verification step, not a commit.** It lives outside the repo (`/tmp/softnix-smoke.LTIcHO/harness/issues_repro.py`). The adapted SYS-1 evaluation is given in T3 step 1.
+**R-2: The end-to-end harness is a verification step, not a commit.** It lives outside the repo (`/tmp/softnix-smoke.LTIcHO/harness/issues_repro.py`). The adapted multi-line evaluation is given in T3 step 1.
 
 ---
 
@@ -52,19 +52,19 @@ T0 C1 spec + plan
 T1 C2 fix(outputs): single_line in frame_batch         (red 2 → green, 195)
 T2 C3 fix(inputs): one UDP datagram = one event         (red 1 → green, 197)
 T3 harness re-run (no commit), then C4 docs CONFIGURATION en/th
-T4 C5 ISSUES.md: SYS-1 fixed                            (needs the C2/C3 hashes)
+T4 record the fix in the issue tracker                  (needs the C2/C3 hashes)
 ```
 
 ---
 
 ### Task 0: C1, spec and plan
 
-- [ ] **Step 1:** `git status --short` shows exactly `?? docs/superpowers/plans/2026-11-11-sys1-multiline-messages-newline-framing.md`, `?? docs/superpowers/specs/2026-11-11-sys1-multiline-messages-newline-framing.md` and `?? report.html`. `git log --oneline -1` is `4d9f58b`.
+- [ ] **Step 1:** `git status --short` shows exactly `?? docs/superpowers/plans/2026-11-11-multiline-messages-newline-framing.md`, `?? docs/superpowers/specs/2026-11-11-multiline-messages-newline-framing.md` and `?? report.html`. `git log --oneline -1` is `4d9f58b`.
 - [ ] **Step 2:**
 
   ```bash
-  git add docs/superpowers/specs/2026-11-11-sys1-multiline-messages-newline-framing.md docs/superpowers/plans/2026-11-11-sys1-multiline-messages-newline-framing.md
-  git commit -m "docs: spec and plan for SYS-1 multi-line messages under newline framing" -m "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
+  git add docs/superpowers/specs/2026-11-11-multiline-messages-newline-framing.md docs/superpowers/plans/2026-11-11-multiline-messages-newline-framing.md
+  git commit -m "docs: spec and plan for multi-line messages under newline framing" -m "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
   ```
 
 ---
@@ -92,7 +92,7 @@ T4 C5 ISSUES.md: SYS-1 fixed                            (needs the C2/C3 hashes)
           String::from_utf8(frame_batch(&[e], format, framing)).unwrap()
       }
 
-      // --- SYS-1: newline framing must keep one event in one frame ---
+      // --- Newline framing must keep one event in one frame ---
 
       #[test]
       fn newline_framing_keeps_multiline_event_in_one_frame() {
@@ -171,7 +171,7 @@ T4 C5 ISSUES.md: SYS-1 fixed                            (needs the C2/C3 hashes)
   ```rust
   /// Newline framing (RFC 6587 §3.4.2) ends a frame at LF, so it cannot carry a
   /// line break inside an event: a multi-line message (a Windows event, or an SD
-  /// value with CR/LF) would arrive as several header-less frames (SYS-1). Write
+  /// value with CR/LF) would arrive as several header-less frames. Write
   /// each `\r\n`, lone `\r` and lone `\n` as one space instead. Lines without
   /// CR/LF (and every `json` line, where serde already escapes them) are
   /// returned unchanged, without allocating.
@@ -198,7 +198,7 @@ T4 C5 ISSUES.md: SYS-1 fixed                            (needs the C2/C3 hashes)
   ```
 
   Run `cargo test --lib outputs::stdout::tests`. Expected: **5 passed**.
-- [ ] **Step 3: cross-check (optional).** If `/tmp/sys1/p1-outputs.diff` exists, `git diff -- src/outputs/stdout.rs | diff - /tmp/sys1/p1-outputs.diff` should differ only in the `index` line.
+- [ ] **Step 3: cross-check (optional).** If `/tmp/multiline/p1-outputs.diff` exists, `git diff -- src/outputs/stdout.rs | diff - /tmp/multiline/p1-outputs.diff` should differ only in the `index` line.
 - [ ] **Step 4: gate.** The expected lib count is **195**.
 - [ ] **Step 5: commit.**
 
@@ -218,8 +218,6 @@ T4 C5 ISSUES.md: SYS-1 fixed                            (needs the C2/C3 hashes)
   frame_batch). Lines without CR/LF, json output, octet_counting and UDP
   are byte-identical. A space keeps common field extraction such as
   "Account Name:\s+(\S+)" working, unlike #012-style escaping.
-
-  Part of SYS-1.
 
   Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
   EOF
@@ -256,7 +254,7 @@ T4 C5 ISSUES.md: SYS-1 fixed                            (needs the C2/C3 hashes)
           (addr, rx, cancel)
       }
 
-      /// SYS-1: RFC 5426 says one syslog message per datagram, so a multi-line
+      /// RFC 5426 says one syslog message per datagram, so a multi-line
       /// message (a Windows event) must arrive as one event, not one per line.
       #[tokio::test]
       async fn udp_datagram_is_one_event() {
@@ -329,7 +327,7 @@ T4 C5 ISSUES.md: SYS-1 fixed                            (needs the C2/C3 hashes)
   ```rust
                               // RFC 5426 §3.1: one syslog message per datagram.
                               // Do not split on LF: a multi-line message (a
-                              // Windows event) is still one event (SYS-1).
+                              // Windows event) is still one event.
                               let line = text.trim();
                               if line.is_empty() { continue; }
                               let ev = self.make_event(line, &peer);
@@ -340,7 +338,7 @@ T4 C5 ISSUES.md: SYS-1 fixed                            (needs the C2/C3 hashes)
 
   This code is inside `tokio::select!`, so rustfmt does not reformat it. Keep the indentation shown. The `continue` now applies to the outer receive loop, the same as the allow-list `continue` a few lines above.
   Run `cargo test --lib inputs::syslog::tests::udp_`. Expected: **4 passed**.
-- [ ] **Step 3: cross-check (optional)** against `/tmp/sys1/p2-inputs.diff`, as in T1 step 3.
+- [ ] **Step 3: cross-check (optional)** against `/tmp/multiline/p2-inputs.diff`, as in T1 step 3.
 - [ ] **Step 4: gate.** The expected lib count is **197**.
 - [ ] **Step 5: commit.**
 
@@ -358,8 +356,6 @@ T4 C5 ISSUES.md: SYS-1 fixed                            (needs the C2/C3 hashes)
   the message. Single-line datagrams, with or without a trailing newline,
   behave as before.
 
-  Part of SYS-1.
-
   Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
   EOF
   ```
@@ -370,19 +366,20 @@ T4 C5 ISSUES.md: SYS-1 fixed                            (needs the C2/C3 hashes)
 
 ### Task 3: end-to-end check, then C4 docs
 
-- [ ] **Step 1: harness (R-2, no commit).** Build and run 3 rounds into a fresh directory. Running the script directly is fine. Do **not** `import` it: it runs `main()` on import.
+- [ ] **Step 1: harness (R-2, no commit).** Build and run 3 rounds into a fresh directory. Running the script directly is fine. Do **not** `import` it: it runs `main()` on import. Set `CASE` to the harness's key for its multi-line case.
 
   ```bash
   cargo build
-  R=$(mktemp -d /tmp/sys1-final.XXXX)
+  R=$(mktemp -d /tmp/multiline-final.XXXX)
   (cd /tmp/softnix-smoke.LTIcHO/harness && python3 -I issues_repro.py "$OLDPWD/target/debug/softnix-log-agent" "$R" 3 >/dev/null 2>&1)
-  python3 -I - "$R" <<'EOF'
+  CASE='<multi-line case key>'
+  python3 -I - "$R" "$CASE" <<'EOF'
   import json, re, sys
-  R = sys.argv[1]
-  res = json.load(open(f'{R}/results.json'))['runs']['SYS-1']
+  R, C = sys.argv[1], sys.argv[2]
+  res = json.load(open(f'{R}/results.json'))['runs'][C]
   B = lambda m: re.sub(r'\r\n|\r|\n', ' ', m)
   for i, r in enumerate(res, 1):
-      d = f'{R}/SYS-1/run-{i}'
+      d = f'{R}/{C}/run-{i}'
       sent = [json.loads(l) for l in open(f'{d}/in/win.jsonl')]
       bev = [json.loads(l) for l in open(f'{d}/b.out') if l.startswith('{')]
       ml = [s for s in sent if '\n' in s['message']]
@@ -408,8 +405,8 @@ T4 C5 ISSUES.md: SYS-1 fixed                            (needs the C2/C3 hashes)
   > TCP/TLS syslog input uses newline framing only, so a message that contains
   > a line break arrives as one event per line. Send multi-line messages to it
   > as single lines (the agent's own syslog output does this; see `framing`
-  > below) or over UDP. Octet-counting on this input is tracked as SYS-4 in
-  > `ISSUES.md`. The UDP input treats each datagram as one event (RFC 5426),
+  > below) or over UDP. Octet-counting on this input is a known open
+  > issue. The UDP input treats each datagram as one event (RFC 5426),
   > line breaks included.
   ```
 
@@ -431,7 +428,7 @@ T4 C5 ISSUES.md: SYS-1 fixed                            (needs the C2/C3 hashes)
   > syslog input แบบ TCP/TLS ใช้ newline framing เท่านั้น ข้อความที่มีการขึ้นบรรทัด
   > จึงถูกแยกเป็นหนึ่ง event ต่อบรรทัด ให้ส่งข้อความหลายบรรทัดมาเป็นบรรทัดเดียว
   > (syslog output ของ agent ทำให้อยู่แล้ว ดู `framing` ด้านล่าง) หรือส่งทาง UDP
-  > การรองรับ octet-counting ที่ input นี้ติดตามไว้เป็น SYS-4 ใน `ISSUES.md`
+  > การรองรับ octet-counting ที่ input นี้ยังเป็นปัญหาที่รอแก้ไข
   > ส่วน syslog input แบบ UDP ถือว่าหนึ่ง datagram คือหนึ่ง event (RFC 5426)
   > รวมการขึ้นบรรทัดในข้อความด้วย
   ```
@@ -446,35 +443,22 @@ T4 C5 ISSUES.md: SYS-1 fixed                            (needs the C2/C3 hashes)
 
   ```bash
   git add docs/CONFIGURATION.md docs/CONFIGURATION.th.md
-  git commit -m "docs(config): document line-break handling under newline framing" -m "Part of SYS-1." -m "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
+  git commit -m "docs(config): document line-break handling under newline framing" -m "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
   ```
 
 ---
 
-### Task 4: C5, mark SYS-1 fixed in `ISSUES.md`
+### Task 4: record the fix in the issue tracker
 
-- [ ] **Step 1:** Under the SYS-1 heading add:
-  `**Status: fixed** in \`<C2>\` (sender) and \`<C3>\` (UDP receiver), branch \`develop_fix_bug_known-issues\`, not yet merged. Agent-to-agent TCP with \`octet_counting\` still needs SYS-4.`
-- [ ] **Step 2:** Replace the heading line `**Fix options (decision needed, so write a spec first).**` with `**Fix options** (decided 2026-11-11: option B, a space, as described below).`. Keep the bullet list as the record of what was considered. After the list, add:
-
-  > **Fix.** With `framing: newline`, each line break inside an event is written as one space (`frame_batch`, which covers TCP, TLS and stdout). A space keeps field extraction such as `Account Name:\s+(\S+)` correct, while rsyslog-style `#012` breaks it. The agent's UDP input treats one datagram as one event. `octet_counting` and `format: json` carry multi-line messages unchanged. Spec: `docs/superpowers/specs/2026-11-11-sys1-multiline-messages-newline-framing.md`.
-
-- [ ] **Step 3:** In the Fix plan's P3 SYS-1 row, append " Fixed in `<C2>`/`<C3>` (option B)." Under **Owner decisions needed**, change the SYS-1 bullet to `- **SYS-1:** ~~how to handle CR/LF in MSG~~ decided 2026-11-11: replace each line break with a space (option B).`
-- [ ] **Step 4:** `git diff ISSUES.md` touches only the SYS-1 entry, its P3 row and its owner-decision bullet. Then:
-
-  ```bash
-  git add ISSUES.md
-  git commit -m "docs: mark SYS-1 fixed" -m "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
-  ```
-
-- [ ] **Step 5: final check.** `git status --short` shows only `?? report.html`. `git diff 4d9f58b --stat` lists the SYS-1 spec and plan, `src/outputs/stdout.rs`, `src/inputs/syslog.rs`, both CONFIGURATION files and `ISSUES.md`, and nothing else.
+- [ ] **Step 1:** Record the fix in the issue tracker: fixed in `<C2>` (sender) and `<C3>` (UDP receiver) with option B, a space per line break, and a link to the spec. Agent-to-agent TCP with `octet_counting` still needs the octet-counting input fix (`2026-11-11-tcp-input-octet-counting.md`).
+- [ ] **Step 2: final check.** `git status --short` shows only `?? report.html`. `git diff 4d9f58b --stat` lists the spec and plan, `src/outputs/stdout.rs`, `src/inputs/syslog.rs` and both CONFIGURATION files, and nothing else.
 
 ---
 
 ### Owner follow-up (not part of these commits)
 
 - **Release note** (the repo has no CHANGELOG, so this goes in the GitHub release text): "Multi-line events (e.g. Windows 4624/4625/4688, 7045) sent with `framing: newline` (the default) now stay one event: line breaks inside the event are written as spaces. Use `framing: octet_counting` or `format: json` to keep them. The UDP syslog input now treats each datagram as one event (RFC 5426)."
-- **Push / PR / CI**: blocked on write access (see the SYS-7 plan, T4).
+- **Push / PR / CI**: blocked on write access (see the `AtomicU64::fetch_update` deprecation plan, `2026-11-11-atomic-fetch-update-deprecation.md`, T4).
 
 ## Coverage check against the spec
 

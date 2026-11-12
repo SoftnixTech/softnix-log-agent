@@ -1,14 +1,13 @@
-# SYS-7: `AtomicU64::fetch_update` deprecation breaks CI on Rust ≥ 1.99 — design spec
+# `AtomicU64::fetch_update` deprecation breaks CI on Rust ≥ 1.99 — design spec
 
 Status: **draft — waiting for owner review** (see [Open questions](#open-questions)).
-Issue: SYS-7 in `ISSUES.md` (priority P1, PR-A in the fix plan).
 Implementation plan:
-`docs/superpowers/plans/2026-11-11-sys7-atomic-fetch-update-deprecation.md`.
+`docs/superpowers/plans/2026-11-11-atomic-fetch-update-deprecation.md`.
 It assumes the proposed answer to every open question.
 
 Reviewed 2026-11-11: every claim was re-checked against commit `f910a8f`.
 Changes made: a must-use check for `update`, the 1.98 baseline, the
-`develop` base branch, the stale `ISSUES.md` Fix text, and a stronger
+`develop` base branch, the stale fix text in the bug report, and a stronger
 saturation test.
 
 ## Problem
@@ -106,8 +105,8 @@ let _ = metrics
     });
 ```
 
-This renames the method and nothing else. It is the fix `ISSUES.md`
-proposes. It has the smallest diff, but keeps the `Option` and the discarded
+This renames the method and nothing else. It is the fix the original bug
+report proposed. It has the smallest diff, but keeps the `Option` and the discarded
 `Result` that the code does not need.
 
 Both options are verified on 1.98.1 and 1.99.1. This spec recommends A.
@@ -158,8 +157,8 @@ rename does not change behaviour.
 One commit, for example
 `fix(engine): replace deprecated AtomicU64::fetch_update`, containing the
 code change, the comment update and the new test. A follow-up commit marks
-SYS-7 as fixed in `ISSUES.md`, names the fixing commit, and, if Option A is
-chosen, corrects the entry's **Fix** text. That text currently says
+the issue as fixed in the issue tracker, names the fixing commit, and, if
+Option A is chosen, corrects the proposed fix text in the bug report. That text currently says
 "Rename the call to `try_update`", which would no longer match the code. The
 status update goes in a separate commit because it has to quote the hash of
 the first one.
@@ -174,7 +173,7 @@ Recorded here so they are not lost. None of them blocks this fix.
    stable, so nothing checks `rust-version = "1.98"`. V4 checks it by hand
    for this change only. A `msrv` job (`cargo +1.98 check --all-targets`)
    would catch an API that is too new before it merges. Suggested as a new
-   issue (SYS-10).
+   issue (now `docs/superpowers/specs/2026-11-11-ci-msrv-job.md`).
 2. **Floating stable plus `-D warnings`.** Any future stable release can
    deprecate something else and break CI in the same way, with no change to
    this repo. The options are to pin CI to a fixed toolchain and bump it on
@@ -188,17 +187,16 @@ Recorded here so they are not lost. None of them blocks this fix.
    Proposed answer: **A**. It is equally verified and states the intent more
    clearly.
 2. **Where does the commit go?**
-   - (a) A standalone branch (for example `fix/sys-7-atomic-update`) as
-     PR-A. This keeps the provider-name PR focused. The provider-name branch
-     then rebases once PR-A merges. Base: `main` and `develop` both point at
+   - (a) A standalone branch (for example `develop_fix_bug_known-issues`)
+     with its own PR. This keeps the provider-name PR focused. The
+     provider-name branch then rebases once that PR merges. Base: `main` and `develop` both point at
      `d4df550` today, and CI runs on pushes to both, so either base gives the
      same tree. The owner picks the PR target.
    - (b) An extra commit on `develop_fix_bug_windows-provider-name`. Fewer
      PRs, but it mixes an unrelated fix into that PR.
 
    Proposed answer: **(a)**. Either way, nothing can be pushed until the
-   account has write access to `SoftnixTech/softnix-log-agent` (see the
-   blocker in `ISSUES.md`).
-3. **Should out-of-scope items 1 and 2 be added to `ISSUES.md` now?**
-   Proposed answer: add item 1 as SYS-10. Add item 2 only if the owner wants
-   to track it.
+   account has write access to `SoftnixTech/softnix-log-agent`.
+3. **Should out-of-scope items 1 and 2 be recorded as issues now?**
+   Proposed answer: record item 1 as a follow-up issue (the missing CI MSRV
+   check). Record item 2 only if the owner wants to track it.
