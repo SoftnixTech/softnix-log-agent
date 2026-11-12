@@ -489,14 +489,19 @@ function setDirty(v){cfgDirty=v;const d=$("#cfgdirty");if(d)d.hidden=!v}
 function renderCfgHighlight(){
   const code=$("#cfghlcode"),cfg=$("#cfg");
   if(!code||!cfg)return;
-  code.innerHTML=highlightYaml(cfg.value);
+  // A <pre> makes no line box for a final "\n", but the textarea shows the
+  // empty line after it. Add one so both have the same number of lines.
+  code.innerHTML=highlightYaml(cfg.value)+(cfg.value.endsWith("\n")?"\n":"");
   syncCfgHlScroll();
 }
 function syncCfgHlScroll(){
-  const hl=$("#cfghl"),cfg=$("#cfg");
-  if(!hl||!cfg)return;
-  hl.scrollTop=cfg.scrollTop;
-  hl.scrollLeft=cfg.scrollLeft;
+  const hl=$("#cfghl"),code=$("#cfghlcode"),cfg=$("#cfg");
+  if(!hl||!code||!cfg)return;
+  // Shift the overlay, don't scroll it: its scroll range is clamped, and it
+  // is smaller than the textarea's whenever the textarea's scrollbars take
+  // space (Windows). Keep the <pre> itself at 0 in case anything scrolled it.
+  hl.scrollTop=0; hl.scrollLeft=0;
+  code.style.transform=`translate(${-cfg.scrollLeft}px,${-cfg.scrollTop}px)`;
 }
 // Small line-oriented YAML tokenizer for the config editor's highlight overlay.
 // Not a real parser: just enough to color comments, keys, quoted strings,
