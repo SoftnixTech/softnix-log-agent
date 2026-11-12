@@ -1,4 +1,4 @@
-# SYS-10 CI MSRV Job Implementation Plan
+# CI MSRV Job Implementation Plan
 
 > **For agentic workers:** Steps use checkbox (`- [ ]`) syntax for tracking. Execute the tasks in order. T3 needs push access and cannot be done before it exists.
 
@@ -8,22 +8,22 @@
 
 **Tech Stack:** GitHub Actions, the action SHAs already pinned in `ci.yml`.
 
-**Spec:** `docs/superpowers/specs/2026-11-11-sys10-ci-msrv-job.md`
+**Spec:** `docs/superpowers/specs/2026-11-11-ci-msrv-job.md`
 
 ## Global Constraints
 
-- Branch `develop_fix_bug_known-issues`, order #9 in `ISSUES.md`'s Fix plan.
-- **Changes only in** `.github/workflows/ci.yml` (T1) and `ISSUES.md` (T2, T3). No Rust source changes.
+- Branch `develop_fix_bug_known-issues`.
+- **Changes only in** `.github/workflows/ci.yml` (T1) and the issue tracker (T2, T3). No Rust source changes.
 - Stage files **by name**, never `git add -A`. Every commit message ends with `Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>`.
 - **What can be verified locally:** the job's two commands (T1 step 1) and the YAML's syntax. **What cannot:** that the job runs, installs 1.98 and can turn red. That needs a real CI run (T3), and CI only triggers on a pull request or a push to `main`/`develop`.
 
 ## Rulings
 
-**R-0: Linux only.** The spec's one open question (Linux only, or also Windows) takes its proposed answer, which `ISSUES.md` records as "used unless vetoed". If the owner wants Windows too, the job gets `strategy.matrix.os: [ubuntu-latest, windows-latest]` and `runs-on: ${{ matrix.os }}`, and the `sed` step needs `shell: bash`.
+**R-0: Linux only.** The spec's one open question (Linux only, or also Windows) takes its proposed answer, which is used unless the owner vetoes it. If the owner wants Windows too, the job gets `strategy.matrix.os: [ubuntu-latest, windows-latest]` and `runs-on: ${{ matrix.os }}`, and the `sed` step needs `shell: bash`.
 
 **R-1: No `--locked`.** `Cargo.lock` is committed and the other jobs do not pass `--locked`, so the new job stays consistent with them.
 
-**R-2: The issue is marked "fixed, pending first CI run" in T2 and confirmed in T3.** The job cannot be seen running before push access exists, and the entry must not claim more than was verified.
+**R-2: The issue is marked "fixed, pending first CI run" in T2 and confirmed in T3.** The job cannot be seen running before push access exists, and the tracker must not claim more than was verified.
 
 ---
 
@@ -32,8 +32,8 @@
 ```text
 T0 C1 docs: spec + plan
 T1 C2 ci: add the msrv job              (local checks only)
-T2 C3 ISSUES.md: fixed, pending CI run  (needs the C2 hash)
-T3 (after push access) first CI run + proof the job can fail, then C4 ISSUES.md: confirmed
+T2 C3 tracker: fixed, pending CI run    (needs the C2 hash)
+T3 (after push access) first CI run + proof the job can fail, then C4 tracker: confirmed
 ```
 
 ---
@@ -43,8 +43,8 @@ T3 (after push access) first CI run + proof the job can fail, then C4 ISSUES.md:
 - [ ] **Step 1:**
 
   ```bash
-  git add docs/superpowers/specs/2026-11-11-sys10-ci-msrv-job.md docs/superpowers/plans/2026-11-11-sys10-ci-msrv-job.md
-  git commit -m "docs: spec and plan for SYS-10 CI MSRV job" -m "Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>"
+  git add docs/superpowers/specs/2026-11-11-ci-msrv-job.md docs/superpowers/plans/2026-11-11-ci-msrv-job.md
+  git commit -m "docs: spec and plan for the CI MSRV job" -m "Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>"
   ```
 
 ---
@@ -98,20 +98,15 @@ T3 (after push access) first CI run + proof the job can fail, then C4 ISSUES.md:
 
   ```bash
   git add .github/workflows/ci.yml
-  git commit -m "ci: add an msrv job that checks the declared rust-version" -m "Cargo.toml declares rust-version = 1.98, but every CI job installed the latest stable, so nothing checked that the crate still builds on 1.98 (SYS-10). The new job reads the version from Cargo.toml and runs cargo check --all-targets on it." -m "Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>"
+  git commit -m "ci: add an msrv job that checks the declared rust-version" -m "Cargo.toml declares rust-version = 1.98, but every CI job installed the latest stable, so nothing checked that the crate still builds on 1.98. The new job reads the version from Cargo.toml and runs cargo check --all-targets on it." -m "Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>"
   ```
 
 ---
 
-### Task 2: C3, `ISSUES.md`
+### Task 2: C3, record the fix in the issue tracker
 
-- [ ] **Step 1:** In the summary table, set SYS-10's status to "**fixed** (`<C2>`), pending first CI run". Replace the entry's status line with: **Status: fixed** in `<C2>`, **not yet seen running**: the first CI run needs push access (see the Fix plan's blocker). Move the row from **Remaining** to **Done** in the Fix plan, with the same caveat.
-- [ ] **Step 2:**
-
-  ```bash
-  git add ISSUES.md
-  git commit -m "docs: mark SYS-10 fixed, pending its first CI run" -m "Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>"
-  ```
+- [ ] **Step 1:** Record the issue as fixed in `<C2>`, but **not yet seen running**: the first CI run needs push access.
+- [ ] **Step 2:** Commit the tracker change as `docs: mark the CI MSRV job fixed, pending its first CI run`.
 
 ---
 
@@ -119,12 +114,7 @@ T3 (after push access) first CI run + proof the job can fail, then C4 ISSUES.md:
 
 - [ ] **Step 1: the first CI run.** On the pull request's first run, the `msrv` job is green, and its toolchain step's log shows `1.98.x` being installed (not the current stable).
 - [ ] **Step 2: proof that the job can fail.** On a throw-away branch with its own pull request, add to any `src/` file a call to an item stabilised after 1.98 (pick one from the 1.99 release notes). `msrv` must turn **red** while `test-linux` stays **green**. Close the pull request and delete the branch. Nothing from it is merged.
-- [ ] **Step 3: C4.** In `ISSUES.md`, remove the "pending first CI run" caveats and add the date and the run it was confirmed on.
-
-  ```bash
-  git add ISSUES.md
-  git commit -m "docs: confirm SYS-10 on CI" -m "Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>"
-  ```
+- [ ] **Step 3: C4.** Record in the issue tracker that the job is confirmed on CI, with the date and the run. Commit it as `docs: confirm the CI MSRV job on CI`.
 
 ---
 
@@ -141,5 +131,5 @@ T3 (after push access) first CI run + proof the job can fail, then C4 ISSUES.md:
 
 ## Risks
 
-- **T3 is blocked** until the account has push access, or a fork workflow is agreed. Until then the job is unverified on CI, and `ISSUES.md` says so (R-2).
+- **T3 is blocked** until the account has push access, or a fork workflow is agreed. Until then the job is unverified on CI, and the issue tracker says so (R-2).
 - **A dependency whose own MSRV rises above 1.98** turns the job red on an unrelated pull request. That is the job doing its work: the owner then bumps `rust-version` or pins the dependency.

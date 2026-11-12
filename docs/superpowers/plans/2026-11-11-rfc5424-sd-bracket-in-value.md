@@ -1,4 +1,4 @@
-# SYS-2 RFC 5424 STRUCTURED-DATA End Detection Implementation Plan
+# RFC 5424 STRUCTURED-DATA End Detection Implementation Plan
 
 > **For agentic workers:** Steps use checkbox (`- [ ]`) syntax for tracking. Execute the tasks in order. The commit-producing task shows a red run before its fix, and ends with the full gate.
 
@@ -8,13 +8,13 @@
 
 **Tech Stack:** Rust 2021, no new dependency.
 
-**Spec:** `docs/superpowers/specs/2026-11-11-sys2-rfc5424-sd-bracket-in-value.md`
+**Spec:** `docs/superpowers/specs/2026-11-11-rfc5424-sd-bracket-in-value.md`
 
 ## Global Constraints
 
-- Branch `develop_fix_bug_known-issues`, after the SYS-4 plan (order #6 in `ISSUES.md`'s Fix plan). `rust-version = "1.98"`. If `cargo` is not on `PATH`, use `export PATH="$HOME/.cargo/bin:$PATH"`.
-- **Code changes only in** `src/pipeline/syslog.rs`. Docs: `ISSUES.md` (T2). No config, dependency or wire change.
-- **Lib test count:** **+10** over the count before T1 (225 if SYS-4 is done first, which leaves 215).
+- Branch `develop_fix_bug_known-issues`, after the TCP/TLS input octet-counting plan (`2026-11-11-tcp-input-octet-counting.md`). `rust-version = "1.98"`. If `cargo` is not on `PATH`, use `export PATH="$HOME/.cargo/bin:$PATH"`.
+- **Code changes only in** `src/pipeline/syslog.rs`. Docs: the issue tracker (T2). No config, dependency or wire change.
+- **Lib test count:** **+10** over the count before T1 (225 if the octet-counting fix is done first, which leaves 215).
 - **Gate** (after T1):
 
   ```bash
@@ -44,7 +44,7 @@
 T0 C1 docs: spec + plan
 T1 C2 fix(pipeline): SD end by the grammar   (red 4 → green, +10 tests)
    harness re-run (no commit)
-T2 C3 ISSUES.md: SYS-2 fixed                 (needs the C2 hash)
+T2 C3 issue tracker: record the fix          (needs the C2 hash)
 ```
 
 ---
@@ -54,8 +54,8 @@ T2 C3 ISSUES.md: SYS-2 fixed                 (needs the C2 hash)
 - [ ] **Step 1:**
 
   ```bash
-  git add docs/superpowers/specs/2026-11-11-sys2-rfc5424-sd-bracket-in-value.md docs/superpowers/plans/2026-11-11-sys2-rfc5424-sd-bracket-in-value.md
-  git commit -m "docs: spec and plan for SYS-2 RFC 5424 structured-data end detection" -m "Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>"
+  git add docs/superpowers/specs/2026-11-11-rfc5424-sd-bracket-in-value.md docs/superpowers/plans/2026-11-11-rfc5424-sd-bracket-in-value.md
+  git commit -m "docs: spec and plan for RFC 5424 structured-data end detection" -m "Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>"
   ```
 
 ---
@@ -87,7 +87,7 @@ T2 C3 ISSUES.md: SYS-2 fixed                 (needs the C2 hash)
         assert_eq!(got_message, message, "message of {tail:?}");
     }
 
-    // SYS-2: `[` inside a quoted PARAM-VALUE is valid (RFC 5424 §6.3.3) and
+    // `[` inside a quoted PARAM-VALUE is valid (RFC 5424 §6.3.3) and
     // must not be counted as an SD-ELEMENT bracket.
     #[test]
     fn sd_value_with_open_bracket_keeps_message() {
@@ -148,7 +148,7 @@ T2 C3 ISSUES.md: SYS-2 fixed                 (needs the C2 hash)
         );
     }
 
-    /// Malformed SD (an unterminated quote): parsed as before SYS-2.
+    /// Malformed SD (an unterminated quote): parsed with the original scan.
     #[test]
     fn sd_unterminated_quote_falls_back_to_old_scan() {
         assert_sd(
@@ -233,7 +233,7 @@ fn sd_end_by_grammar(tail: &str) -> Option<usize> {
     None
 }
 
-/// The scan used before SYS-2: every `[` and `]` counts, quoted or not. Kept
+/// The original scan: every `[` and `]` counts, quoted or not. Kept
 /// for malformed SD only, so such a line parses exactly as it always has.
 /// Returns `tail.len()` when it finds no end either.
 fn sd_end_by_brackets(tail: &str) -> usize {
@@ -261,12 +261,13 @@ fn sd_end_by_brackets(tail: &str) -> usize {
   `cargo test --lib pipeline::syslog` is all green, including the existing `rfc5424_parses`.
 
 - [ ] **Step 3: gate.** Lib count is **+10**.
-- [ ] **Step 4: harness (no commit).** If `/tmp/softnix-smoke.LTIcHO/harness/issues_repro.py` still exists:
+- [ ] **Step 4: harness (no commit).** If `/tmp/softnix-smoke.LTIcHO/harness/issues_repro.py` still exists, run this. Set `CASE` to the harness's key for its STRUCTURED-DATA case.
 
   ```bash
-  cargo build && mkdir -p /tmp/sys2-runs
-  python3 /tmp/softnix-smoke.LTIcHO/harness/issues_repro.py "$PWD/target/debug/softnix-log-agent" /tmp/sys2-runs 3
-  python3 -c 'import json; [print(r) for r in json.load(open("/tmp/sys2-runs/results.json"))["runs"]["SYS-2"]]'
+  cargo build && mkdir -p /tmp/sd-bracket-runs
+  python3 /tmp/softnix-smoke.LTIcHO/harness/issues_repro.py "$PWD/target/debug/softnix-log-agent" /tmp/sd-bracket-runs 3
+  CASE='<STRUCTURED-DATA case key>'
+  python3 -c 'import json, sys; [print(r) for r in json.load(open("/tmp/sd-bracket-runs/results.json"))["runs"][sys.argv[1]]]' "$CASE"
   ```
 
   Expected: all 6 cases correct in each of the 3 runs (it was 2/6). If the harness is gone, skip this step and say so in the commit body.
@@ -275,24 +276,16 @@ fn sd_end_by_brackets(tail: &str) -> usize {
 
   ```bash
   git add src/pipeline/syslog.rs
-  git commit -m "fix(pipeline): end RFC 5424 STRUCTURED-DATA by the grammar, not raw brackets" -m "parse_rfc5424 counted every '[' and ']', including those inside a quoted PARAM-VALUE. A valid value such as rule=\"Contoso [TCP 443\\]\" raised the depth, the scan ran to the end of the line, and message became empty (SYS-2).
+  git commit -m "fix(pipeline): end RFC 5424 STRUCTURED-DATA by the grammar, not raw brackets" -m "parse_rfc5424 counted every '[' and ']', including those inside a quoted PARAM-VALUE. A valid value such as rule=\"Contoso [TCP 443\\]\" raised the depth, the scan ran to the end of the line, and message became empty.
 
 Brackets now count only outside quotes, and '\\' escapes only inside them. When that scan finds no end (malformed SD), the previous scan decides, so such lines parse as before." -m "Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>"
   ```
 
 ---
 
-### Task 2: C3, mark SYS-2 fixed in `ISSUES.md`
+### Task 2: C3, record the fix in the issue tracker
 
-- [ ] **Step 1:** In the summary table, set SYS-2's status to **fixed** with the `<C2>` hash.
-- [ ] **Step 2:** Replace the SYS-2 entry's status line with: **Status: fixed** in `<C2>` (branch `develop_fix_bug_known-issues`, not yet merged). In its **Fix.** paragraph, change "If the scan ends inside an unterminated quote, fall back to today's scan" to "If the scan finds no end of the SD, fall back to the previous scan".
-- [ ] **Step 3:** In the Fix plan, move the SYS-2 row from **Remaining** to **Done** (issue, severity Medium, the hash, the spec file name).
-- [ ] **Step 4:**
-
-  ```bash
-  git add ISSUES.md
-  git commit -m "docs: mark SYS-2 fixed" -m "Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>"
-  ```
+- [ ] **Step 1:** Record the fix in the issue tracker, with the `<C2>` hash and the branch `develop_fix_bug_known-issues` (not yet merged). Describe the fallback as R-1 does: the previous scan decides whenever the grammar scan finds no end of the SD.
 
 ---
 

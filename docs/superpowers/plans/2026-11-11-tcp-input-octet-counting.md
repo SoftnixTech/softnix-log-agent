@@ -1,4 +1,4 @@
-# SYS-4 Octet-Counting on the Syslog TCP/TLS Input Implementation Plan
+# Octet-Counting on the Syslog TCP/TLS Input Implementation Plan
 
 > **For agentic workers:** Steps use checkbox (`- [ ]`) syntax for tracking. Execute the tasks in order. Every commit-producing task shows a red run before its fix, and ends with the full gate.
 
@@ -8,12 +8,12 @@
 
 **Tech Stack:** Rust 2021, `tokio_util::codec::Decoder`, `bytes::{Buf, BytesMut}` (both already dependencies), existing tokio test scaffolding.
 
-**Spec:** `docs/superpowers/specs/2026-11-11-sys4-tcp-input-octet-counting.md`
+**Spec:** `docs/superpowers/specs/2026-11-11-tcp-input-octet-counting.md`
 
 ## Global Constraints
 
 - Branch `develop_fix_bug_known-issues`. Starting HEAD is `7abecf9` plus the docs commits of T0. `rust-version = "1.98"`. The local toolchains are stable 1.99.x (with clippy) and 1.98 (no clippy, so use `check`). If `cargo` is not on `PATH`, use `export PATH="$HOME/.cargo/bin:$PATH"`.
-- **Code changes only in** `src/config/schema.rs`, `src/inputs/syslog.rs` (T1, T2) and `src/config/mod.rs` (T2, tests only). Docs: `docs/CONFIGURATION.md`, `docs/CONFIGURATION.th.md` (T3) and `ISSUES.md` (T4). No new dependency.
+- **Code changes only in** `src/config/schema.rs`, `src/inputs/syslog.rs` (T1, T2) and `src/config/mod.rs` (T2, tests only). Docs: `docs/CONFIGURATION.md`, `docs/CONFIGURATION.th.md` (T3). T4 records the fix in the issue tracker. No new dependency.
 - **Lib test counts on macOS** (bin 3 and e2e 6 never change): 197 at the start, **213** after T1, **215** after T2.
 - **Gate** (after T1 and T2; everything must pass):
 
@@ -26,14 +26,14 @@
 
   Do **not** set `CARGO_TARGET_DIR`: the `update::apply` preflight tests look for the binary under `<repo>/target/debug`.
 - Stage files **by name**, never `git add -A` (`report.html` stays untracked). Every commit message ends with `Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>`.
-- **Prototype status** (2026-11-11, throw-away worktree `/tmp/sys4-proto` at `7abecf9`):
-  - **T1 is prototyped.** Its snippets below are the prototype's code after `cargo fmt`. It passed: red 1 (the integration test, see T1 step 1), then 29/29 `inputs::syslog` tests, and the full gate with lib **213**. Its patch is kept at `/tmp/sys4-p1.diff` as an optional cross-check.
+- **Prototype status** (2026-11-11, throw-away worktree `/tmp/octet-proto` at `7abecf9`):
+  - **T1 is prototyped.** Its snippets below are the prototype's code after `cargo fmt`. It passed: red 1 (the integration test, see T1 step 1), then 29/29 `inputs::syslog` tests, and the full gate with lib **213**. Its patch is kept at `/tmp/octet-p1.diff` as an optional cross-check.
   - **T2 is not prototyped.** Its snippets were written but never compiled or run. Treat the first gate of T2 as their verification, and expect small `cargo fmt` differences.
   - The module doc-comment edit in T1 step 2a is not in the prototype either. It is a comment only.
 
 ## Rulings
 
-**R-0: The owner's decisions.** The spec's three open questions take their proposed answers, which `ISSUES.md` records as "used unless vetoed": (1) `auto` detects digits + SP + `<`/`{`, (2) the `framing` option is added, (3) invalid UTF-8 is decoded lossily. If one changes:
+**R-0: The owner's decisions.** The spec's three open questions take their proposed answers, which were recorded as "used unless vetoed": (1) `auto` detects digits + SP + `<`/`{`, (2) the `framing` option is added, (3) invalid UTF-8 is decoded lossily. If one changes:
 
 | Decision changed | Tasks affected |
 | --- | --- |
@@ -52,31 +52,26 @@
 ## Dependency graph
 
 ```text
-T0 C0 docs: revised fix plan in ISSUES.md (already in the working tree)
+T0 C0 pending issue-tracker update (already in the working tree)
    C1 docs: spec + plan
 T1 C2 feat(inputs): decode octet-counted frames      (red 1 → green, lib 213)
 T2 C3 feat(config): framing option on syslog inputs  (red = does not compile → green, lib 215)
 T3 harness re-run (no commit), then C4 docs CONFIGURATION en/th
-T4 C5 ISSUES.md: SYS-4 fixed                         (needs the C2/C3 hashes)
+T4 record the fix in the issue tracker               (needs the C2/C3 hashes)
 ```
 
 ---
 
 ### Task 0: C0 and C1, pending docs
 
-- [ ] **Step 1:** `git status --short` shows ` M ISSUES.md`, the untracked specs and plans for SYS-2/3/4/5/10, and `?? report.html`. `git log --oneline -1` is `7abecf9`.
-- [ ] **Step 2:** The `ISSUES.md` change is the tracker update made before this plan: the revised order, specs and plans drafted, SYS-3 decided (option A) and SYS-6 closed as "won't fix". Commit it alone (SYS-6 has no spec or plan any more):
-
-  ```bash
-  git add ISSUES.md
-  git commit -m "docs: revise the fix plan, decide SYS-3 and close SYS-6" -m "Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>"
-  ```
+- [ ] **Step 1:** `git status --short` shows the pending issue-tracker update, the untracked specs and plans drafted the same day (`rfc5424-sd-bracket-in-value`, `rfc3164-long-tag`, `tcp-input-octet-counting`, `self-logs-to-stderr`, `ci-msrv-job`), and `?? report.html`. `git log --oneline -1` is `7abecf9`.
+- [ ] **Step 2:** Record the pending update in the issue tracker on its own: the revised fix order and the decisions taken before this plan.
 
 - [ ] **Step 3:**
 
   ```bash
-  git add docs/superpowers/specs/2026-11-11-sys4-tcp-input-octet-counting.md docs/superpowers/plans/2026-11-11-sys4-tcp-input-octet-counting.md
-  git commit -m "docs: spec and plan for SYS-4 octet-counting on the syslog TCP input" -m "Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>"
+  git add docs/superpowers/specs/2026-11-11-tcp-input-octet-counting.md docs/superpowers/plans/2026-11-11-tcp-input-octet-counting.md
+  git commit -m "docs: spec and plan for octet-counting on the syslog TCP input" -m "Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>"
   ```
 
   The other issues' specs and plans stay untracked. Each is committed by its own plan's T0.
@@ -90,7 +85,7 @@ T4 C5 ISSUES.md: SYS-4 fixed                         (needs the C2/C3 hashes)
 - [ ] **Step 1: the integration test first (red).** In `src/inputs/syslog.rs`'s `mod tests`, insert directly **before** `    #[test]\n    fn make_event_preserves_raw_message_when_enabled() {`:
 
 ```rust
-    /// SYS-4: octet-counted frames are delivered one event per frame while
+    /// Octet-counted frames are delivered one event per frame while
     /// the connection is still open, and a line break inside a frame stays.
     #[tokio::test]
     async fn tcp_receives_octet_counted_frames() {
@@ -529,13 +524,13 @@ impl Decoder for SyslogFrameCodec {
 ```
 
 - [ ] **Step 4:** `cargo test --lib inputs::syslog` gives **29 passed** (13 before, +1 integration, +15 codec).
-- [ ] **Step 5: cross-check (optional).** If `/tmp/sys4-p1.diff` exists, `git diff -- src/config/schema.rs src/inputs/syslog.rs | diff - /tmp/sys4-p1.diff` should differ only in the `index` lines and the module doc comment.
+- [ ] **Step 5: cross-check (optional).** If `/tmp/octet-p1.diff` exists, `git diff -- src/config/schema.rs src/inputs/syslog.rs | diff - /tmp/octet-p1.diff` should differ only in the `index` lines and the module doc comment.
 - [ ] **Step 6: gate.** The expected lib count is **213**.
 - [ ] **Step 7: commit.**
 
   ```bash
   git add src/config/schema.rs src/inputs/syslog.rs
-  git commit -m "feat(inputs): decode octet-counted syslog frames on TCP/TLS" -m "The TCP/TLS input only understood newline framing, so a sender using RFC 6587 octet-counting (the agent's own framing: octet_counting included) delivered nothing until it closed, and then one corrupt event (SYS-4).
+  git commit -m "feat(inputs): decode octet-counted syslog frames on TCP/TLS" -m "The TCP/TLS input only understood newline framing, so a sender using RFC 6587 octet-counting (the agent's own framing: octet_counting included) delivered nothing until it closed, and then one corrupt event.
 
 SyslogFrameCodec replaces LinesCodec. It detects each frame: MSG-LEN SP followed by '<' or '{' is an octet-counted frame, anything else is a newline-terminated line. Invalid UTF-8 is now decoded lossily, as on UDP, instead of closing the connection." -m "Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>"
   ```
@@ -549,7 +544,7 @@ SyslogFrameCodec replaces LinesCodec. It detects each frame: MSG-LEN SP followed
 - [ ] **Step 1: tests first (red).** In `src/inputs/syslog.rs`'s `mod tests`, in `test_cfg`, add `framing: InputFraming::Auto,` after `format: SyslogFormat::Auto,`. Then insert directly **before** `    fn codec(mode: InputFraming) -> SyslogFrameCodec {`:
 
 ```rust
-    /// SYS-4: `framing: octet_counting` on the input carries payloads that
+    /// `framing: octet_counting` on the input carries payloads that
     /// `auto` cannot detect, because they do not start with `<` or `{` (the
     /// agent's own `format: raw` output is one).
     #[tokio::test]
@@ -592,7 +587,7 @@ SyslogFrameCodec replaces LinesCodec. It detects each frame: MSG-LEN SP followed
 
 ```rust
 
-    /// SYS-4: `framing` on a syslog input defaults to `auto`, accepts the
+    /// `framing` on a syslog input defaults to `auto`, accepts the
     /// three documented values, and rejects anything else at load time.
     #[test]
     fn syslog_input_framing_option() {
@@ -643,13 +638,14 @@ SyslogFrameCodec replaces LinesCodec. It detects each frame: MSG-LEN SP followed
 
 ### Task 3: end-to-end check, then C4 docs
 
-- [ ] **Step 1: harness (R-3, no commit).** Run the script directly. Do **not** `import` it: it runs `main()` on import.
+- [ ] **Step 1: harness (R-3, no commit).** Run the script directly. Do **not** `import` it: it runs `main()` on import. Set `CASE` to the harness's key for its octet-counting case.
 
   ```bash
   cargo build
-  mkdir -p /tmp/sys4-runs
-  python3 /tmp/softnix-smoke.LTIcHO/harness/issues_repro.py "$PWD/target/debug/softnix-log-agent" /tmp/sys4-runs 3
-  python3 -c 'import json; [print(r) for r in json.load(open("/tmp/sys4-runs/results.json"))["runs"]["SYS-4"]]'
+  mkdir -p /tmp/octet-runs
+  python3 /tmp/softnix-smoke.LTIcHO/harness/issues_repro.py "$PWD/target/debug/softnix-log-agent" /tmp/octet-runs 3
+  CASE='<octet-counting case key>'
+  python3 -c 'import json, sys; [print(r) for r in json.load(open("/tmp/octet-runs/results.json"))["runs"][sys.argv[1]]]' "$CASE"
   ```
 
   Expected in each of the 3 runs: `siem_frames_decoded: 10`, `agent_events_while_sender_connected: 10` (was 0), `agent_events_after_sender_closed: 10` (was 1), `agent_first_event_message_len` well under 100 (was 830) and `raw_events: 10`. The script also runs the other issues' cases. Ignore them here.
@@ -707,27 +703,17 @@ SyslogFrameCodec replaces LinesCodec. It detects each frame: MSG-LEN SP followed
 
 ---
 
-### Task 4: C5, mark SYS-4 fixed in `ISSUES.md`
+### Task 4: record the fix in the issue tracker
 
-- [ ] **Step 1:** In the summary table, set SYS-4's status to `**fixed** (<C2>, <C3>)`, with the two hashes in backticks.
-- [ ] **Step 2:** Replace the SYS-4 entry's status line with: **Status: fixed** in `<C2>` (decoder) and `<C3>` (`framing` option), branch `develop_fix_bug_known-issues`, not yet merged. After the entry's **Fix.** paragraph add one sentence: "`auto` does not detect octet-counted `raw` text (no `<` or `{` after the length); such senders need `framing: octet_counting` on the input."
-- [ ] **Step 3:** In the SYS-1 entry's status line, replace "Agent-to-agent TCP with `octet_counting` still needs SYS-4." with "Agent-to-agent TCP with `octet_counting` works since SYS-4 (`<C2>`)."
-- [ ] **Step 4:** In the Fix plan, move the SYS-4 row from **Remaining** to **Done** as row 5 (issue, severity Medium, the two hashes, the spec file name). In **Owner decisions needed**, strike the SYS-4 part of the "Minor" bullet and add "used as proposed".
-- [ ] **Step 5:** `git diff ISSUES.md` touches only those places. Then:
-
-  ```bash
-  git add ISSUES.md
-  git commit -m "docs: mark SYS-4 fixed" -m "Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>"
-  ```
-
-- [ ] **Step 6: final check.** `git diff 7abecf9 --stat` lists, for this plan, the SYS-4 spec and plan, `src/config/schema.rs`, `src/config/mod.rs`, `src/inputs/syslog.rs`, both CONFIGURATION files and `ISSUES.md`. `git worktree list` may still show `/tmp/sys4-proto`. Removing it (`git worktree remove --force /tmp/sys4-proto`) is the owner's call.
+- [ ] **Step 1:** Record the fix in the issue tracker: fixed in `<C2>` (decoder) and `<C3>` (`framing` option), with a link to the spec. Note there that `auto` does not detect octet-counted `raw` text (such senders need `framing: octet_counting` on the input), and that agent-to-agent TCP with `octet_counting` now carries multi-line messages.
+- [ ] **Step 2: final check.** `git diff 7abecf9 --stat` lists, for this plan, the spec and plan, `src/config/schema.rs`, `src/config/mod.rs`, `src/inputs/syslog.rs` and both CONFIGURATION files. `git worktree list` may still show `/tmp/octet-proto`. Removing it (`git worktree remove --force /tmp/octet-proto`) is the owner's call.
 
 ---
 
 ### Owner follow-up (not part of these commits)
 
 - **Release note** (the repo has no CHANGELOG, so this goes in the GitHub release text): "The syslog TCP/TLS input now accepts RFC 6587 octet-counted frames as well as newline-terminated lines, detected per frame. New option `inputs.syslog[].framing` (`auto` | `newline` | `octet_counting`). Invalid UTF-8 on TCP/TLS is now replaced with U+FFFD instead of closing the connection."
-- **Push / PR / CI**: blocked on write access (see the SYS-7 plan, T4).
+- **Push / PR / CI**: blocked on write access (see the `AtomicU64::fetch_update` deprecation plan, `2026-11-11-atomic-fetch-update-deprecation.md`, T4).
 
 ## Coverage check against the spec
 

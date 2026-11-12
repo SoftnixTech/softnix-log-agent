@@ -1,14 +1,14 @@
-# SYS-9: Eventlog `EventData` values containing XML entities are truncated and split — design spec
+# Eventlog `EventData` values containing XML entities are truncated and split — design spec
 
 Status: **implemented for trial, not committed** (2026-11-11). The owner
 asked for the proposed answers to the open questions to be implemented
 first, so the fix can be tested. V1–V5 pass on macOS. V6 (Windows CI) is
 still pending.
-Issue: SYS-9 in `ISSUES.md` (High, P2).
 Implementation plan:
-`docs/superpowers/plans/2026-11-11-sys9-eventlog-xml-text-entities.md`.
-Related: SYS-8 (attribute values) has its own spec,
-`docs/superpowers/specs/2026-11-11-sys8-eventlog-xml-attribute-unescape.md`.
+`docs/superpowers/plans/2026-11-11-eventlog-xml-text-entities.md`.
+Related: attribute values that are not entity-unescaped (the attribute fix)
+have their own spec,
+`docs/superpowers/specs/2026-11-11-eventlog-xml-attribute-unescape.md`.
 It is a separate defect in a separate part of the same parser. It relies on
 Part 2 of this spec (the move to a cross-platform module) for its tests,
 but not on Part 1.
@@ -84,10 +84,12 @@ around it.
 
 ## Non-goals
 
-- Attribute values: SYS-8.
+- Attribute values: the attribute fix.
 - No change to `build_event`, `format_message`, the subscription and
   bookmark logic, or the `Event` shape.
-- No CR/LF handling for the wire: SYS-1.
+- No CR/LF handling for the wire: that belongs to the fix for multi-line
+  messages split by newline framing
+  (`2026-11-11-multiline-messages-newline-framing.md`).
 - No CDATA, `UserData` or DTD-defined entities (see
   [Out of scope](#out-of-scope)).
 
@@ -156,7 +158,7 @@ The **failing tests**: each one fails before Part 1.
 
 | Test | Input | Asserts |
 | --- | --- | --- |
-| `data_value_with_entities_is_one_item` | SYS-9 `CommandLine` line, plus `Tom &amp; Jerry` | each is one item with the full value |
+| `data_value_with_entities_is_one_item` | the `CommandLine` line from the Evidence table, plus `Tom &amp; Jerry` | each is one item with the full value |
 | `data_value_keeps_whitespace_between_refs` | `a&amp; &amp;b` | `"a& &b"` |
 | `data_value_that_is_only_an_entity_is_kept` | `&lt;` | `[("X","<")]` |
 | `numeric_char_refs_are_resolved` | `line1&#13;&#10;line2 &#x41;&#66;` | `"line1\r\nline2 AB"` |
@@ -176,15 +178,16 @@ The **byte-identical guards**: they pass before and after the change.
 
 | # | Command | Where | Expected | Trial result |
 | --- | --- | --- | --- | --- |
-| V1 | `cargo test --lib eventlog_xml` before Part 1 | macOS | the 7 SYS-9 tests fail, the 3 guards pass | as expected |
+| V1 | `cargo test --lib eventlog_xml` before Part 1 | macOS | the 7 new tests fail, the 3 guards pass | as expected |
 | V2 | `RUSTFLAGS="-D warnings" cargo test --all-targets` | macOS, 1.99.1 | all pass | 189 lib + 3 bin + 6 e2e pass |
 | V3 | `RUSTFLAGS="-D warnings" cargo clippy --all-targets`, `cargo fmt --all -- --check` | macOS, 1.99.1 | clean | clean |
 | V4 | `RUSTFLAGS="-D warnings" cargo +1.98 check --all-targets` | macOS, 1.98.1 | passes | passes |
 | V5 | `cargo tree -e normal \| grep -c quick-xml`, `git diff Cargo.lock` | macOS | `0`, no diff | `0`, no diff |
 | V6 | CI `test-windows` (test + clippy) | Windows | passes. This is the only gate that compiles `eventlog.rs` with the new import. | **pending** (no Windows toolchain locally) |
 
-Independence from SYS-8: with SYS-8's change reverted and only this fix
-applied, 10/12 parser tests pass. The 2 that fail are the SYS-8 tests.
+Independence from the attribute fix: with its change reverted and only this
+fix applied, 10/12 parser tests pass. The 2 that fail are the attribute
+fix's tests.
 
 ## Risks and behaviour changes
 
@@ -196,27 +199,28 @@ applied, 10/12 parser tests pass. The 2 that fail are the SYS-8 tests.
    line.
 3. **Values can now contain CR/LF that come from `&#13;&#10;`.** Before,
    such values were truncated at the reference. A literal CRLF in element
-   text already passes through today, so this adds a new path into SYS-1
-   (an event split on newline framing), not a new kind of problem. SD values
-   are escaped by `sd_escape` (`format.rs:83`) for `"`, `\` and `]`, but not
-   for newlines. SYS-1 remains the place to handle that.
+   text already passes through today, so this adds a new path into the
+   newline-framing bug (an event split on newline framing), not a new kind
+   of problem. SD values are escaped by `sd_escape` (`format.rs:83`) for
+   `"`, `\` and `]`, but not for newlines. The newline-framing fix remains
+   the place to handle that.
 4. **An unknown entity is kept literally** (`&foo;`). `EvtRender` emits no
    DTD, so in practice this cannot happen. The rule is defensive.
 
 ## Rollout
 
-On `develop_fix_bug_known-issues`, after SYS-7 (`0f67852`, `af3018c`,
-`cf5bc5a`):
+On `develop_fix_bug_known-issues`, after the `AtomicU64::fetch_update`
+deprecation fix (`0f67852`, `af3018c`, `cf5bc5a`):
 
 1. `refactor(eventlog): move XML parser to a cross-platform module`
    (Part 2: a pure move. `parses_system_and_eventdata` and `SAMPLE` are
    byte-identical to the originals in `eventlog.rs`.)
 2. `fix(eventlog): resolve XML entities in EventData text` (Part 1, the 7
    failing tests, the 2 new guards, and `Keywords` added to `SAMPLE` and
-   `parses_system_and_eventdata`). This fixes SYS-9.
-3. SYS-8's commit follows (see its spec).
-4. `docs`: mark SYS-9 fixed in `ISSUES.md`, and correct its **Fix** text:
-   the tests are cross-platform, not `#[cfg(windows)]`.
+   `parses_system_and_eventdata`). This fixes the bug.
+3. The attribute fix's commit follows (see its spec).
+4. `docs`: record the fix in the issue tracker, and correct the proposed
+   fix there: the tests are cross-platform, not `#[cfg(windows)]`.
 
 ## Out of scope
 
@@ -224,14 +228,14 @@ On `develop_fix_bug_known-issues`, after SYS-7 (`0f67852`, `af3018c`,
    `EvtRender` does not emit CDATA for EventData. Record it as a new issue
    if a real event shows up with it.
 2. **`UserData` events** produce no `data_*` fields before and after.
-3. **CR/LF on the wire**: SYS-1.
-4. **Attribute values**: SYS-8.
+3. **CR/LF on the wire**: the newline-framing fix.
+4. **Attribute values**: the attribute fix.
 
 ## Open questions (resolved: the owner adopted the proposed answers for trial on 2026-11-11)
 
 1. Move the parser to a cross-platform module (Part 2)? **Yes.**
 2. Unknown or invalid references? **Keep them literally.**
 3. Should `&#13;&#10;` become real CR/LF? **Yes.** Handle the wire
-   representation in SYS-1.
-4. Branch? **`develop_fix_bug_known-issues`** (renamed from
-   `fix/sys-7-atomic-update`), with the SYS-7 commits restored.
+   representation in the newline-framing fix.
+4. Branch? **`develop_fix_bug_known-issues`**, with the
+   `fetch_update` deprecation commits restored.

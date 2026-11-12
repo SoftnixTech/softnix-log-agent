@@ -1,8 +1,8 @@
-# SYS-10: CI never builds on the declared MSRV (1.98) — design spec
+# CI never builds on the declared MSRV (1.98) — design spec
 
 Status: **draft — owner review** (open question 1, Linux only or also
 Windows, has a proposed answer). Nothing is implemented yet.
-Issue: SYS-10 in `ISSUES.md` (Low, P4). Found while fixing SYS-7.
+Found while fixing the `AtomicU64::fetch_update` deprecation on Rust 1.99.
 Branch: `develop_fix_bug_known-issues`.
 
 ## Problem
@@ -17,7 +17,9 @@ dependency bump that raises the MSRV, merges without notice, and the
 `rust-version` claim silently stops being true.
 
 So far the MSRV has been checked **by hand**, three times on this branch:
-SYS-7's V4, SYS-9's gate and SYS-1's gate, each with
+V4 of the `fetch_update` deprecation fix, and the gates of the fixes for
+Eventlog `EventData` values with XML entities and for multi-line messages
+split by newline framing, each with
 `RUSTFLAGS="-D warnings" cargo +1.98 check --all-targets`, which passed every
 time.
 
@@ -50,8 +52,8 @@ broken MSRV is found by a user building with 1.98, not by CI.
 ## Non-goals
 
 - Pinning the other jobs' toolchain. That is the separate question of
-  floating stable plus `-D warnings`, recorded in the SYS-7 spec's out of
-  scope item 2.
+  floating stable plus `-D warnings`, recorded in out of scope item 2
+  of `docs/superpowers/specs/2026-11-11-atomic-fetch-update-deprecation.md`.
 - Running the test suite or clippy on the MSRV. `check` is enough to catch
   API and syntax that are too new, and the 1.98 toolchain installed here
   has no clippy anyway.
@@ -86,7 +88,8 @@ Add a job to `.github/workflows/ci.yml`, after `lint`:
   versions as the other jobs. It does not pass `--locked`, to stay
   consistent with them.
 - `--all-targets` covers the tests too. They are compiled, not run, which is
-  also how the `cfg(test)` module `eventlog_xml` from SYS-9 gets
+  also how the `cfg(test)` module `eventlog_xml` from the Eventlog
+  `EventData` entity fix (`2026-11-11-eventlog-xml-text-entities.md`) gets
   MSRV-checked on Linux.
 
 ## Testing
@@ -119,8 +122,8 @@ here, so:
 On `develop_fix_bug_known-issues`, after the spec and plan:
 
 1. `ci: add an msrv job that checks the declared rust-version`.
-2. `docs`: mark SYS-10 fixed in `ISSUES.md`, noting that it is verified on
-   the first CI run.
+2. `docs`: record the fix in the issue tracker, noting that it is verified
+   on the first CI run.
 
 ## Open questions
 

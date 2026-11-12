@@ -1,4 +1,4 @@
-# SYS-7 `fetch_update` Deprecation Implementation Plan
+# `fetch_update` Deprecation Implementation Plan
 
 > **For agentic workers:** Steps use checkbox (`- [ ]`) syntax for tracking. Execute the tasks in order.
 
@@ -8,7 +8,7 @@
 
 **Tech Stack:** Rust 2021 and `std::sync::atomic::AtomicU64::update`, which is stable on both 1.98.1 and 1.99.1 (verified in the spec).
 
-**Spec:** `docs/superpowers/specs/2026-11-11-sys7-atomic-fetch-update-deprecation.md`
+**Spec:** `docs/superpowers/specs/2026-11-11-atomic-fetch-update-deprecation.md`
 
 ## Global Constraints
 
@@ -21,19 +21,19 @@
 
 ## Rulings (decisions this plan makes where the spec leaves room)
 
-**R-0: Open questions take the spec's proposed answers.** Option A (`update`), a standalone branch (open question 2a), and SYS-10 added to `ISSUES.md` (open question 3; out-of-scope item 2 is not added). If the owner decides otherwise:
+**R-0: Open questions take the spec's proposed answers.** Option A (`update`), a standalone branch (open question 2a), and the missing CI MSRV check recorded as a follow-up issue (open question 3; out-of-scope item 2 is not recorded). If the owner decides otherwise:
 
 | Decision changed | Tasks affected |
 | --- | --- |
-| Option B (`try_update`) | T2 step 2 uses the Option B snippet from the spec, and the comment says `try_update`. In T3, `ISSUES.md`'s Fix text stays "rename to `try_update`". |
+| Option B (`try_update`) | T2 step 2 uses the Option B snippet from the spec, and the comment says `try_update`. In T3, the tracker records `try_update` as the fix. |
 | Commit on `develop_fix_bug_windows-provider-name` instead | T0: skip creating the branch; commit the docs on the current branch. Everything else stays the same. |
-| No SYS-10 | T3: skip step 4. |
+| No follow-up issue for the CI MSRV check | T3: skip step 2. |
 
 **R-1: The branch is cut from `main`.** `main` and `develop` are the same commit (`d4df550`), so the tree is identical either way. The PR target is chosen when the PR is opened (T4).
 
-**R-2: The spec and plan travel with the fix.** This follows the provider-name precedent (`70fe4a6 docs: spec and plan …`), so the reviewer of PR-A sees why the change was made. `report.html` stays untracked: it is verification output, not project documentation.
+**R-2: The spec and plan travel with the fix.** This follows the provider-name precedent (`70fe4a6 docs: spec and plan …`), so the reviewer of the PR sees why the change was made. `report.html` stays untracked: it is verification output, not project documentation.
 
-**R-3: `ISSUES.md` is first committed in T3.** It is untracked today (`git status`: `?? ISSUES.md`). It is added in its own `docs:` commit, so if the owner wants the tracker landed separately, that one commit can be dropped from PR-A without touching the fix.
+**R-3: The issue-tracker update is its own commit (T3).** It goes in a separate `docs:` commit, so if the owner wants it landed separately, that one commit can be dropped from the PR without touching the fix.
 
 **R-4: Test and fix share one commit (T1 + T2).** The spec's Rollout section says one commit. The new test is a behaviour pin that passes before and after the change, not a red test, so a test-only commit would add no signal. There is also a practical reason: before the fix, no commit can pass the CI gate anyway.
 
@@ -45,7 +45,7 @@
 T0 branch + docs commit
 T1 saturation test (pins current behaviour, + mutation check)
  └── T2 replace fetch_update → update, full gate, commit   (T1 + T2 = one commit, R-4)
-      └── T3 ISSUES.md: SYS-7 fixed, Fix text, SYS-10      (needs T2's hash)
+      └── T3 issue tracker: fix recorded, MSRV follow-up   (needs T2's hash)
            └── T4 push + PR + CI (blocked on write access)   (owner)
 ```
 
@@ -53,17 +53,17 @@ T1 saturation test (pins current behaviour, + mutation check)
 
 ### Task 0: branch and docs commit
 
-**Files:** `docs/superpowers/specs/2026-11-11-sys7-atomic-fetch-update-deprecation.md`, `docs/superpowers/plans/2026-11-11-sys7-atomic-fetch-update-deprecation.md` (both untracked today).
+**Files:** `docs/superpowers/specs/2026-11-11-atomic-fetch-update-deprecation.md`, `docs/superpowers/plans/2026-11-11-atomic-fetch-update-deprecation.md` (both untracked today).
 
-- [ ] **Step 1:** Check that the tree has no tracked changes: `git status --porcelain` shows only `??` lines (`ISSUES.md`, `report.html`, the two docs files).
-- [ ] **Step 2:** `git switch -c fix/sys-7-atomic-update main`. Untracked files carry over.
+- [ ] **Step 1:** Check that the tree has no tracked changes: `git status --porcelain` shows only `??` lines (the local issue-tracker file, `report.html`, the two docs files).
+- [ ] **Step 2:** `git switch -c develop_fix_bug_known-issues main`. Untracked files carry over.
 - [ ] **Step 3:** Confirm that the new branch still has the defect: `grep -n fetch_update src/engine.rs` shows lines 242 and 251.
 - [ ] **Step 4:** Commit only the two docs files:
 
   ```bash
-  git add docs/superpowers/specs/2026-11-11-sys7-atomic-fetch-update-deprecation.md \
-          docs/superpowers/plans/2026-11-11-sys7-atomic-fetch-update-deprecation.md
-  git commit -m "docs: spec and plan for SYS-7 fetch_update deprecation" -m "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
+  git add docs/superpowers/specs/2026-11-11-atomic-fetch-update-deprecation.md \
+          docs/superpowers/plans/2026-11-11-atomic-fetch-update-deprecation.md
+  git commit -m "docs: spec and plan for the fetch_update deprecation" -m "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
   ```
 
 ---
@@ -77,7 +77,7 @@ T1 saturation test (pins current behaviour, + mutation check)
   ```rust
       /// `ChannelBudget::release` must clamp `agent_channel_bytes` at 0, not
       /// wrap, when it releases more bytes than the gauge currently holds.
-      /// Pins the behaviour across the SYS-7 `fetch_update` → `update`
+      /// Pins the behaviour across the `fetch_update` → `update`
       /// replacement; plain `fetch_sub` would wrap to ~u64::MAX here.
       #[test]
       fn channel_budget_release_saturates_at_zero() {
@@ -171,8 +171,6 @@ No commit (R-4).
   1.98 MSRV, so no MSRV change. A new test pins the saturating clamp the
   call exists for.
 
-  Fixes SYS-7.
-
   Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
   ```
 
@@ -180,51 +178,22 @@ No commit (R-4).
 
 ---
 
-### Task 3: update `ISSUES.md`
+### Task 3: record the fix in the issue tracker
 
-**Files:** `ISSUES.md` (first commit of the file, R-3). Let `<HASH>` be the T2 commit's short hash.
+**Files:** the issue tracker only (its own commit, R-3). Let `<HASH>` be the T2 commit's short hash.
 
-- [ ] **Step 1:** The section intro (line 11) reads "Status of every entry below: **open — recorded only, not fixed**." Change it to: "Status: **open — recorded only, not fixed**, unless the entry says otherwise."
-- [ ] **Step 2:** In the SYS-7 entry, add directly under its heading:
-  `**Status: fixed** in \`<HASH>\` (branch \`fix/sys-7-atomic-update\`, not yet merged).`
-  Then replace the first sentence of the **Fix.** paragraph ("Rename the call to `try_update`.") with:
-  "Replace the call with `AtomicU64::update` (spec: `docs/superpowers/specs/2026-11-11-sys7-atomic-fetch-update-deprecation.md`). `try_update` would also work; `update` was chosen because the closure is infallible."
-  Keep the correction note and the toolchain table. The table still holds, and it is the MSRV evidence.
-- [ ] **Step 3:** In the Fix plan's P1 row, change "The `try_update` rename is verified safe for MSRV 1.98." to "Fixed in `<HASH>` (`update`, verified on MSRV 1.98)."
-- [ ] **Step 4:** Add SYS-10 (spec out-of-scope item 1). First add a summary-table row:
-  `| SYS-10 | CI never builds on the declared MSRV (1.98) | build | Low | P4 | n/a |`
-  Then add an entry after SYS-9:
-
-  ```markdown
-  ### SYS-10 — CI never builds on the declared MSRV (1.98)
-
-  `Cargo.toml:7` declares `rust-version = "1.98"`, but every CI job
-  (`.github/workflows/ci.yml`: `test-linux`, `test-windows`, `lint`)
-  installs the latest stable. Nothing checks that the crate still builds on
-  1.98, so an API newer than the MSRV can merge unnoticed. Found while
-  writing the SYS-7 spec, where it was checked by hand
-  (`cargo +1.98 check --all-targets`).
-
-  **Fix.** Add an `msrv` job that installs 1.98 and runs
-  `cargo check --all-targets` (Linux is enough; add Windows if the
-  `#[cfg(windows)]` code should be covered too).
-  ```
-
-- [ ] **Step 5:** Commit only `ISSUES.md`:
-
-  ```bash
-  git add ISSUES.md
-  git commit -m "docs: add ISSUES.md tracker; mark SYS-7 fixed, add SYS-10" -m "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
-  ```
+- [ ] **Step 1:** Record the issue as fixed in `<HASH>`, and note that the fix uses `update`, not the `try_update` rename the bug report proposed.
+- [ ] **Step 2:** Record the missing CI MSRV check as a follow-up issue (spec out-of-scope item 1).
+- [ ] **Step 3:** Commit the tracker change on its own, with a `docs:` prefix.
 
 ---
 
 ### Task 4: push, PR and CI (owner, blocked)
 
 - [ ] **Step 1:** Get write access to `SoftnixTech/softnix-log-agent` (the account currently has `"push": false`), or agree on a fork workflow. A fork of this public repo is public.
-- [ ] **Step 2:** `git push -u origin develop_fix_bug_known-issues` (the branch was renamed from `fix/sys-7-atomic-update` on 2026-11-11, so it can carry every `ISSUES.md` fix), then open the PR against the base the owner picks (`main` or `develop`, R-1). The PR body ends with the Claude Code attribution line.
-- [ ] **Step 3 (spec V5):** All of `test-linux`, `test-windows` and `lint` must be green. If `test-windows` fails on a *different* deprecation in `#[cfg(windows)]` code, that is a new issue (record it as SYS-n), not part of this PR, unless it is just as trivial.
-- [ ] **Step 4:** After merge, rebase `develop_fix_bug_windows-provider-name` onto the updated base so its CI picks up the fix. Then update SYS-7's status line to say "merged in #<PR>".
+- [ ] **Step 2:** `git push -u origin develop_fix_bug_known-issues` (the branch got this name on 2026-11-11, when it was renamed so it can carry the fixes for other known issues too), then open the PR against the base the owner picks (`main` or `develop`, R-1). The PR body ends with the Claude Code attribution line.
+- [ ] **Step 3 (spec V5):** All of `test-linux`, `test-windows` and `lint` must be green. If `test-windows` fails on a *different* deprecation in `#[cfg(windows)]` code, that is a new issue (record it in the issue tracker), not part of this PR, unless it is just as trivial.
+- [ ] **Step 4:** After merge, rebase `develop_fix_bug_windows-provider-name` onto the updated base so its CI picks up the fix. Then record in the issue tracker that the fix merged in #<PR>.
 
 ---
 
@@ -240,13 +209,13 @@ No commit (R-4).
 | Testing: existing test kept, new saturation test | T1, T2 step 4 |
 | V3 fmt | T2 step 4 |
 | V5 Windows CI | T4 step 3 |
-| Rollout: fix commit + separate `ISSUES.md` status commit | T2 step 5, T3 |
-| Out-of-scope item 1 → SYS-10 | T3 step 4 |
+| Rollout: fix commit + separate issue-tracker status commit | T2 step 5, T3 |
+| Out-of-scope item 1 → follow-up issue | T3 step 2 |
 | Open questions | R-0, R-1 |
 
 ## Risks and known trade-offs
 
-- **Stable may move again before merge.** If CI already runs a newer stable (1.100+) by the time PR-A opens, it may surface another new lint or deprecation. T4 step 3 catches this; spec out-of-scope item 2 is the long-term answer.
+- **Stable may move again before merge.** If CI already runs a newer stable (1.100+) by the time the PR opens, it may surface another new lint or deprecation. T4 step 3 catches this; spec out-of-scope item 2 is the long-term answer.
 - **Windows-only code is not compiled locally.** The grep shows no `fetch_update` in `eventlog.rs`, but other 1.99 deprecations there would show up only in CI (T4 step 3).
 - **The mutation check is manual.** T1 step 3 must be reverted by hand. The `git diff` check at the end of that step is the guard.
 - **Everything stops at T4** until write access exists. T0–T3 are local commits that can be pushed as-is later.

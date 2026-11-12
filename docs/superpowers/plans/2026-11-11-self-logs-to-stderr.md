@@ -1,4 +1,4 @@
-# SYS-5 Agent Self-Logs to stderr Implementation Plan
+# Agent Self-Logs to stderr Implementation Plan
 
 > **For agentic workers:** Steps use checkbox (`- [ ]`) syntax for tracking. Execute the tasks in order. The commit-producing task shows a red run before its fix, and ends with the full gate.
 
@@ -8,12 +8,12 @@
 
 **Tech Stack:** Rust 2021, `tracing_subscriber`, `std::process`, `tempfile` and `serde_json` (all already dependencies).
 
-**Spec:** `docs/superpowers/specs/2026-11-11-sys5-self-logs-to-stderr.md`
+**Spec:** `docs/superpowers/specs/2026-11-11-self-logs-to-stderr.md`
 
 ## Global Constraints
 
-- Branch `develop_fix_bug_known-issues`, order #8 in `ISSUES.md`'s Fix plan. `rust-version = "1.98"`. If `cargo` is not on `PATH`, use `export PATH="$HOME/.cargo/bin:$PATH"`.
-- **Code changes only in** `src/main.rs` (one line) and the new `tests/self_logs_on_stderr.rs`. Docs: `ISSUES.md` (T2).
+- Branch `develop_fix_bug_known-issues`, after the long RFC 3164 tag fix (`2026-11-11-rfc3164-long-tag.md`). `rust-version = "1.98"`. If `cargo` is not on `PATH`, use `export PATH="$HOME/.cargo/bin:$PATH"`.
+- **Code changes only in** `src/main.rs` (one line) and the new `tests/self_logs_on_stderr.rs`. Docs: the issue tracker (T2).
 - **Test counts:** lib, bin and `e2e` are unchanged. There is one new test binary, `self_logs_on_stderr`, with **1** test.
 - **Gate** (after T1):
 
@@ -26,7 +26,7 @@
 
   Do **not** set `CARGO_TARGET_DIR`.
 - Stage files **by name**, never `git add -A`. Every commit message ends with `Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>`.
-- **Not prototyped.** At the owner's request no source was touched while writing this plan, so the test below has never been compiled or run. T1 step 2's red run is its verification. Its YAML keys are copied from the harness's SYS-5 case, which runs against this binary, and its path quoting follows `tests/e2e.rs` (R-2). `data_dir` does not need to exist: the engine creates it (`src/engine.rs`, `create_dir_all`).
+- **Not prototyped.** At the owner's request no source was touched while writing this plan, so the test below has never been compiled or run. T1 step 2's red run is its verification. Its YAML keys are copied from the harness's self-logs case, which runs against this binary, and its path quoting follows `tests/e2e.rs` (R-2). `data_dir` does not need to exist: the engine creates it (`src/engine.rs`, `create_dir_all`).
 
 ## Rulings
 
@@ -44,7 +44,7 @@
 T0 C1 docs: spec + plan
 T1 C2 fix(main): self-logs to stderr   (red 1 → green)
    harness re-run (no commit)
-T2 C3 ISSUES.md: SYS-5 fixed           (needs the C2 hash)
+T2 C3 issue tracker: record the fix    (needs the C2 hash)
 ```
 
 ---
@@ -54,8 +54,8 @@ T2 C3 ISSUES.md: SYS-5 fixed           (needs the C2 hash)
 - [ ] **Step 1:**
 
   ```bash
-  git add docs/superpowers/specs/2026-11-11-sys5-self-logs-to-stderr.md docs/superpowers/plans/2026-11-11-sys5-self-logs-to-stderr.md
-  git commit -m "docs: spec and plan for SYS-5 self-logs to stderr" -m "Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>"
+  git add docs/superpowers/specs/2026-11-11-self-logs-to-stderr.md docs/superpowers/plans/2026-11-11-self-logs-to-stderr.md
+  git commit -m "docs: spec and plan for self-logs to stderr" -m "Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>"
   ```
 
 ---
@@ -67,7 +67,7 @@ T2 C3 ISSUES.md: SYS-5 fixed           (needs the C2 hash)
 - [ ] **Step 1: the test.** Create `tests/self_logs_on_stderr.rs`:
 
 ```rust
-//! SYS-5: the agent's own log lines go to stderr, so stdout carries only what
+//! The agent's own log lines go to stderr, so stdout carries only what
 //! a `type: stdout` output writes. The tracing subscriber is installed inside
 //! the binary, so this spawns the real executable.
 
@@ -76,7 +76,7 @@ use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-const MARKER: &str = "SYS5-EVENT";
+const MARKER: &str = "SELF-LOGS-EVENT";
 
 #[test]
 fn self_logs_go_to_stderr_not_stdout() {
@@ -167,7 +167,7 @@ fn self_logs_go_to_stderr_not_stdout() {
 }
 ```
 
-- [ ] **Step 2: red.** `cargo test --test self_logs_on_stderr`. Expected: **FAILED** with "stdout must carry only events, but got this line: … Softnix Log Agent v… starting …". If it fails any other way (the config is rejected, or "the event never reached stdout"), the test's config is wrong: fix the YAML (see R-2 and the harness's `sys5` case) until the failure is the expected one. Do not go on to step 3 with a different failure.
+- [ ] **Step 2: red.** `cargo test --test self_logs_on_stderr`. Expected: **FAILED** with "stdout must carry only events, but got this line: … Softnix Log Agent v… starting …". If it fails any other way (the config is rejected, or "the event never reached stdout"), the test's config is wrong: fix the YAML (see R-2 and the harness's self-logs case) until the failure is the expected one. Do not go on to step 3 with a different failure.
 
 - [ ] **Step 3: the fix (green).** In `src/main.rs`'s `run_agent`, change:
 
@@ -188,12 +188,13 @@ fn self_logs_go_to_stderr_not_stdout() {
   The comment above it (`// Tracing: stderr + in-memory ring buffer for the web UI.`) is now true and stays. `cargo test --test self_logs_on_stderr` passes.
 
 - [ ] **Step 4: gate.**
-- [ ] **Step 5: harness (no commit).** If `/tmp/softnix-smoke.LTIcHO/harness/issues_repro.py` still exists:
+- [ ] **Step 5: harness (no commit).** If `/tmp/softnix-smoke.LTIcHO/harness/issues_repro.py` still exists, run this. Set `CASE` to the harness's key for its self-logs case.
 
   ```bash
-  cargo build && mkdir -p /tmp/sys5-runs
-  python3 /tmp/softnix-smoke.LTIcHO/harness/issues_repro.py "$PWD/target/debug/softnix-log-agent" /tmp/sys5-runs 3
-  python3 -c 'import json; [print(r) for r in json.load(open("/tmp/sys5-runs/results.json"))["runs"]["SYS-5"]]'
+  cargo build && mkdir -p /tmp/self-logs-runs
+  python3 /tmp/softnix-smoke.LTIcHO/harness/issues_repro.py "$PWD/target/debug/softnix-log-agent" /tmp/self-logs-runs 3
+  CASE='<self-logs case key>'
+  python3 -c 'import json, sys; [print(r) for r in json.load(open("/tmp/self-logs-runs/results.json"))["runs"][sys.argv[1]]]' "$CASE"
   ```
 
   Expected in each run: `stdout_lines: 2`, `stdout_events: 2`, `stdout_selflog_lines: 0` (was 8) and `stderr_bytes` greater than 0 (was 0). If the harness is gone, skip this step and say so in the commit body.
@@ -202,22 +203,16 @@ fn self_logs_go_to_stderr_not_stdout() {
 
   ```bash
   git add src/main.rs tests/self_logs_on_stderr.rs
-  git commit -m "fix(main): write agent self-logs to stderr" -m "tracing_subscriber's fmt layer writes to stdout by default, so with a type: stdout output the agent's own log lines were mixed into the event stream (SYS-5). The comment above it and docs/OPERATIONS.md both already said stderr.
+  git commit -m "fix(main): write agent self-logs to stderr" -m "tracing_subscriber's fmt layer writes to stdout by default, so with a type: stdout output the agent's own log lines were mixed into the event stream. The comment above it and docs/OPERATIONS.md both already said stderr.
 
 Anyone who captured the logs by redirecting stdout only must now redirect stderr as well." -m "Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>"
   ```
 
 ---
 
-### Task 2: C3, mark SYS-5 fixed in `ISSUES.md`
+### Task 2: C3, record the fix in the issue tracker
 
-- [ ] **Step 1:** In the summary table, set SYS-5's status to **fixed** with the `<C2>` hash. Replace the entry's status line with: **Status: fixed** in `<C2>` (branch `develop_fix_bug_known-issues`, not yet merged). Move the row from **Remaining** to **Done** in the Fix plan.
-- [ ] **Step 2:**
-
-  ```bash
-  git add ISSUES.md
-  git commit -m "docs: mark SYS-5 fixed" -m "Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>"
-  ```
+- [ ] **Step 1:** Record the fix in the issue tracker, with the `<C2>` hash and the branch `develop_fix_bug_known-issues` (not yet merged).
 
 ---
 
