@@ -59,7 +59,7 @@ pub(super) fn frame_batch(events: &[Event], format: OutputFormat, framing: Frami
 
 /// Newline framing (RFC 6587 §3.4.2) ends a frame at LF, so it cannot carry a
 /// line break inside an event: a multi-line message (a Windows event, or an SD
-/// value with CR/LF) would arrive as several header-less frames (SYS-1). Write
+/// value with CR/LF) would arrive as several header-less frames. Write
 /// each `\r\n`, lone `\r` and lone `\n` as one space instead. Lines without
 /// CR/LF (and every `json` line, where serde already escapes them) are
 /// returned unchanged, without allocating.
@@ -99,7 +99,7 @@ mod tests {
         String::from_utf8(frame_batch(&[e], format, framing)).unwrap()
     }
 
-    // --- SYS-1: newline framing must keep one event in one frame ---
+    // --- Newline framing must keep one event in one frame ---
 
     #[test]
     fn newline_framing_keeps_multiline_event_in_one_frame() {

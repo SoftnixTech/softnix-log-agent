@@ -137,7 +137,7 @@ fn sd_end_by_grammar(tail: &str) -> Option<usize> {
     None
 }
 
-/// The scan used before SYS-2: every `[` and `]` counts, quoted or not. Kept
+/// The original scan: every `[` and `]` counts, quoted or not. Kept
 /// for malformed SD only, so such a line parses exactly as it always has.
 /// Returns `tail.len()` when it finds no end either.
 fn sd_end_by_brackets(tail: &str) -> usize {
@@ -273,7 +273,7 @@ mod tests {
         assert_eq!(ev.message, format!("{tag}: hello"));
     }
 
-    // SYS-3: the tag bound applies to the name and the PID separately, not to
+    // The tag bound applies to the name and the PID separately, not to
     // `TAG[PID]` as a whole, so long Windows provider names are still parsed.
     #[test]
     fn rfc3164_long_tag_with_pid_is_parsed() {
@@ -375,7 +375,7 @@ mod tests {
         assert_eq!(got_message, message, "message of {tail:?}");
     }
 
-    // SYS-2: `[` inside a quoted PARAM-VALUE is valid (RFC 5424 §6.3.3) and
+    // `[` inside a quoted PARAM-VALUE is valid (RFC 5424 §6.3.3) and
     // must not be counted as an SD-ELEMENT bracket.
     #[test]
     fn sd_value_with_open_bracket_keeps_message() {
@@ -436,7 +436,7 @@ mod tests {
         );
     }
 
-    /// Malformed SD (an unterminated quote): parsed as before SYS-2.
+    /// Malformed SD (an unterminated quote): parsed with the original scan.
     #[test]
     fn sd_unterminated_quote_falls_back_to_old_scan() {
         assert_sd(

@@ -390,7 +390,7 @@ impl SyslogInput {
                             let text = String::from_utf8_lossy(&buf[..n]);
                             // RFC 5426 §3.1: one syslog message per datagram.
                             // Do not split on LF: a multi-line message (a
-                            // Windows event) is still one event (SYS-1).
+                            // Windows event) is still one event.
                             let line = text.trim();
                             if line.is_empty() { continue; }
                             let ev = self.make_event(line, &peer);
@@ -878,7 +878,7 @@ mod tests {
         (addr, rx, cancel)
     }
 
-    /// SYS-1: RFC 5426 says one syslog message per datagram, so a multi-line
+    /// RFC 5426 says one syslog message per datagram, so a multi-line
     /// message (a Windows event) must arrive as one event, not one per line.
     #[tokio::test]
     async fn udp_datagram_is_one_event() {
@@ -965,7 +965,7 @@ mod tests {
         cancel.cancel();
     }
 
-    /// SYS-4: octet-counted frames are delivered one event per frame while
+    /// Octet-counted frames are delivered one event per frame while
     /// the connection is still open, and a line break inside a frame stays.
     #[tokio::test]
     async fn tcp_receives_octet_counted_frames() {
@@ -1006,7 +1006,7 @@ mod tests {
         cancel.cancel();
     }
 
-    /// SYS-4: `framing: octet_counting` on the input carries payloads that
+    /// `framing: octet_counting` on the input carries payloads that
     /// `auto` cannot detect, because they do not start with `<` or `{` (the
     /// agent's own `format: raw` output is one).
     #[tokio::test]

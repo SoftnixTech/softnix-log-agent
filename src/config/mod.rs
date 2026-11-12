@@ -107,7 +107,7 @@ outputs:
         assert!(s.allowed_senders.is_empty());
     }
 
-    /// SYS-4: `framing` on a syslog input defaults to `auto`, accepts the
+    /// `framing` on a syslog input defaults to `auto`, accepts the
     /// three documented values, and rejects anything else at load time.
     #[test]
     fn syslog_input_framing_option() {

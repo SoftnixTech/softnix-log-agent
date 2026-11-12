@@ -933,7 +933,7 @@ mod tests {
 
     /// `ChannelBudget::release` must clamp `agent_channel_bytes` at 0, not
     /// wrap, when it releases more bytes than the gauge currently holds.
-    /// Pins the behaviour across the SYS-7 `fetch_update` → `update`
+    /// Pins the behaviour across the `fetch_update` → `update`
     /// replacement; plain `fetch_sub` would wrap to ~u64::MAX here.
     #[test]
     fn channel_budget_release_saturates_at_zero() {
