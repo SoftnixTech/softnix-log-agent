@@ -239,7 +239,7 @@ impl ChannelBudget {
     fn release(&self, ev: &Event, metrics: &Metrics) {
         let n = EventSender::permits_for(ev) as usize;
         self.budget.add_permits(n);
-        // `saturating_sub` (via `try_update`, since `AtomicU64` has no
+        // `saturating_sub` (via `update`, since `AtomicU64` has no
         // built-in fetch-saturating-sub) as belt-and-braces: `send` and
         // `blocking_send` now credit this gauge before the send that can
         // race a concurrent `release`'s `fetch_sub` (see their comments), so
@@ -248,8 +248,8 @@ impl ChannelBudget {
         // briefly nonsensical, whereas saturating just clamps to 0.
         metrics
             .channel_bytes
-            .try_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
-                Some(cur.saturating_sub(EventSender::event_bytes(ev)))
+            .update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+                cur.saturating_sub(EventSender::event_bytes(ev))
             });
     }
 }
