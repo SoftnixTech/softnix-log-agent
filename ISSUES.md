@@ -42,12 +42,15 @@ elsewhere.
 | SYS-4 | Syslog TCP/TLS input does not decode octet-counting framing | receiver | Medium | P3 (with SYS-1) | No | **fixed** (`fd90159`, `8de82c5`) |
 | SYS-5 | Agent self-logs go to stdout, not stderr | agent | Low | P4 | No | **fixed** (`292f00e`) |
 | SYS-6 | SD-ID uses enterprise number 32473 (reserved for documentation) | sender | Low | P5 | Cosmetic / policy | **won't fix** (owner decision 2026-11-11) |
-| SYS-7 | CI breaks on Rust ≥ 1.99: `fetch_update` is deprecated under `-D warnings` | build | Medium (blocks CI) | **P1** | n/a | **fixed** (`af3018c`) |
+| SYS-7 | CI breaks on Rust ≥ 1.99: `fetch_update` is deprecated under `-D warnings` | build | Medium (blocks CI) | **P1** | n/a | **fixed** (`af3018c`), broken again on `develop` by merge `e541e78`, **fixed again** (`0e1f135`, see SYS-14) |
 | SYS-8 | Eventlog XML attribute values are not entity-unescaped | input (Windows) | Low | P2 (with SYS-9) | n/a | **fixed** (`cb9586c`) |
 | SYS-9 | Eventlog `EventData` values containing XML entities are truncated and split | input (Windows) | **High** | **P2** | Yes (data lost at the source) | **fixed** (`f6fb143`) |
-| SYS-10 | CI never builds on the declared MSRV (1.98) | build | Low | P4 | n/a | **fixed** (`98dc828`), pending first CI run |
-| SYS-11 | e2e test `a_backed_up_destination_does_not_stop_its_peers` is flaky on Windows and did not guard the bug it names | test | Medium (blocks CI) | P1 | n/a | **fixed** (`170d99f`), pending Windows CI |
-| SYS-12 | `Engine::stop` waits the full 8 s timeout when a TCP output's peer stops reading | agent | Low | P4 | n/a | open |
+| SYS-10 | CI never builds on the declared MSRV (1.98) | build | Low | P4 | n/a | **fixed** (`98dc828`); job seen running on `9d08455`, where it caught SYS-14 |
+| SYS-11 | e2e test `a_backed_up_destination_does_not_stop_its_peers` is flaky on Windows and did not guard the bug it names | test | Medium (blocks CI) | P1 | n/a | **fixed** (`170d99f`), pending Windows CI (blocked by SYS-14) |
+| SYS-12 | `Engine::stop` waits the full 8 s timeout when a TCP output's peer stops reading | agent | Low | P4 | n/a | open (re-verified 2026-11-11: 8.29 s) |
+| SYS-13 | Events are shed on a burst under `full_policy: block` while the disk queue has room | agent (sender + receiver) | **High** | **P1** (proposed) | Yes (data lost at the sender) | open |
+| SYS-14 | `develop` does not compile under `-D warnings`: merge `e541e78` dropped `let _ =` from the SYS-7 call | build | **High** (blocks all CI) | **P1** | n/a | **fixed** (`0e1f135`), pending CI (not pushed yet) |
+| SYS-15 | `update::apply` preflight tests hard-code `target/debug/softnix-log-agent` | test | Low | P4 | n/a | open |
 
 Fixes are on branch `develop_fix_bug_known-issues`, which is based on `main`
 and not yet merged. The entries above were found and first verified on the
@@ -455,6 +458,156 @@ save-and-reload), which stop the engine the same way.
 `select!`, and leave the in-flight batch un-acked so it is resent after a
 restart. Or add a write timeout to the TCP/TLS sink.
 
+**Re-verified 2026-11-11** in the Docker full-flow retest (below): a Linux
+agent whose TCP peer accepts but never reads took 8.29 s to exit on
+SIGTERM. Not verifiable for Windows under Wine (see the retest's limits).
+
+---
+
+## 2026-11-11 — found during the Docker full-flow retest
+
+Status: **open — recorded only, not fixed.**
+
+A re-test of every entry above, plus areas outside them, on `develop` @
+`9d08455` (merge of PR #3) with the SYS-14 fix applied in the working tree.
+Both release targets were built in Docker (`x86_64-unknown-linux-musl`, and
+`x86_64-pc-windows-gnu` as a stand-in for `-msvc`) and run as two agents on
+a Docker network, the Windows one under Wine 10. Mock Event Log events from
+22 real providers went A → syslog → B in both directions (Windows → Linux,
+Linux → Windows) over TCP, UDP, TLS + mTLS, RFC 5424 / 3164 / json, newline
+and octet-counting framing. As a negative control the same matrix was run
+with binaries built from `main` (`d4df550`): 114 of 152 checks failed there,
+0 on the fixed build, so the harness does catch SYS-1 to SYS-5.
+
+Result: SYS-1 to SYS-5, SYS-8, SYS-9 and SYS-10 pass on both builds. SYS-7 is
+broken again on `develop` (SYS-14), SYS-11 is still unverified on Windows,
+SYS-12 is still open, and three new defects were found (SYS-13, SYS-14,
+SYS-15). Outside ISSUES.md, these all pass on both builds: disk buffering
+across a receiver outage with a graceful or SIGKILL sender restart, failover,
+pipeline transforms and routing, file rotation, the web API (auth, metrics,
+save + reload, refusing a public bind without a token), `allowed_senders`;
+and SIGHUP reload on Linux.
+
+The report is `retest-report-2026-11-11.html` at the repo root (untracked).
+The harness lives outside the repo, at `/tmp/softnix-retest/harness/`
+(`matrix.py`, `extras.py`).
+
+**Not verifiable in the Docker/Wine setup** (not product defects; these
+need CI's `test-windows` job or a real Windows host):
+
+- Graceful stop / Windows Service: Wine turns SIGINT into a hard kill, so
+  the agent never logs "shutting down". Windows stop times, SYS-12 on
+  Windows, and restart duplicates are not meaningful under Wine.
+- Event Log collection: Wine does not implement `EvtSubscribe`
+  (0x80070078). Only verified that the input logs, backs off and does not
+  stop other inputs.
+- File identity on Windows (creation time + first-line hash): Wine reports
+  the change time as the creation time, so the identity changes on every
+  write. `inputs::file::tests::resumes_from_saved_offset` and
+  `tails_rotation_and_truncation` fail under Wine for this reason only.
+- `tests/e2e.rs`: 5 of 6 tests (SYS-11 included) abort with SIGTRAP under
+  Rosetta and under QEMU before any assertion. The Windows lib tests also
+  abort at `syslog::tests::tcp_closes_idle_connections_after_the_configured_timeout`
+  after 107 passes. All 20 `eventlog` / `eventlog_xml` tests pass.
+
+---
+
+### SYS-13 — Events are shed on a burst under `full_policy: block` while the disk queue has room
+
+**Status: open.**
+
+**Symptom.** A file input that reads a large backlog at once (for example
+`read_from_start: true`, or a log that arrives in a burst) loses most of it,
+with the default `full_policy: block` and a healthy destination:
+
+| Run | Delivered | Disk queue at the time |
+|---|---|---|
+| 100,000 lines, native macOS release build | 35,007 | 5 MB of 1024 MB |
+| 10,000 lines, native macOS release build | 9,132 | — |
+| 100,000 lines, Linux musl build in Docker | 30,678 | 3.8 MB of 1024 MB |
+| 30,000 lines, Windows build under Wine | 10,574 | — |
+| 100,000 lines, `main` (`d4df550`), native | 34,993 | — |
+
+The sender logs `destination router buffer full; shedding event` from about
+0.2 s after start. A receiving agent sheds the same way when a sender
+delivers faster than it writes its own queue, so a relay loses events too.
+On `main` the loss is silent (no shedding warning in the log).
+
+**Root cause.** `route_event` (`src/engine.rs:657-668`) hands each event to
+the destination's router channel with `try_send` and drops it when the
+channel (`ROUTER_CAPACITY` = 4096, `src/engine.rs:53`) is full. The comment
+there assumes a full channel means the disk queue behind it is already
+full. That is not true: the channel also fills whenever the router task is
+briefly slower than the pipeline (disk writes, scheduling), which a burst
+causes every time. Introduced in `24a1969` (2026-09-04, "make per-destination
+fan-out actually non-blocking"), so every release since v0.1.0 has it.
+
+**Impact.** High. Data loss in the default configuration with nothing wrong
+downstream, contradicting `docs/CONFIGURATION.md` (`buffer`, `block`: "never
+drop while there's room"). Typical triggers are agent start with a backlog,
+log bursts during incidents, and relaying for many senders.
+
+**Fix options.** Shed only when the destination's disk queue is actually
+full (its full state is already tracked for `agent_queue_full`); otherwise
+`send().await`, optionally with a timeout. Any fix must keep
+`a_backed_up_destination_does_not_stop_its_peers` (SYS-11) passing: one
+stuck destination must still not stall the others. Add a regression test
+that pushes a burst larger than `ROUTER_CAPACITY` through a healthy
+destination and expects every event.
+
+---
+
+### SYS-14 — `develop` does not compile under `-D warnings`: merge `e541e78` dropped `let _ =` from the SYS-7 call
+
+**Status: fixed** in `0e1f135` on `develop_fix_bug` (2026-11-12), pending
+CI: not pushed yet.
+
+**Symptom.** Every CI job on `develop` @ `9d08455` (run 42997642297) fails
+to compile: `lint`, `msrv`, `test-linux` and `test-windows`, with
+`error: unused Result that must be used` at `src/engine.rs:249`.
+
+**Root cause.** Each branch fixed SYS-7 differently:
+`develop_fix_bug_known-issues` used `AtomicU64::update` (`af3018c`), and
+`develop_fix_bug_windows-provider-name` used `let _ = …try_update(…)`
+(`7bb53e6`). The conflict resolution in merge `e541e78` kept `try_update`
+but dropped the `let _ =`, so the `#[must_use]` `Result` is ignored and
+`-D warnings` makes that an error.
+
+**Impact.** High: nothing on `develop` can pass CI, and SYS-10 / SYS-11 can't
+be confirmed on CI until this is fixed.
+
+**Fix.** Go back to the SYS-7 choice, `update(…, |cur|
+cur.saturating_sub(…))` with no `Option` and no ignored `Result`, and the
+comment saying `update`. Checked locally: fmt, clippy, tests, `cargo +1.98
+check` and `cargo audit` pass, and Windows clippy passes on
+`x86_64-pc-windows-gnu`.
+
+**Re-verified 2026-11-12.** Committed `9d08455` still fails
+`cargo clippy --all-targets -- -D warnings` at `src/engine.rs:249`. With
+the fix, fmt, clippy (1.99.1), `cargo +1.98 check`, `cargo audit` and
+`cargo test` (258 passed) all pass.
+
+---
+
+### SYS-15 — `update::apply` preflight tests hard-code `target/debug/softnix-log-agent`
+
+**Status: open.**
+
+`this_binary()` (`src/update/apply.rs:477-484`) builds the path as
+`CARGO_MANIFEST_DIR/target/debug/softnix-log-agent`. It ignores
+`CARGO_TARGET_DIR` and `--target <triple>`. With
+`cargo test --target x86_64-unknown-linux-musl` (and a separate target dir)
+`preflight_passes_with_a_valid_config` and
+`preflight_fails_on_an_invalid_config` fail: the path held the macOS binary
+from the bind-mounted repo, which can't run in the container. On a developer
+machine the path can hold a stale binary from older code, so the tests may
+pass or fail for the wrong reason. CI passes today only because it uses the
+default target dir and no `--target`.
+
+**Fix options.** Locate the binary relative to the test executable
+(`std::env::current_exe()`, then `../softnix-log-agent{EXE_SUFFIX}`), or move
+these two tests to `tests/` and use `env!("CARGO_BIN_EXE_softnix-log-agent")`.
+
 ---
 
 ### Fix plan
@@ -494,6 +647,16 @@ and commits.
 | # | Issue | Severity | Effort | Blocked by | Why this position |
 |---|---|---|---|---|---|
 | **10** | **SYS-6** | Low | none | **closed: won't fix** (owner decision 2026-11-11, no PEN) | No breakage today, and the company has no PEN to switch to. Nothing to do unless a PEN is obtained. |
+
+**Added 2026-11-11 by the Docker full-flow retest** (proposed order, not yet
+agreed with the owner):
+
+| # | Issue | Severity | Effort | Blocked by | Why this position |
+|---|---|---|---|---|---|
+| ~~**11**~~ | ~~**SYS-14**~~ | High (blocks all CI) | 3 lines | none | **Done:** `0e1f135` (2026-11-12), pending CI. SYS-10 / SYS-11 close once CI is green. |
+| **12** | **SYS-13** | **High** | medium (routing change + regression test) | SYS-14 (to see CI) | Data loss in the default configuration. Must keep the SYS-11 guard passing. |
+| 13 | SYS-12 | Low | small to medium | none | Slow stop / reload only; no data loss. |
+| 14 | SYS-15 | Low | small | none | Test hygiene; CI passes today. |
 
 The workflow for each one is the same as for SYS-7/8/9/1: review the spec
 with a prototype in a throw-away worktree, write a plan, then implement in
