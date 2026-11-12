@@ -6,3 +6,6 @@
 .DS_Store
 /.worktrees
 /.superpowers
+
+# Local-only issue tracker (not shared)
+ISSUES.md
